@@ -94,6 +94,13 @@ class Settings(BaseSettings):
     ws_max_connections: int = 500
 
     # -----------------------------------------------------------------
+    # Gateway integration
+    # -----------------------------------------------------------------
+    gateway_url: str = "http://127.0.0.1:8000"
+    # Shared HMAC key for signing commands forwarded to the gateway
+    gateway_signing_key: str = "changeme-gateway-signing-key"
+
+    # -----------------------------------------------------------------
     # Rate limiting
     # -----------------------------------------------------------------
     rate_limit_default: str = "120/minute"

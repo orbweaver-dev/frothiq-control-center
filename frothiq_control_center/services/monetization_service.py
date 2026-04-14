@@ -1,5 +1,10 @@
 """
-Monetization service — revenue signals, upgrade funnel, paywall metrics, billing visibility.
+Monetization service — revenue signals, upgrade funnel, paywall metrics.
+
+BOUNDARY CONTRACT: Revenue Pressure Index computation, upgrade candidate
+identification, conversion probability estimation, and funnel classification
+are all business logic owned by frothiq-core. This service proxies core's
+monetization endpoints and shapes them for operator UI consumption.
 """
 
 from __future__ import annotations
@@ -15,9 +20,25 @@ logger = logging.getLogger(__name__)
 
 async def get_monetization_overview() -> dict[str, Any]:
     """
-    Build a complete monetization overview for the Control Center dashboard.
-    Aggregates plan distribution, upgrade signals, and paywall data.
+    Fetch monetization overview from frothiq-core.
+
+    Prefers core's /api/v2/intelligence/monetization/overview.
+    Falls back to assembling from core's tenant list — plan counts
+    and upgrade candidates come from core fields only; no local RPI
+    or conversion probability is computed.
     """
+    # Prefer core's dedicated overview endpoint
+    try:
+        data = await core_client.get("/api/v2/intelligence/monetization/overview")
+        return {
+            "source": "frothiq-core",
+            "fetched_at": datetime.now(UTC).isoformat(),
+            **data,
+        }
+    except CoreClientError:
+        pass
+
+    # Fallback: assemble from core tenant list — core provides all fields
     try:
         tenants_data = await core_client.get("/api/v2/internal/tenants")
         tenants = tenants_data.get("tenants", [])
@@ -32,80 +53,51 @@ async def get_monetization_overview() -> dict[str, Any]:
         plan = t.get("plan", "free")
         plan_breakdown[plan] = plan_breakdown.get(plan, 0) + 1
 
-        # Identify tenants close to plan limits (upgrade candidates)
-        max_sites = t.get("max_sites", 1)
-        active_sites = t.get("active_sites", 0)
-        utilization = active_sites / max(max_sites, 1)
-
-        if utilization >= 0.8 and plan != "enterprise":
+        # Use core's upgrade_candidate flag or utilization; never compute locally
+        if t.get("upgrade_candidate") or t.get("upgrade_recommended"):
             upgrade_candidates.append({
                 "tenant_id": t.get("tenant_id"),
                 "plan": plan,
-                "utilization": round(utilization, 2),
-                "active_sites": active_sites,
-                "max_sites": max_sites,
-                "next_plan": _next_plan(plan),
+                # Use core-provided utilization; never compute active_sites/max_sites ratio here
+                "utilization": t.get("utilization", t.get("site_utilization", 0.0)),
+                "active_sites": t.get("active_sites", 0),
+                "max_sites": t.get("max_sites", 1),
+                "next_plan": t.get("next_plan", ""),
             })
 
-    # Sort by utilization descending
-    upgrade_candidates.sort(key=lambda x: x["utilization"], reverse=True)
-
     return {
+        "source": "frothiq-core",
         "total_tenants": len(tenants),
         "plan_breakdown": plan_breakdown,
-        "upgrade_signals_last_7d": _estimate_upgrade_signals(tenants),
-        "paywall_hits_last_7d": _estimate_paywall_hits(tenants),
-        "revenue_pressure_index": _compute_rpi(plan_breakdown),
+        # Core provides these counts; no local estimation
+        "upgrade_signals_last_7d": tenants_data.get("upgrade_signals_last_7d", len(upgrade_candidates)),
+        "paywall_hits_last_7d": tenants_data.get("paywall_hits_last_7d", 0),
+        # Core provides RPI; never compute locally
+        "revenue_pressure_index": tenants_data.get("revenue_pressure_index", 0.0),
         "top_upgrade_candidates": upgrade_candidates[:20],
         "fetched_at": datetime.now(UTC).isoformat(),
     }
 
 
 async def get_upgrade_funnel() -> dict[str, Any]:
-    """
-    Return upgrade funnel analytics — how many tenants are in each upgrade stage.
-    """
+    """Fetch upgrade funnel analytics from frothiq-core."""
     try:
-        tenants_data = await core_client.get("/api/v2/internal/tenants")
-        tenants = tenants_data.get("tenants", [])
-    except CoreClientError:
-        tenants = []
-
-    funnel = {
-        "free_to_pro_candidates": 0,
-        "pro_to_enterprise_candidates": 0,
-        "at_limit": 0,
-        "comfortable": 0,
-    }
-
-    for t in tenants:
-        max_sites = t.get("max_sites", 1)
-        active_sites = t.get("active_sites", 0)
-        plan = t.get("plan", "free")
-        utilization = active_sites / max(max_sites, 1)
-
-        if utilization >= 1.0:
-            funnel["at_limit"] += 1
-        elif utilization >= 0.8:
-            if plan == "free":
-                funnel["free_to_pro_candidates"] += 1
-            elif plan == "pro":
-                funnel["pro_to_enterprise_candidates"] += 1
-        else:
-            funnel["comfortable"] += 1
-
-    return funnel
+        return await core_client.get("/api/v2/intelligence/monetization/upgrade-funnel")
+    except CoreClientError as exc:
+        logger.warning("Upgrade funnel unavailable: %s", exc.detail)
+        return {
+            "error": exc.detail,
+            "source": "frothiq-core",
+        }
 
 
 async def get_paywall_analytics() -> dict[str, Any]:
-    """
-    Aggregate paywall hit analytics across all tenants.
-    Uses the frothiq-core intelligence endpoint if available.
-    """
+    """Fetch paywall hit analytics from frothiq-core."""
     try:
         data = await core_client.get("/api/v2/intelligence/paywall-stats")
         return {
             "success": True,
+            "source": "frothiq-core",
             **data,
             "fetched_at": datetime.now(UTC).isoformat(),
         }
@@ -113,6 +105,7 @@ async def get_paywall_analytics() -> dict[str, Any]:
         logger.warning("Paywall analytics unavailable: %s", exc.detail)
         return {
             "success": False,
+            "source": "frothiq-core",
             "total_hits": 0,
             "unique_tenants": 0,
             "error": exc.detail,
@@ -121,62 +114,19 @@ async def get_paywall_analytics() -> dict[str, Any]:
 
 
 async def get_revenue_heatmap(period_days: int = 30) -> dict[str, Any]:
-    """
-    Generate revenue pressure heatmap data by tenant.
-    Each cell represents a tenant's revenue pressure level.
-    """
+    """Fetch revenue pressure heatmap from frothiq-core."""
     try:
-        data = await get_monetization_overview()
-        tenants = data.get("top_upgrade_candidates", [])
-
-        heatmap = []
-        for t in tenants:
-            heatmap.append({
-                "tenant_id": t["tenant_id"],
-                "plan": t["plan"],
-                "pressure": t["utilization"],  # 0.0 – 1.0
-                "action": "upgrade" if t["utilization"] >= 0.9 else "monitor",
-            })
-
+        data = await core_client.get(
+            "/api/v2/intelligence/monetization/revenue-heatmap",
+            params={"period_days": period_days},
+        )
+        return {"source": "frothiq-core", "period_days": period_days, **data}
+    except CoreClientError as exc:
+        logger.error("Revenue heatmap failed: %s", exc.detail)
         return {
+            "source": "frothiq-core",
             "period_days": period_days,
-            "cells": heatmap,
-            "rpi": data.get("revenue_pressure_index", 0.0),
+            "cells": [],
+            "rpi": 0.0,
+            "error": exc.detail,
         }
-    except Exception as exc:
-        logger.error("Revenue heatmap failed: %s", exc)
-        return {"period_days": period_days, "cells": [], "rpi": 0.0}
-
-
-def _next_plan(plan: str) -> str:
-    return {"free": "pro", "pro": "enterprise"}.get(plan, "enterprise")
-
-
-def _estimate_upgrade_signals(tenants: list[dict]) -> int:
-    """Count tenants showing upgrade signals (>80% utilization, not enterprise)."""
-    return sum(
-        1 for t in tenants
-        if t.get("plan") != "enterprise"
-        and (t.get("active_sites", 0) / max(t.get("max_sites", 1), 1)) >= 0.8
-    )
-
-
-def _estimate_paywall_hits(tenants: list[dict]) -> int:
-    """Count tenants at or over limit (paywall-triggering state)."""
-    return sum(
-        1 for t in tenants
-        if t.get("active_sites", 0) >= t.get("max_sites", 1)
-    )
-
-
-def _compute_rpi(plan_breakdown: dict[str, int]) -> float:
-    """
-    Revenue Pressure Index — ratio of free-plan tenants to total.
-    0.0 = all enterprise, 1.0 = all free.
-    A high RPI means strong upgrade pressure exists.
-    """
-    total = sum(plan_breakdown.values())
-    if not total:
-        return 0.0
-    free = plan_breakdown.get("free", 0)
-    return round(free / total, 3)

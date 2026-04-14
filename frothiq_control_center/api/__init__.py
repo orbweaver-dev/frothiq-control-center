@@ -11,6 +11,7 @@ from .routes_simulation import router as simulation_router
 from .routes_flywheel import router as flywheel_router
 from .routes_tenants import router as tenants_router
 from .routes_audit import router as audit_router
+from .routes_commands import router as commands_router
 
 # All control center routes under /api/v1/cc/
 api_router = APIRouter(prefix="/api/v1/cc")
@@ -25,5 +26,6 @@ api_router.include_router(simulation_router)
 api_router.include_router(flywheel_router)
 api_router.include_router(tenants_router)
 api_router.include_router(audit_router)
+api_router.include_router(commands_router)
 
 __all__ = ["api_router"]
