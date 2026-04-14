@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "frothiq-control-center"
+version = "1.0.0"
+description = "FrothIQ Control Center — standalone command authority for the FrothIQ security platform"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = ["E501", "B008"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["frothiq_control_center"]
+omit = ["*/tests/*", "*/conftest.py"]
