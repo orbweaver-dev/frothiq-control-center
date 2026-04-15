@@ -8,6 +8,7 @@ from .defense_service import (
 )
 from .policy_service import (
     get_active_policies,
+    get_distribution_status,
     get_policy_detail,
     get_policy_mesh_overview,
     get_policy_version_history,
@@ -56,7 +57,7 @@ __all__ = [
     "CoreClient", "CoreClientError", "core_client",
     "get_all_clusters", "get_cluster_detail", "get_engine_status",
     "get_propagation_graph", "get_suggested_actions",
-    "get_active_policies", "get_policy_detail", "get_policy_mesh_overview",
+    "get_active_policies", "get_distribution_status", "get_policy_detail", "get_policy_mesh_overview",
     "get_policy_version_history", "rollback_policy",
     "force_sync", "get_all_license_states", "get_sync_health",
     "get_tenant_license", "restore_license", "revoke_license",

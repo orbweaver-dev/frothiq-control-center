@@ -48,9 +48,9 @@ class Settings(BaseSettings):
     admin_ip_allowlist: str = ""  # empty = allow all (dev default)
 
     # -----------------------------------------------------------------
-    # Database (PostgreSQL)
+    # Database (MariaDB)
     # -----------------------------------------------------------------
-    database_url: str = "postgresql+asyncpg://frothiq:frothiq@localhost:5432/frothiq_cc"
+    database_url: str = "mysql+aiomysql://frothiq:frothiq_cc_pass@localhost:3306/frothiq_cc"
 
     # -----------------------------------------------------------------
     # Redis

@@ -28,7 +28,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from frothiq_control_center.auth.dependencies import require_role
-from frothiq_control_center.auth.jwt_handler import TokenData
+from frothiq_control_center.auth.jwt_handler import TokenPayload as TokenData
 from frothiq_control_center.config import get_settings
 from frothiq_control_center.services.audit_service import log_action
 

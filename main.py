@@ -26,7 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from frothiq_control_center import __version__
-from frothiq_control_center.api import api_router
+from frothiq_control_center.api import api_router, edge_registration_router
 from frothiq_control_center.config import get_settings
 from frothiq_control_center.integrations import (
     close_redis,
@@ -56,6 +56,9 @@ async def lifespan(app: FastAPI):
 
     # Initialize database
     await create_tables()
+
+    # Seed default feature flags (idempotent — only sets if missing)
+    await _seed_default_flags()
 
     # Initialize Redis
     cache = get_cache_client()
@@ -90,6 +93,57 @@ async def lifespan(app: FastAPI):
     await dispose_engine()
     await close_redis()
     logger.info("Shutdown complete")
+
+
+async def _seed_default_flags() -> None:
+    """Ensure default feature flags exist in the database.
+
+    Idempotent — only inserts a flag if it has never been set.
+    All flags default to False/off so operators must explicitly enable enforcement.
+    """
+    import uuid
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select
+
+    from frothiq_control_center.integrations.database import get_session_factory as _gsf
+    from frothiq_control_center.models.edge import FeatureFlag
+
+    defaults = {
+        "PLAN_ENFORCEMENT_ENABLED": (
+            False,
+            "When true, enforce plan limits and activate paywall injection. "
+            "Default false — all features accessible regardless of plan.",
+        ),
+        "UPGRADE_SYSTEM_ENABLED": (
+            False,
+            "When true, show upgrade prompts and enable upgrade orchestration.",
+        ),
+        "REGISTRATION_ENABLED": (
+            True,
+            "When false, new edge node registrations are rejected.",
+        ),
+    }
+
+    factory = _gsf()
+    async with factory() as session:
+        for flag_key, (default_value, description) in defaults.items():
+            result = await session.execute(
+                select(FeatureFlag).where(FeatureFlag.flag_key == flag_key)
+            )
+            if result.scalar_one_or_none() is None:
+                session.add(
+                    FeatureFlag(
+                        id=str(uuid.uuid4()),
+                        flag_key=flag_key,
+                        flag_value=default_value,
+                        description=description,
+                        last_changed_by="system",
+                        last_changed_at=datetime.now(UTC),
+                    )
+                )
+                logger.info("feature_flag: seeded %s=%s", flag_key, default_value)
+        await session.commit()
 
 
 def create_app() -> FastAPI:
@@ -127,6 +181,9 @@ def create_app() -> FastAPI:
 
     # API routes
     app.include_router(api_router)
+
+    # Public edge registration (no JWT — accessible to all edge plugins)
+    app.include_router(edge_registration_router)
 
     # WebSocket routes (not under /api/v1/cc prefix)
     app.include_router(ws_router)

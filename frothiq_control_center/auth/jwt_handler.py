@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel
 
@@ -90,3 +92,37 @@ def decode_token(token: str) -> TokenPayload:
 def role_at_least(user_role: str, required_role: str) -> bool:
     """Return True if user_role has equal or greater privilege than required_role."""
     return ROLE_LEVEL.get(user_role, 0) >= ROLE_LEVEL.get(required_role, 999)
+
+
+# ---------------------------------------------------------------------------
+# FastAPI dependency helpers
+# ---------------------------------------------------------------------------
+
+_bearer = HTTPBearer()
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(_bearer),
+) -> TokenPayload:
+    """FastAPI dependency: extract and validate the Bearer JWT."""
+    try:
+        return decode_token(credentials.credentials)
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+
+def require_role(minimum_role: str) -> Callable:
+    """Return a FastAPI dependency that enforces a minimum role level."""
+    async def _checker(
+        current_user: TokenPayload = Depends(get_current_user),
+    ) -> TokenPayload:
+        if not role_at_least(current_user.role, minimum_role):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"Role '{current_user.role}' is insufficient. "
+                    f"Required: {minimum_role} or above."
+                ),
+            )
+        return current_user
+    return _checker
