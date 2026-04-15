@@ -19,7 +19,7 @@ import json
 import logging
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
@@ -140,7 +140,7 @@ async def set_feature_flag(flag_key: str, value: bool, changed_by: str) -> dict[
             session.add(flag)
         else:
             flag.flag_value = value
-            flag.last_changed_at = datetime.now(UTC)
+            flag.last_changed_at = datetime.now(timezone.utc).replace(tzinfo=None)
             flag.last_changed_by = changed_by
         await session.commit()
 
@@ -211,7 +211,7 @@ async def _upsert_node(
         select(EdgeNode).where(EdgeNode.edge_id == edge_id)
     )
     node = result.scalar_one_or_none()
-    now = datetime.now(UTC)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
 
     if node is None:
         node = EdgeNode(

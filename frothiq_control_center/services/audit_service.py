@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -55,7 +55,7 @@ async def log_action(
         "detail": detail,
         "ip_address": ip_address,
         "status": status,
-        "created_at": datetime.now(UTC).isoformat(),
+        "created_at": datetime.now(timezone.utc).replace(tzinfo=None),
     }
 
     # Always log to Python logger

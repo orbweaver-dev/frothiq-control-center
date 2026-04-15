@@ -5,7 +5,7 @@ Auth routes — login, logout, refresh, user management.
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from jose import JWTError
@@ -85,7 +85,7 @@ async def login(
         )
 
     # Update last_login
-    user.last_login = datetime.now(UTC)
+    user.last_login = datetime.now(timezone.utc).replace(tzinfo=None)
     await db.commit()
 
     access_token = create_access_token(user.id, user.role)

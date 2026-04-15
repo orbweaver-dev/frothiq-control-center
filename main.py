@@ -102,7 +102,7 @@ async def _seed_default_flags() -> None:
     All flags default to False/off so operators must explicitly enable enforcement.
     """
     import uuid
-    from datetime import UTC, datetime
+    from datetime import datetime, timezone
 
     from sqlalchemy import select
 
@@ -139,7 +139,7 @@ async def _seed_default_flags() -> None:
                         flag_value=default_value,
                         description=description,
                         last_changed_by="system",
-                        last_changed_at=datetime.now(UTC),
+                        last_changed_at=datetime.now(timezone.utc).replace(tzinfo=None),
                     )
                 )
                 logger.info("feature_flag: seeded %s=%s", flag_key, default_value)
