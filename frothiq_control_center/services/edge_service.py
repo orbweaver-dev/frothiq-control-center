@@ -148,6 +148,31 @@ async def set_feature_flag(flag_key: str, value: bool, changed_by: str) -> dict[
     return {"flag_key": flag_key, "flag_value": value, "changed_by": changed_by}
 
 
+async def get_edge_endpoint(tenant_id: str) -> str | None:
+    """
+    Return the HTTP base URL of the most-recently-seen active edge node for *tenant_id*.
+    Returns None if no active node is registered.
+    The URL is derived from the node's domain field: https://<domain>
+    """
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(
+            select(EdgeNode)
+            .where(EdgeNode.tenant_id == tenant_id)
+            .where(EdgeNode.state.in_(["ACTIVE", "SYNCED"]))
+            .order_by(EdgeNode.last_seen_at.desc())
+        )
+        node = result.scalars().first()
+
+    if node is None:
+        return None
+
+    domain = node.domain.rstrip("/")
+    if not domain.startswith("http"):
+        domain = f"https://{domain}"
+    return domain
+
+
 async def get_registration_stats() -> dict[str, Any]:
     """Summary statistics for the MC3 dashboard."""
     factory = get_session_factory()
