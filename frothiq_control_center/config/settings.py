@@ -101,6 +101,13 @@ class Settings(BaseSettings):
     gateway_signing_key: str = "changeme-gateway-signing-key"
 
     # -----------------------------------------------------------------
+    # Billing sync
+    # -----------------------------------------------------------------
+    # Shared HMAC-SHA256 secret between ERPNext billing bridge and MC3.
+    # Must match CC_BILLING_WEBHOOK_SECRET in both environments.
+    billing_webhook_secret: str = ""
+
+    # -----------------------------------------------------------------
     # Rate limiting
     # -----------------------------------------------------------------
     rate_limit_default: str = "120/minute"
