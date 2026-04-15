@@ -90,12 +90,16 @@ def _save(s: PortalSettings) -> None:
     _SETTINGS_FILE.write_text(s.model_dump_json(indent=2))
 
 
-def _logo_url(filename: str | None) -> str | None:
-    return "/api/v1/cc/settings/portal/logo" if filename else None
+def _logo_url(filename: str | None, updated_at: float | None = None) -> str | None:
+    if not filename:
+        return None
+    # Cache-bust via updated_at so the browser fetches the new file after every save
+    v = int(updated_at or time.time())
+    return f"/api/v1/cc/settings/portal/logo?v={v}"
 
 
 def _public_view(s: PortalSettings) -> dict:
-    return {**s.model_dump(exclude={"logo_filename"}), "logo_url": _logo_url(s.logo_filename)}
+    return {**s.model_dump(exclude={"logo_filename"}), "logo_url": _logo_url(s.logo_filename, s.updated_at)}
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +182,7 @@ async def upload_logo(
     _save(s)
 
     logger.info("Portal logo uploaded by %s → %s", user.sub, dest.name)
-    return {"ok": True, "logo_url": "/api/v1/cc/settings/portal/logo", "filename": dest.name}
+    return {"ok": True, "logo_url": _logo_url(dest.name, s.updated_at), "filename": dest.name}
 
 
 @router.delete("/portal/logo", status_code=status.HTTP_200_OK)
@@ -206,4 +210,7 @@ async def serve_logo():
     path = _UPLOADS_DIR / s.logo_filename
     if not path.exists():
         raise HTTPException(status_code=404, detail="Logo file not found on disk")
-    return FileResponse(str(path))
+    return FileResponse(
+        str(path),
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
