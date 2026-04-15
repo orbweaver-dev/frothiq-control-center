@@ -14,6 +14,7 @@ from frothiq_control_center.models.user import Base
 import frothiq_control_center.models.edge     # noqa: F401
 import frothiq_control_center.models.billing          # noqa: F401
 import frothiq_control_center.models.reconciliation   # noqa: F401
+import frothiq_control_center.models.predictive_sync  # noqa: F401
 
 logger = logging.getLogger(__name__)
 

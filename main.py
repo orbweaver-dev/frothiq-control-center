@@ -40,6 +40,7 @@ from frothiq_control_center.middleware import DBSessionMiddleware, IPAllowlistMi
 from frothiq_control_center.services.core_client import core_client
 from frothiq_control_center.websocket import start_event_dispatcher, ws_router
 from frothiq_control_center.reconciliation.reconciliation_scheduler import ReconciliationScheduler
+from frothiq_control_center.predictive_sync.predictive_sync_orchestrator import PredictiveSyncScheduler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -81,6 +82,13 @@ async def lifespan(app: FastAPI):
         name="reconciliation_scheduler",
     )
 
+    # Start predictive sync scheduler (signal detection + contract pre-staging)
+    predictive_scheduler = PredictiveSyncScheduler()
+    predictive_task = asyncio.create_task(
+        predictive_scheduler.run(),
+        name="predictive_sync_scheduler",
+    )
+
     logger.info(
         "Control Center ready — core: %s | port: %d",
         settings.core_base_url,
@@ -91,10 +99,13 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down FrothIQ Control Center")
+    predictive_task.cancel()
     recon_task.cancel()
     dispatcher_task.cancel()
     try:
-        await asyncio.gather(recon_task, dispatcher_task, return_exceptions=True)
+        await asyncio.gather(
+            predictive_task, recon_task, dispatcher_task, return_exceptions=True
+        )
     except asyncio.CancelledError:
         pass
 

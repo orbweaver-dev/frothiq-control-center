@@ -17,6 +17,7 @@ Architecture rules enforced here:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Annotated, Any
@@ -96,6 +97,20 @@ async def webhook_subscription(
                 )
             except Exception as exc:
                 logger.warning("billing event publish failed: %s", exc)
+
+            # Fire predictive confirmation listener as a background task.
+            # It checks whether any staged (pre-predicted) contract matches
+            # the confirmed state and activates or invalidates it on edges.
+            try:
+                from frothiq_control_center.predictive_sync.confirmation_listener import (
+                    on_billing_confirmed,
+                )
+                asyncio.create_task(
+                    on_billing_confirmed(tenant_id, state),
+                    name=f"confirm_prediction_{tenant_id}",
+                )
+            except Exception as exc:
+                logger.debug("confirmation_listener fire failed: %s", exc)
 
     return result
 
