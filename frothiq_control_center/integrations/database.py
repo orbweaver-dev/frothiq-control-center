@@ -12,7 +12,8 @@ from frothiq_control_center.config import get_settings
 from frothiq_control_center.models.user import Base
 # Import all models so Base.metadata has them registered before create_all()
 import frothiq_control_center.models.edge     # noqa: F401
-import frothiq_control_center.models.billing  # noqa: F401
+import frothiq_control_center.models.billing          # noqa: F401
+import frothiq_control_center.models.reconciliation   # noqa: F401
 
 logger = logging.getLogger(__name__)
 

@@ -39,6 +39,7 @@ from frothiq_control_center.integrations import (
 from frothiq_control_center.middleware import DBSessionMiddleware, IPAllowlistMiddleware
 from frothiq_control_center.services.core_client import core_client
 from frothiq_control_center.websocket import start_event_dispatcher, ws_router
+from frothiq_control_center.reconciliation.reconciliation_scheduler import ReconciliationScheduler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -73,6 +74,13 @@ async def lifespan(app: FastAPI):
         name="event_dispatcher",
     )
 
+    # Start reconciliation scheduler (drift detection + self-healing)
+    recon_scheduler = ReconciliationScheduler()
+    recon_task = asyncio.create_task(
+        recon_scheduler.run(),
+        name="reconciliation_scheduler",
+    )
+
     logger.info(
         "Control Center ready — core: %s | port: %d",
         settings.core_base_url,
@@ -83,9 +91,10 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down FrothIQ Control Center")
+    recon_task.cancel()
     dispatcher_task.cancel()
     try:
-        await dispatcher_task
+        await asyncio.gather(recon_task, dispatcher_task, return_exceptions=True)
     except asyncio.CancelledError:
         pass
 

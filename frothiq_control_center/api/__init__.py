@@ -17,6 +17,7 @@ from .routes_settings import router as settings_router
 from .routes_propagation import router as propagation_router
 from .routes_sync import router as sync_router
 from .routes_billing import router as billing_router
+from .routes_reconciliation import router as reconciliation_router
 
 # All control center routes under /api/v1/cc/
 api_router = APIRouter(prefix="/api/v1/cc")
@@ -42,6 +43,8 @@ api_router.include_router(propagation_router)
 api_router.include_router(sync_router)
 # Billing webhook receiver + state query + drift report
 api_router.include_router(billing_router)
+# Reconciliation engine — drift detection, correction, audit, edge ACK
+api_router.include_router(reconciliation_router)
 
 # Public edge registration (no JWT — separate prefix /api/v1/edge/)
 # This is mounted directly on the FastAPI app in main.py
