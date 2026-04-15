@@ -274,12 +274,16 @@ async def upload_logo(
     """Upload a new portal (login page) logo. Clears any URL override."""
     dest = await _save_upload(file, "portal_logo")
     s = _load()
-    _delete_file(s.logo_filename)          # remove old file if different suffix
+    old_filename = s.logo_filename
     s.logo_filename    = dest.name
     s.logo_url_override = None             # file takes over; clear URL override
     s.updated_at = time.time()
     s.updated_by = user.sub
     _save(s)
+    # Only delete old file after settings are saved, and only when name differs
+    # (same name means new content already overwrote the old file in _save_upload)
+    if old_filename and old_filename != dest.name:
+        _delete_file(old_filename)
     logo_url = _resolve_logo_url(None, dest.name, "/api/v1/cc/settings/portal/logo", s.updated_at)
     logger.info("Portal logo uploaded by %s → %s", user.sub, dest.name)
     return {"ok": True, "logo_url": logo_url, "filename": dest.name}
@@ -316,12 +320,14 @@ async def upload_menu_logo(
     """Upload a new menu (sidebar) logo. Clears any URL override."""
     dest = await _save_upload(file, "menu_logo")
     s = _load()
-    _delete_file(s.menu_logo_filename)
+    old_filename = s.menu_logo_filename
     s.menu_logo_filename    = dest.name
     s.menu_logo_url_override = None
     s.updated_at = time.time()
     s.updated_by = user.sub
     _save(s)
+    if old_filename and old_filename != dest.name:
+        _delete_file(old_filename)
     logo_url = _resolve_logo_url(None, dest.name, "/api/v1/cc/settings/portal/menu-logo", s.updated_at)
     logger.info("Menu logo uploaded by %s → %s", user.sub, dest.name)
     return {"ok": True, "logo_url": logo_url, "filename": dest.name}
@@ -358,12 +364,14 @@ async def upload_favicon(
     """Upload a new browser tab favicon. Accepted: ICO, PNG, SVG — max 2 MB."""
     dest = await _save_upload(file, "favicon")
     s = _load()
-    _delete_file(s.favicon_filename)
+    old_filename = s.favicon_filename
     s.favicon_filename    = dest.name
     s.favicon_url_override = None
     s.updated_at = time.time()
     s.updated_by = user.sub
     _save(s)
+    if old_filename and old_filename != dest.name:
+        _delete_file(old_filename)
     favicon_url = _resolve_logo_url(None, dest.name, "/api/v1/cc/settings/portal/favicon", s.updated_at)
     logger.info("Favicon uploaded by %s → %s", user.sub, dest.name)
     return {"ok": True, "favicon_url": favicon_url, "filename": dest.name}
