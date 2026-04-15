@@ -32,7 +32,7 @@ router = APIRouter(prefix="/settings", tags=["settings"])
 # ---------------------------------------------------------------------------
 
 _SETTINGS_ROOT = Path(
-    os.environ.get("CC_PORTAL_SETTINGS_DIR", "/usr/lib/frothiq-control-center")
+    os.environ.get("CC_PORTAL_SETTINGS_DIR", "/var/lib/frothiq/control-center")
 )
 _SETTINGS_FILE = _SETTINGS_ROOT / "portal_settings.json"
 _UPLOADS_DIR = _SETTINGS_ROOT / "uploads"
