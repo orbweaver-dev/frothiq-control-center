@@ -9,8 +9,11 @@ GET    /settings/portal/logo         — public; serves the uploaded portal logo
 POST   /settings/portal/menu-logo    — super_admin; multipart upload (sidebar logo)
 DELETE /settings/portal/menu-logo    — super_admin
 GET    /settings/portal/menu-logo    — public; serves the uploaded menu logo file
+POST   /settings/portal/favicon      — super_admin; multipart upload (browser tab favicon)
+DELETE /settings/portal/favicon      — super_admin
+GET    /settings/portal/favicon      — public; serves the uploaded favicon file
 
-Logo source priority (per logo slot):
+Logo/favicon source priority (per slot):
   1. url_override — external URL stored in settings JSON
   2. filename     — file uploaded to /var/lib/frothiq/control-center/uploads/
   Setting one clears the other so they are always mutually exclusive.
@@ -51,6 +54,8 @@ _ALLOWED_TYPES = {
     "image/svg+xml",
     "image/gif",
     "image/webp",
+    "image/x-icon",
+    "image/vnd.microsoft.icon",
 }
 _MAX_LOGO_BYTES = 2 * 1024 * 1024  # 2 MB
 
@@ -67,6 +72,9 @@ class PortalSettings(BaseModel):
     # Sidebar / menu logo
     menu_logo_filename:    Optional[str] = None
     menu_logo_url_override: Optional[str] = None
+    # Browser tab favicon
+    favicon_filename:      Optional[str] = None
+    favicon_url_override:  Optional[str] = None
     # Appearance
     theme_accent:          str           = "#4f8ef7"
     # Security
@@ -87,6 +95,7 @@ class PortalSettingsPatch(BaseModel):
     # Pass empty string to clear; non-empty to set (clears the filename counterpart)
     logo_url_override:       Optional[str]  = None
     menu_logo_url_override:  Optional[str]  = None
+    favicon_url_override:    Optional[str]  = None
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +136,7 @@ def _resolve_logo_url(
 
 def _public_view(s: PortalSettings) -> dict:
     return {
-        **s.model_dump(exclude={"logo_filename", "menu_logo_filename"}),
+        **s.model_dump(exclude={"logo_filename", "menu_logo_filename", "favicon_filename"}),
         "logo_url": _resolve_logo_url(
             s.logo_url_override, s.logo_filename,
             "/api/v1/cc/settings/portal/logo", s.updated_at,
@@ -135,6 +144,10 @@ def _public_view(s: PortalSettings) -> dict:
         "menu_logo_url": _resolve_logo_url(
             s.menu_logo_url_override, s.menu_logo_filename,
             "/api/v1/cc/settings/portal/menu-logo", s.updated_at,
+        ),
+        "favicon_url": _resolve_logo_url(
+            s.favicon_url_override, s.favicon_filename,
+            "/api/v1/cc/settings/portal/favicon", s.updated_at,
         ),
     }
 
@@ -232,6 +245,15 @@ async def update_portal_settings(
         else:
             s.menu_logo_url_override = None
 
+    # URL override for favicon
+    if patch.favicon_url_override is not None:
+        if patch.favicon_url_override:
+            _delete_file(s.favicon_filename)
+            s.favicon_filename    = None
+            s.favicon_url_override = patch.favicon_url_override
+        else:
+            s.favicon_url_override = None
+
     s.updated_at = time.time()
     s.updated_by = user.sub
     _save(s)
@@ -322,3 +344,45 @@ async def delete_menu_logo(user: TokenPayload = Depends(require_super_admin)):
 async def serve_menu_logo():
     """Serve the uploaded menu logo. Public endpoint."""
     return _serve_file(_load().menu_logo_filename, "menu logo")
+
+
+# ---------------------------------------------------------------------------
+# Routes — favicon
+# ---------------------------------------------------------------------------
+
+@router.post("/portal/favicon", status_code=status.HTTP_200_OK)
+async def upload_favicon(
+    file: UploadFile = File(...),
+    user: TokenPayload = Depends(require_super_admin),
+):
+    """Upload a new browser tab favicon. Accepted: ICO, PNG, SVG — max 2 MB."""
+    dest = await _save_upload(file, "favicon")
+    s = _load()
+    _delete_file(s.favicon_filename)
+    s.favicon_filename    = dest.name
+    s.favicon_url_override = None
+    s.updated_at = time.time()
+    s.updated_by = user.sub
+    _save(s)
+    favicon_url = _resolve_logo_url(None, dest.name, "/api/v1/cc/settings/portal/favicon", s.updated_at)
+    logger.info("Favicon uploaded by %s → %s", user.sub, dest.name)
+    return {"ok": True, "favicon_url": favicon_url, "filename": dest.name}
+
+
+@router.delete("/portal/favicon", status_code=status.HTTP_200_OK)
+async def delete_favicon(user: TokenPayload = Depends(require_super_admin)):
+    """Remove the uploaded favicon and revert to default."""
+    s = _load()
+    _delete_file(s.favicon_filename)
+    s.favicon_filename = None
+    s.updated_at = time.time()
+    s.updated_by = user.sub
+    _save(s)
+    logger.info("Favicon removed by %s", user.sub)
+    return {"ok": True, "favicon_url": None}
+
+
+@router.get("/portal/favicon")
+async def serve_favicon():
+    """Serve the uploaded favicon. Public endpoint."""
+    return _serve_file(_load().favicon_filename, "favicon")
