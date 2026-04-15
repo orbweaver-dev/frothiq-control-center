@@ -13,6 +13,7 @@ from .routes_tenants import router as tenants_router
 from .routes_audit import router as audit_router
 from .routes_commands import router as commands_router
 from .routes_edge import public_router as edge_public_router, protected_router as edge_protected_router
+from .routes_settings import router as settings_router
 
 # All control center routes under /api/v1/cc/
 api_router = APIRouter(prefix="/api/v1/cc")
@@ -30,6 +31,8 @@ api_router.include_router(audit_router)
 api_router.include_router(commands_router)
 # Edge management routes (JWT protected, under /api/v1/cc/)
 api_router.include_router(edge_protected_router)
+# Portal settings (GET is public; write endpoints require super_admin)
+api_router.include_router(settings_router)
 
 # Public edge registration (no JWT — separate prefix /api/v1/edge/)
 # This is mounted directly on the FastAPI app in main.py
