@@ -40,6 +40,12 @@ logger = logging.getLogger(__name__)
 _ACCURACY_REDIS_KEY  = "frothiq:prediction:accuracy"
 _ACCURACY_REDIS_TTL  = 7 * 86400   # 7 days rolling window in Redis
 
+# Rule 7 counter keys within the accuracy hash
+_COUNTER_INCORRECT_AUTO_ACTIVATION = "incorrect_auto_activation_count"
+_COUNTER_REPLACEMENTS               = "staged_contract_replacements"
+_COUNTER_COLLISIONS                 = "prediction_collision_count"
+_COUNTER_EDGE_REJECTIONS            = "edge_rejection_count"
+
 
 class OutcomeType(str, Enum):
     CORRECT   = "correct"
@@ -81,6 +87,62 @@ async def record_outcome(
 
 
 # ---------------------------------------------------------------------------
+# Rule 7: safety counter increments
+# ---------------------------------------------------------------------------
+
+async def record_incorrect_auto_activation(tenant_id: str) -> None:
+    """
+    Increment the incorrect_auto_activation_count counter.
+    Called when an edge activated a staged contract that later turned out wrong.
+    """
+    await _increment_safety_counter(_COUNTER_INCORRECT_AUTO_ACTIVATION, tenant_id)
+
+
+async def record_replacement(tenant_id: str) -> None:
+    """
+    Increment the staged_contract_replacements counter.
+    Called when a staged contract is atomically retired and replaced (Rule 2).
+    """
+    await _increment_safety_counter(_COUNTER_REPLACEMENTS, tenant_id)
+
+
+async def record_collision(tenant_id: str) -> None:
+    """
+    Increment the prediction_collision_count counter.
+    Called when multiple signals fire for the same tenant in one scan cycle (Rule 5).
+    """
+    await _increment_safety_counter(_COUNTER_COLLISIONS, tenant_id)
+
+
+async def record_edge_rejection(tenant_id: str, edge_id: str) -> None:
+    """
+    Increment the edge_rejection_count counter.
+    Called when an edge rejects a staged contract (activation guard check failed).
+    """
+    await _increment_safety_counter(_COUNTER_EDGE_REJECTIONS, tenant_id, edge_id=edge_id)
+
+
+async def _increment_safety_counter(
+    counter_key: str,
+    tenant_id: str,
+    edge_id: str | None = None,
+) -> None:
+    """Atomically increment a Rule-7 safety counter in the accuracy Redis hash."""
+    try:
+        redis = await get_cache_client()
+        pipe  = redis.pipeline()
+        pipe.hincrby(_ACCURACY_REDIS_KEY, counter_key, 1)
+        # Also track per-tenant for debugging
+        pipe.hincrby(_ACCURACY_REDIS_KEY, f"tenant:{tenant_id}:{counter_key}", 1)
+        if edge_id:
+            pipe.hincrby(_ACCURACY_REDIS_KEY, f"edge:{edge_id}:{counter_key}", 1)
+        pipe.expire(_ACCURACY_REDIS_KEY, _ACCURACY_REDIS_TTL)
+        await pipe.execute()
+    except Exception as exc:
+        logger.warning("_increment_safety_counter(%s) failed: %s", counter_key, exc)
+
+
+# ---------------------------------------------------------------------------
 # Read: accuracy metrics
 # ---------------------------------------------------------------------------
 
@@ -103,6 +165,9 @@ async def get_accuracy_metrics(window_hours: int = 24) -> dict[str, Any]:
     accuracy    = round(correct / total, 3) if total > 0 else 0.0
     mean_latency = db_metrics.get("mean_latency_saved_ms") or 0.0
 
+    # Rule 7: read safety counters from Redis
+    safety = await _read_safety_counters()
+
     return {
         "window_hours":          window_hours,
         "total_predictions":     total,
@@ -113,6 +178,11 @@ async def get_accuracy_metrics(window_hours: int = 24) -> dict[str, Any]:
         "mean_latency_saved_ms": round(mean_latency, 1),
         "drift_prevented_count": correct,       # every correct prediction prevented a drift window
         "by_signal_type":        db_metrics.get("by_signal_type", {}),
+        # Rule 7 safety counters (all-time rolling)
+        "incorrect_auto_activation_count": safety.get(_COUNTER_INCORRECT_AUTO_ACTIVATION, 0),
+        "staged_contract_replacements":    safety.get(_COUNTER_REPLACEMENTS, 0),
+        "prediction_collision_count":      safety.get(_COUNTER_COLLISIONS, 0),
+        "edge_rejection_count":            safety.get(_COUNTER_EDGE_REJECTIONS, 0),
         "rolling_totals":        redis_totals,
         "computed_at":           time.time(),
     }
@@ -163,6 +233,26 @@ async def _increment_redis(
         await pipe.execute()
     except Exception as exc:
         logger.warning("_increment_redis accuracy failed: %s", exc)
+
+
+async def _read_safety_counters() -> dict[str, int]:
+    """Read the four Rule-7 safety counters from Redis."""
+    try:
+        redis = await get_cache_client()
+        keys  = [
+            _COUNTER_INCORRECT_AUTO_ACTIVATION,
+            _COUNTER_REPLACEMENTS,
+            _COUNTER_COLLISIONS,
+            _COUNTER_EDGE_REJECTIONS,
+        ]
+        values = await redis.hmget(_ACCURACY_REDIS_KEY, *keys)
+        return {
+            k: int(v or 0)
+            for k, v in zip(keys, values)
+        }
+    except Exception as exc:
+        logger.warning("_read_safety_counters failed: %s", exc)
+        return {}
 
 
 async def _read_redis_counters() -> dict[str, Any]:

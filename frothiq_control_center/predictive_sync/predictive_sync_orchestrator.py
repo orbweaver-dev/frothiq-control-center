@@ -52,21 +52,19 @@ async def run_for_tenant(tenant_id: str) -> list[dict[str, Any]]:
     """
     Run the full predictive pipeline for one tenant.
     Returns a list of dispatch result dicts (one per actionable signal).
+
+    Rule 2: atomic replacement is handled by dispatch_staged_contract()
+    via _retire_existing_contract() — no need to skip here.
     """
     results: list[dict[str, Any]] = []
-
-    # Don't generate a new staged contract if one already exists and is active
-    existing = await get_staged_contract(tenant_id)
-    if existing and _contract_still_valid(existing):
-        logger.debug("run_for_tenant: active staged contract exists for %s — skipping", tenant_id)
-        return results
 
     signals = await detect_signals_for_tenant(tenant_id)
     if not signals:
         return results
 
-    # Use the highest-confidence actionable signal
-    best_signal = max(signals, key=lambda s: s.confidence_score)
+    # Rule 5: pick highest-confidence signal; break ties by restrictiveness
+    # then earliest expected activation window start
+    best_signal = _select_best_signal(signals)
     if best_signal.confidence_score < _CONTRACT_THRESHOLD:
         return results
 
@@ -102,16 +100,32 @@ async def run_for_tenant(tenant_id: str) -> list[dict[str, Any]]:
 
 
 async def run_all_tenants() -> dict[str, Any]:
-    """Run the predictive pipeline for all known tenants."""
+    """
+    Run the predictive pipeline for all known tenants.
+
+    Rule 5 — Collision resolution:
+      When multiple signals fire for the same tenant, choose the best one
+      via _select_best_signal():
+        1. Highest confidence score
+        2. Tie-break: more restrictive transition wins
+        3. Tie-break: earliest expected activation window start wins
+    """
     signals  = await detect_signals_all_tenants()
     if not signals:
         return {"total": 0, "staged": 0, "skipped": 0}
 
-    # Deduplicate: one run per tenant (highest-confidence signal wins)
-    by_tenant: dict[str, Any] = {}
+    # Group by tenant
+    by_tenant: dict[str, list[Any]] = {}
     for s in signals:
-        if s.tenant_id not in by_tenant or s.confidence_score > by_tenant[s.tenant_id].confidence_score:
-            by_tenant[s.tenant_id] = s
+        by_tenant.setdefault(s.tenant_id, []).append(s)
+
+    # Record collisions (Rule 7)
+    from frothiq_control_center.predictive_sync.prediction_accuracy_tracker import (
+        record_collision,
+    )
+    collision_tenants = [t for t, sigs in by_tenant.items() if len(sigs) > 1]
+    for tenant_id in collision_tenants:
+        await record_collision(tenant_id)
 
     staged  = 0
     skipped = 0
@@ -122,13 +136,33 @@ async def run_all_tenants() -> dict[str, Any]:
         else:
             skipped += 1
 
-    return {"total": len(by_tenant), "staged": staged, "skipped": skipped}
+    return {
+        "total":      len(by_tenant),
+        "staged":     staged,
+        "skipped":    skipped,
+        "collisions": len(collision_tenants),
+    }
 
 
-def _contract_still_valid(contract: dict[str, Any]) -> bool:
-    """Return True if a staged contract has not yet expired."""
-    valid_until = float(contract.get("max_valid_until") or contract.get("valid_until") or 0)
-    return valid_until > time.time()
+def _select_best_signal(signals: list[Any]) -> Any:
+    """
+    Rule 5 — Choose the best signal from a list:
+      1. Highest confidence score
+      2. Tie-break: more restrictive transition (higher RESTRICTIVE_ORDER rank)
+      3. Tie-break: earliest expected window start (smallest timestamp)
+    """
+    from frothiq_control_center.predictive_sync.preemptive_contract_generator import (
+        RESTRICTIVE_ORDER,
+    )
+
+    def _sort_key(s: Any) -> tuple:
+        to_state = (getattr(s, "predicted_status", None) or "").lower()
+        restriction_rank = RESTRICTIVE_ORDER.get(to_state, 1)
+        activation_ts = float(getattr(s, "expected_window_start", None) or time.time())
+        # Sort by: conf DESC, restriction DESC, activation ASC
+        return (-s.confidence_score, -restriction_rank, activation_ts)
+
+    return min(signals, key=_sort_key)
 
 
 # ---------------------------------------------------------------------------
