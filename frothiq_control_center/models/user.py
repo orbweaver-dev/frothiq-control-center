@@ -35,6 +35,9 @@ class CCUser(Base):
     last_login: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # Optional: IP allowlist for this specific admin user
     ip_allowlist: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # TOTP / Google Authenticator 2FA
+    totp_secret: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
 class AuditLog(Base):

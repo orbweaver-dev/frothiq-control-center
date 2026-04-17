@@ -52,7 +52,22 @@ async def create_tables() -> None:
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(lambda c: Base.metadata.create_all(c, checkfirst=True))
+    await _migrate_totp_columns()
     logger.info("Database tables ready")
+
+
+async def _migrate_totp_columns() -> None:
+    """Add TOTP columns to cc_users if they don't already exist (idempotent)."""
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await conn.execute(
+            __import__("sqlalchemy").text(
+                "ALTER TABLE cc_users "
+                "ADD COLUMN IF NOT EXISTS totp_secret VARCHAR(64) NULL, "
+                "ADD COLUMN IF NOT EXISTS totp_enabled BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+        )
+    logger.info("TOTP columns ensured on cc_users")
 
 
 async def dispose_engine() -> None:

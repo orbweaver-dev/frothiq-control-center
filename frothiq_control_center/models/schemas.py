@@ -26,6 +26,32 @@ class TokenResponse(BaseModel):
     role: str
     user_id: str
     full_name: str
+    mfa_required: bool = False
+    mfa_challenge_token: str | None = None
+
+
+class MFAChallengeRequest(BaseModel):
+    """Submit a TOTP code to complete login after password auth."""
+    mfa_challenge_token: str
+    totp_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+class TOTPSetupResponse(BaseModel):
+    """Returned when a user initiates 2FA setup."""
+    provisioning_uri: str   # otpauth:// URI for QR code
+    qr_code_png_b64: str    # base64-encoded PNG — display as <img src="data:image/png;base64,..."/>
+    secret: str             # raw base32 secret for manual entry
+
+
+class TOTPVerifySetupRequest(BaseModel):
+    """User submits a code from Google Authenticator to confirm setup."""
+    totp_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+class TOTPDisableRequest(BaseModel):
+    """Disable 2FA — requires current password and a valid TOTP code."""
+    password: str
+    totp_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
 
 
 class RefreshRequest(BaseModel):
@@ -46,6 +72,7 @@ class UserResponse(BaseModel):
     full_name: str
     role: str
     is_active: bool
+    totp_enabled: bool = False
     created_at: datetime
     last_login: datetime | None = None
 

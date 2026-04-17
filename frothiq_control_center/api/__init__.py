@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from .routes_auth import router as auth_router
+from .routes_mfa import router as mfa_router
 from .routes_dashboard import router as dashboard_router
 from .routes_defense import router as defense_router
 from .routes_policy import router as policy_router
@@ -23,6 +24,7 @@ from .routes_predictive import router as predictive_router
 # All control center routes under /api/v1/cc/
 api_router = APIRouter(prefix="/api/v1/cc")
 api_router.include_router(auth_router)
+api_router.include_router(mfa_router)
 api_router.include_router(dashboard_router)
 api_router.include_router(defense_router)
 api_router.include_router(policy_router)

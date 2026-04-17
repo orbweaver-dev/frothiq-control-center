@@ -38,6 +38,7 @@ ROLE_LEVEL: dict[str, int] = {
 
 TOKEN_TYPE_ACCESS = "access"
 TOKEN_TYPE_REFRESH = "refresh"
+TOKEN_TYPE_MFA_CHALLENGE = "mfa_challenge"
 
 
 class TokenPayload(BaseModel):
@@ -73,6 +74,23 @@ def create_refresh_token(user_id: str, role: Role) -> str:
         "sub": user_id,
         "role": role,
         "type": TOKEN_TYPE_REFRESH,
+        "iat": now,
+        "exp": expire,
+    }
+    return jwt.encode(payload, settings.secret_key, algorithm=settings.jwt_algorithm)
+
+
+def create_mfa_challenge_token(user_id: str, jti: str) -> str:
+    """Short-lived (5 min) token issued after password auth when 2FA is required.
+    The frontend holds this and exchanges it + a valid TOTP code for a full JWT."""
+    settings = get_settings()
+    now = datetime.now(UTC)
+    expire = now + timedelta(minutes=5)
+    payload: dict[str, Any] = {
+        "sub": user_id,
+        "role": "read_only",   # placeholder — real role issued after TOTP verify
+        "type": TOKEN_TYPE_MFA_CHALLENGE,
+        "jti": jti,
         "iat": now,
         "exp": expire,
     }

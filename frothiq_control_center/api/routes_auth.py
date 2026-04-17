@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -14,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from frothiq_control_center.middleware.rate_limiter import limiter
+from frothiq_control_center.auth.jwt_handler import create_mfa_challenge_token
 
 from frothiq_control_center.auth import (
     TokenPayload,
@@ -38,6 +40,9 @@ from frothiq_control_center.services.audit_service import log_action
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+_MFA_CHALLENGE_PREFIX = "cc:mfa_challenge:"
+_MFA_CHALLENGE_TTL = 300  # 5 minutes
 
 # ---------------------------------------------------------------------------
 # Account lockout constants
@@ -139,6 +144,31 @@ async def login(
     await _clear_failures(payload.email, redis)
     user.last_login = datetime.now(timezone.utc).replace(tzinfo=None)
     await db.commit()
+
+    # If 2FA is enabled, issue a short-lived challenge token instead of a full JWT
+    if user.totp_enabled:
+        jti = str(uuid.uuid4())
+        challenge_token = create_mfa_challenge_token(user.id, jti)
+        await redis.setex(f"{_MFA_CHALLENGE_PREFIX}{jti}", _MFA_CHALLENGE_TTL, "1")
+
+        await log_action(
+            action="auth.login.mfa_required",
+            user_id=user.id,
+            user_email=user.email,
+            ip_address=client_ip,
+            db=db,
+            redis=redis,
+        )
+
+        return TokenResponse(
+            access_token="",
+            refresh_token="",
+            role=user.role,
+            user_id=user.id,
+            full_name=user.full_name,
+            mfa_required=True,
+            mfa_challenge_token=challenge_token,
+        )
 
     access_token = create_access_token(user.id, user.role)
     refresh_token = create_refresh_token(user.id, user.role)
