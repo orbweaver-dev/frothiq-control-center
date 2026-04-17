@@ -24,6 +24,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
 from frothiq_control_center import __version__
 from frothiq_control_center.api import api_router, edge_registration_router
@@ -36,7 +38,7 @@ from frothiq_control_center.integrations import (
     get_pubsub_client,
     get_session_factory,
 )
-from frothiq_control_center.middleware import DBSessionMiddleware, IPAllowlistMiddleware
+from frothiq_control_center.middleware import DBSessionMiddleware, IPAllowlistMiddleware, limiter
 from frothiq_control_center.services.core_client import core_client
 from frothiq_control_center.websocket import start_event_dispatcher, ws_router
 from frothiq_control_center.reconciliation.reconciliation_scheduler import ReconciliationScheduler
@@ -190,6 +192,10 @@ def create_app() -> FastAPI:
         allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type", "X-Service-Key"],
     )
+
+    # Rate limiting (slowapi + Redis)
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
     # IP allowlist (admin endpoint protection)
     app.add_middleware(IPAllowlistMiddleware)

@@ -4,6 +4,7 @@ Auth routes — login, logout, refresh, user management.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import datetime, timezone
 
@@ -11,6 +12,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from jose import JWTError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from frothiq_control_center.middleware.rate_limiter import limiter
 
 from frothiq_control_center.auth import (
     TokenPayload,
@@ -36,6 +39,47 @@ from frothiq_control_center.services.audit_service import log_action
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+# ---------------------------------------------------------------------------
+# Account lockout constants
+# ---------------------------------------------------------------------------
+_LOCKOUT_MAX_FAILURES = 5        # failures before lockout
+_LOCKOUT_WINDOW_SECONDS = 900    # 15-minute rolling window
+_LOCKOUT_DURATION_SECONDS = 900  # lockout duration (15 minutes)
+
+
+def _lockout_key(email: str) -> str:
+    """Redis key for tracking login failures. Hashed to avoid PII in key names."""
+    digest = hashlib.sha256(email.lower().encode()).hexdigest()[:16]
+    return f"cc:login_failures:{digest}"
+
+
+async def _check_lockout(email: str, redis) -> None:
+    """Raise 429 if the account is currently locked out."""
+    key = _lockout_key(email)
+    raw = await redis.get(key)
+    if raw and int(raw) >= _LOCKOUT_MAX_FAILURES:
+        ttl = await redis.ttl(key)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Account temporarily locked due to too many failed attempts. "
+                   f"Try again in {max(ttl, 1)} seconds.",
+            headers={"Retry-After": str(max(ttl, 1))},
+        )
+
+
+async def _record_failure(email: str, redis) -> None:
+    """Increment failure counter; set/refresh TTL on first failure."""
+    key = _lockout_key(email)
+    count = await redis.incr(key)
+    if count == 1:
+        await redis.expire(key, _LOCKOUT_WINDOW_SECONDS)
+    logger.warning("Login failure #%d for account (hash %s)", count, key[-8:])
+
+
+async def _clear_failures(email: str, redis) -> None:
+    """Clear failure counter on successful login."""
+    await redis.delete(_lockout_key(email))
+
 
 def _get_db(request: Request) -> AsyncSession:
     return request.state.db
@@ -50,19 +94,26 @@ def _get_redis(request: Request):
 # ---------------------------------------------------------------------------
 
 @router.post("/login", response_model=TokenResponse)
+@limiter.limit("10/minute")
 async def login(
-    payload: LoginRequest,
     request: Request,
+    payload: LoginRequest,
 ):
     """Authenticate with email + password. Returns JWT access + refresh tokens."""
     db: AsyncSession = _get_db(request)
     redis = _get_redis(request)
     client_ip = request.client.host if request.client else None
 
+    # Check account lockout before touching the DB
+    await _check_lockout(payload.email, redis)
+
     result = await db.execute(select(CCUser).where(CCUser.email == payload.email))
     user = result.scalar_one_or_none()
 
     if not user or not verify_password(payload.password, user.hashed_password):
+        # Record failure against this email regardless of whether account exists
+        # (avoids user enumeration via timing difference in lockout behavior)
+        await _record_failure(payload.email, redis)
         await log_action(
             action="auth.login.failed",
             user_id=None,
@@ -84,7 +135,8 @@ async def login(
             detail="Account is disabled. Contact your administrator.",
         )
 
-    # Update last_login
+    # Success — clear any accumulated failures and update last_login
+    await _clear_failures(payload.email, redis)
     user.last_login = datetime.now(timezone.utc).replace(tzinfo=None)
     await db.commit()
 
