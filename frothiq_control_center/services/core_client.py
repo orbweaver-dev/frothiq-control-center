@@ -30,7 +30,7 @@ _CACHEABLE: dict[str, int] = {
     "/api/v2/simulation/status": 60,
     "/api/v2/simulation/scenarios": 300,
     "/api/v1/get-rules": 60,
-    "/api/v2/internal/health": 10,
+    "/api/v2/health": 10,
 }
 
 _core_healthy: bool = True
@@ -217,7 +217,7 @@ class CoreClient:
     async def health_check(self) -> dict[str, Any]:
         """Check frothiq-core health. Returns status dict even on failure."""
         try:
-            data = await self.get("/api/v2/internal/health", bypass_cache=True)
+            data = await self.get("/api/v2/health", bypass_cache=True)
             return {"status": "online", **data}
         except CoreClientError as exc:
             return {"status": "degraded", "detail": exc.detail}
