@@ -15,8 +15,10 @@ Login flow when 2FA is enabled:
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import logging
+import os
 import uuid
 
 import pyotp
@@ -54,6 +56,51 @@ _PENDING_SECRET_TTL = 600  # 10 minutes to complete setup
 # Redis key prefix for MFA challenge tokens (revoked once used)
 _MFA_CHALLENGE_PREFIX = "cc:mfa_challenge:"
 _MFA_CHALLENGE_TTL = 300   # 5 minutes
+# Trusted device tokens (stored as sha256 hash, keyed by user_id + token_hash)
+_DEVICE_TOKEN_PREFIX = "cc:trusted_device:"
+_DEVICE_TOKEN_TTL = 60 * 60 * 24 * 30  # 30 days
+
+
+def _device_token_key(user_id: str, raw_token: str) -> str:
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    return f"{_DEVICE_TOKEN_PREFIX}{user_id}:{token_hash}"
+
+
+def _generate_device_token() -> str:
+    """Return a 64-char hex string (32 random bytes)."""
+    return os.urandom(32).hex()
+
+
+async def _issue_device_token(user_id: str, redis) -> str:
+    """Generate, store (hashed), and return a new trusted-device token."""
+    raw = _generate_device_token()
+    key = _device_token_key(user_id, raw)
+    await redis.setex(key, _DEVICE_TOKEN_TTL, "1")
+    return raw
+
+
+async def _verify_device_token(user_id: str, raw_token: str, redis) -> bool:
+    """Return True if the raw token maps to a valid stored hash for this user."""
+    if not raw_token:
+        return False
+    key = _device_token_key(user_id, raw_token)
+    exists = await redis.exists(key)
+    if exists:
+        # Sliding window: refresh TTL on each valid use
+        await redis.expire(key, _DEVICE_TOKEN_TTL)
+    return bool(exists)
+
+
+async def _revoke_all_device_tokens(user_id: str, redis) -> None:
+    """Remove all trusted-device tokens for a user (called when 2FA is disabled)."""
+    pattern = f"{_DEVICE_TOKEN_PREFIX}{user_id}:*"
+    cursor = 0
+    while True:
+        cursor, keys = await redis.scan(cursor, match=pattern, count=100)
+        if keys:
+            await redis.delete(*keys)
+        if cursor == 0:
+            break
 
 
 def _get_db(request: Request) -> AsyncSession:
@@ -219,6 +266,9 @@ async def disable_2fa(
     user.totp_enabled = False
     await db.commit()
 
+    # Revoke all trusted-device tokens — device trust is invalidated when 2FA is removed
+    await _revoke_all_device_tokens(user.id, redis)
+
     await log_action(
         action="auth.2fa.disabled",
         user_id=current_user.sub,
@@ -310,11 +360,17 @@ async def mfa_challenge(
     access_token = create_access_token(user.id, user.role)
     refresh_token = create_refresh_token(user.id, user.role)
 
+    # Issue a trusted-device token if the user opted in
+    new_device_token: str | None = None
+    if payload.remember_device:
+        new_device_token = await _issue_device_token(user.id, redis)
+
     await log_action(
         action="auth.login.success",
         user_id=user.id,
         user_email=user.email,
         ip_address=client_ip,
+        detail="2FA verified" + (" — device trusted" if new_device_token else ""),
         db=db,
         redis=redis,
     )
@@ -325,4 +381,5 @@ async def mfa_challenge(
         role=user.role,
         user_id=user.id,
         full_name=user.full_name,
+        device_token=new_device_token,
     )

@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from frothiq_control_center.middleware.rate_limiter import limiter
 from frothiq_control_center.auth.jwt_handler import create_mfa_challenge_token
+from frothiq_control_center.api.routes_mfa import _verify_device_token
 
 from frothiq_control_center.auth import (
     TokenPayload,
@@ -145,8 +146,26 @@ async def login(
     user.last_login = datetime.now(timezone.utc).replace(tzinfo=None)
     await db.commit()
 
-    # If 2FA is enabled, issue a short-lived challenge token instead of a full JWT
+    # If 2FA is enabled, check for a trusted device token before issuing a challenge
     if user.totp_enabled:
+        if payload.device_token and await _verify_device_token(user.id, payload.device_token, redis):
+            # Trusted device — skip 2FA, issue full JWT directly
+            await log_action(
+                action="auth.login.success",
+                user_id=user.id,
+                user_email=user.email,
+                ip_address=client_ip,
+                detail="trusted device — 2FA skipped",
+                db=db,
+                redis=redis,
+            )
+            return TokenResponse(
+                access_token=create_access_token(user.id, user.role),
+                refresh_token=create_refresh_token(user.id, user.role),
+                role=user.role,
+                user_id=user.id,
+                full_name=user.full_name,
+            )
         jti = str(uuid.uuid4())
         challenge_token = create_mfa_challenge_token(user.id, jti)
         await redis.setex(f"{_MFA_CHALLENGE_PREFIX}{jti}", _MFA_CHALLENGE_TTL, "1")

@@ -17,6 +17,7 @@ from pydantic import BaseModel, EmailStr, Field
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+    device_token: str | None = None  # trusted-device bypass token
 
 
 class TokenResponse(BaseModel):
@@ -28,12 +29,14 @@ class TokenResponse(BaseModel):
     full_name: str
     mfa_required: bool = False
     mfa_challenge_token: str | None = None
+    device_token: str | None = None  # returned when remember_device=True after 2FA
 
 
 class MFAChallengeRequest(BaseModel):
     """Submit a TOTP code to complete login after password auth."""
     mfa_challenge_token: str
     totp_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    remember_device: bool = False  # if True, backend issues a trusted-device token
 
 
 class TOTPSetupResponse(BaseModel):
