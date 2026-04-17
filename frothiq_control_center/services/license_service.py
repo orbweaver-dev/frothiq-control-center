@@ -28,7 +28,7 @@ async def get_all_license_states() -> dict[str, Any]:
     without any local status derivation or validation logic.
     """
     try:
-        data = await core_client.get("/api/v2/internal/tenants")
+        data = await core_client.get("/api/v2/internal/registry")
         tenants = data.get("tenants", [])
 
         # Aggregate counts from core-provided status fields — no local derivation

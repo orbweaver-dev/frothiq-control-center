@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 _CACHEABLE: dict[str, int] = {
     "/api/v2/defense/clusters/all": 30,
     "/api/v2/defense/status": 15,
-    "/api/v2/policy/active": 30,
+    "/api/v2/policy/rules": 30,
     "/api/v2/simulation/status": 60,
     "/api/v2/simulation/scenarios": 300,
     "/api/v1/get-rules": 60,
