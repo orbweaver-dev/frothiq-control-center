@@ -218,7 +218,7 @@ class CoreClient:
         """Check frothiq-core health. Returns status dict even on failure."""
         try:
             data = await self.get("/api/v2/health", bypass_cache=True)
-            return {"status": "online", **data}
+            return {**data, "status": "online"}
         except CoreClientError as exc:
             return {"status": "degraded", "detail": exc.detail}
         except Exception as exc:
