@@ -2,8 +2,6 @@
 Auth routes — login, logout, refresh, user management.
 """
 
-from __future__ import annotations
-
 import hashlib
 import logging
 import uuid

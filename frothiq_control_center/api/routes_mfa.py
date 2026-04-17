@@ -12,8 +12,6 @@ Login flow when 2FA is enabled:
   2. POST /auth/2fa/challenge  → returns full access + refresh tokens
 """
 
-from __future__ import annotations
-
 import base64
 import hashlib
 import io
