@@ -54,6 +54,10 @@ _PENDING_SECRET_TTL = 600  # 10 minutes to complete setup
 # Redis key prefix for MFA challenge tokens (revoked once used)
 _MFA_CHALLENGE_PREFIX = "cc:mfa_challenge:"
 _MFA_CHALLENGE_TTL = 300   # 5 minutes
+# Track consumed TOTP codes per user to prevent replay within the valid window.
+# With valid_window=1, a code is valid for up to 90 seconds (±1 30-second step).
+_TOTP_USED_PREFIX = "cc:totp_used:"
+_TOTP_USED_TTL = 90  # seconds — matches valid_window=1 coverage
 # Trusted device tokens (stored as sha256 hash, keyed by user_id + token_hash)
 _DEVICE_TOKEN_PREFIX = "cc:trusted_device:"
 _DEVICE_TOKEN_TTL = 60 * 60 * 24 * 30  # 30 days
@@ -351,6 +355,26 @@ async def mfa_challenge(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authenticator code.",
         )
+
+    # Replay guard: reject a TOTP code that was already accepted within its valid window.
+    # A code is valid for up to 90 seconds (valid_window=1 = ±1 step of 30s each).
+    # Without this check, the same code can be used multiple times within that window.
+    totp_used_key = f"{_TOTP_USED_PREFIX}{user.id}:{payload.totp_code}"
+    if await redis.exists(totp_used_key):
+        await log_action(
+            action="auth.2fa.challenge.replay",
+            user_id=user.id,
+            user_email=user.email,
+            ip_address=client_ip,
+            status="failure",
+            db=db,
+            redis=redis,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authenticator code has already been used. Wait for a new code.",
+        )
+    await redis.setex(totp_used_key, _TOTP_USED_TTL, "1")
 
     # Single-use: delete challenge from Redis
     await redis.delete(redis_key)
