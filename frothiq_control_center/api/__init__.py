@@ -20,6 +20,7 @@ from .routes_sync import router as sync_router
 from .routes_billing import router as billing_router
 from .routes_reconciliation import router as reconciliation_router
 from .routes_predictive import router as predictive_router
+from .routes_sysinfo import router as sysinfo_router
 
 # All control center routes under /api/v1/cc/
 api_router = APIRouter(prefix="/api/v1/cc")
@@ -50,6 +51,8 @@ api_router.include_router(billing_router)
 api_router.include_router(reconciliation_router)
 # Predictive sync — signal detection, staged contracts, accuracy metrics
 api_router.include_router(predictive_router)
+# ServOps — host system metrics (super_admin only)
+api_router.include_router(sysinfo_router)
 
 # Public edge registration (no JWT — separate prefix /api/v1/edge/)
 # This is mounted directly on the FastAPI app in main.py
