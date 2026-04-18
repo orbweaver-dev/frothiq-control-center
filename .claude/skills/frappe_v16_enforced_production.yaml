@@ -1,0 +1,187 @@
+name: frappe_v16_enforced_production
+description: >
+  Strict enforcement layer for Frappe Framework v16 development across Client Scripts,
+  Server Scripts (GUI), and App-level Python/JS code. Ensures upgrade-safe, secure,
+  and architecture-correct implementations aligned with Frappe best practices.
+
+rules:
+
+  # =========================================================
+  # 1. CORE ARCHITECTURE PRINCIPLES
+  # =========================================================
+  - Always prefer built-in Frappe/ERPNext features before customization
+  - Never duplicate existing DocTypes, workflows, or reports
+  - Follow strict layering:
+      UI (Client Script) -> presentation only
+      Server Script (GUI) -> validation + lightweight automation
+      App Code (Python) -> business logic + integrations
+  - Keep responsibilities strictly separated (no cross-layer logic leakage)
+
+  # =========================================================
+  # 2. CLIENT SCRIPT RULES (Browser / Desk JS)
+  # =========================================================
+  - JavaScript only (no Python, no server logic)
+  - Must use frappe.ui.form.on structure
+  - Only use frm API (frm.doc, frm.set_value, frm.refresh_field)
+  - No direct database assumptions or persistence logic
+  - No security-critical validation here
+  - Use frappe.call ONLY for server interaction
+  - Avoid DOM manipulation unless unavoidable
+  - Must not depend on backend state assumptions
+
+  REQUIRED PATTERN:
+    frappe.ui.form.on('DocType', {
+        refresh(frm) {
+            // UI logic only
+        }
+    });
+
+  # =========================================================
+  # 3. SERVER SCRIPT RULES (GUI / RestrictedPython)
+  # =========================================================
+  - Strict RestrictedPython environment
+  - FORBIDDEN:
+      - import
+      - def
+      - class
+      - decorators
+      - return
+      - file system access
+      - external network calls
+  - Must use frappe.response["message"] for output
+  - Must use frappe.get_doc / frappe.db APIs only
+  - Must be event-scoped or API-scoped
+  - Must be lightweight (no heavy computation loops)
+
+  # =========================================================
+  # 4. SERVER SCRIPT TYPES
+  # =========================================================
+
+  DOCUMENT EVENT:
+    - Must attach to valid DocType lifecycle event:
+        before_insert
+        before_save
+        after_insert
+        on_submit
+        on_cancel
+    - Use for validation and simple automation only
+
+  API SCRIPT:
+    - Must be explicitly API type
+    - Must return:
+        frappe.response["message"] = result
+    - Must not expose internal logic unnecessarily
+
+  # =========================================================
+  # 5. APP-LEVEL CODE RULES (FILES)
+  # =========================================================
+  - Allowed full Python syntax including imports
+  - Business logic belongs ONLY here
+  - Must use Frappe ORM (no raw SQL unless required)
+  - Use hooks.py for lifecycle extensions
+  - Use whitelisted methods ONLY in app code
+  - Keep modules organized:
+      doctype/
+      api/
+      overrides/
+      utils/
+
+  # =========================================================
+  # 6. DATABASE & ORM RULES
+  # =========================================================
+  - Prefer ORM over SQL:
+      frappe.get_doc
+      frappe.db.get_value
+      frappe.db.set_value
+      frappe.db.exists
+      frappe.new_doc
+  - Avoid raw SQL unless performance-critical and justified
+  - Always respect document lifecycle triggers
+  - Avoid bypassing permissions unless explicitly required
+
+  # =========================================================
+  # 7. PERMISSIONS & SECURITY MODEL
+  # =========================================================
+  - Always respect role-based permissions (Frappe Role Permission System)
+  - Never hardcode user access checks unless required
+  - Never trust client input
+  - Always validate on server-side (app or server script)
+  - Do not expose sensitive DocTypes via API
+  - Avoid privilege escalation patterns
+  - Use frappe.has_permission when needed
+
+  # =========================================================
+  # 8. API & INTEGRATION RULES
+  # =========================================================
+  - Use /api/method endpoints only for app-level code
+  - GET = read operations only
+  - POST = write operations only
+  - Must return structured JSON:
+      frappe.response["message"] = data
+  - Never expose internal system utilities directly
+
+  # =========================================================
+  # 9. PERFORMANCE RULES
+  # =========================================================
+  - Avoid frappe.call inside loops
+  - Batch database operations when possible
+  - Avoid repeated DB queries in Client Scripts
+  - Avoid heavy logic in Server Scripts (GUI)
+  - Move computation-heavy logic to background jobs (app level if needed)
+
+  # =========================================================
+  # 10. EVENT & LIFECYCLE SAFETY
+  # =========================================================
+  - Never create infinite loops via document save triggers
+  - Avoid recursive hooks without guards
+  - Be cautious with before_save modifications
+  - Ensure idempotent behavior for event scripts
+
+  # =========================================================
+  # 11. UPGRADE & COMPATIBILITY RULES
+  # =========================================================
+  - Never modify core Frappe files directly
+  - Avoid monkey patching unless explicitly required
+  - Prefer hooks over overrides
+  - Ensure all customizations survive version upgrades
+  - Avoid relying on internal/private APIs
+
+  # =========================================================
+  # 12. ERPNEXT / FRAMEWORK GUARDRAILS
+  # =========================================================
+  - Never recreate built-in ERPNext features (CRM, Accounts, HR, etc.)
+  - Always check existence of DocTypes/features before creating new ones
+  - Prefer configuration over customization
+  - Use standard workflows before custom workflows
+  - Avoid duplication of Reports, Print Formats, and Workflows
+
+  # =========================================================
+  # 13. ANTI-PATTERNS (STRICTLY BLOCKED)
+  # =========================================================
+  - Business logic in Client Scripts
+  - import / def / return / class in GUI Server Scripts
+  - Direct DB writes from client side
+  - Raw SQL without justification
+  - Recreating ERPNext built-in modules
+  - Overriding core logic without necessity
+  - Mixing UI + persistence logic
+  - Ignoring permission system
+
+  # =========================================================
+  # 14. OUTPUT FORMAT REQUIREMENTS
+  # =========================================================
+  - Always specify:
+      - Script Type (Client / Server / App)
+      - Exact location (DocType, file path, or Script record)
+      - Full working code block
+  - No pseudocode unless explicitly requested
+  - Keep solutions minimal, correct, and production-ready
+
+  # =========================================================
+  # 15. DEFAULT BEHAVIOR RULE
+  # =========================================================
+  - If multiple approaches exist:
+      1. Built-in Frappe feature
+      2. Configuration
+      3. Server Script (GUI)
+      4. App code (last resort for GUI use cases)
