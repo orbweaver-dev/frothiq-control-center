@@ -883,13 +883,13 @@ async def get_server(key: str, _: str = Depends(require_super_admin)) -> dict:
                 pass
             break
 
-    # Tail first existing log file
+    # Tail first existing log file — use sudo to handle root-owned log dirs
     log_lines = []
     log_path = None
     for lp in meta["log_paths"]:
-        p = Path(lp)
-        if p.is_file():
-            log_lines = _run_out(["tail", "-n50", lp]).splitlines()
+        out = _run_out(["sudo", "tail", "-n50", lp])
+        if out.strip():
+            log_lines = out.splitlines()
             log_path = lp
             break
 
