@@ -248,6 +248,7 @@ def _parse_crontab_file(path: Path, source: str, jobs: list) -> None:
 async def get_sysinfo(_: str = Depends(require_super_admin)) -> dict:
     boot_ts = psutil.boot_time()
     cpu_pct = psutil.cpu_percent(interval=0.2)
+    cpu_per_core = psutil.cpu_percent(interval=0, percpu=True)
     load_avg = list(psutil.getloadavg())
     mem = psutil.virtual_memory()
     swap = psutil.swap_memory()
@@ -298,6 +299,7 @@ async def get_sysinfo(_: str = Depends(require_super_admin)) -> dict:
         "boot_time": datetime.fromtimestamp(boot_ts, tz=UTC).isoformat(),
         "cpu": {
             "percent": cpu_pct,
+            "per_core": cpu_per_core,
             "logical_cores": psutil.cpu_count(logical=True),
             "physical_cores": psutil.cpu_count(logical=False),
             "load_avg_1m": round(load_avg[0], 2),
