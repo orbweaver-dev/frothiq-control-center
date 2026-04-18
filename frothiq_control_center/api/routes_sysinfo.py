@@ -324,8 +324,8 @@ async def get_sysinfo(_: str = Depends(require_super_admin)) -> dict:
             "interfaces": list(psutil.net_if_addrs().keys()),
             "per_interface": {
                 iface: {
-                    "bytes_sent_mb": round(counters.bytes_sent / 1e6, 4),
-                    "bytes_recv_mb": round(counters.bytes_recv / 1e6, 4),
+                    "bytes_sent": counters.bytes_sent,
+                    "bytes_recv": counters.bytes_recv,
                 }
                 for iface, counters in net_per_nic.items()
             },
