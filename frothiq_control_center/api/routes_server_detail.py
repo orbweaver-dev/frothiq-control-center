@@ -537,3 +537,286 @@ async def get_server_detail(key: str, _: str = Depends(require_super_admin)) -> 
     except Exception as e:
         data = {"error": str(e)}
     return {"type": key, "data": data, "checked_at": datetime.now(UTC).isoformat()}
+
+
+# ---------------------------------------------------------------------------
+# Config file paths
+# ---------------------------------------------------------------------------
+
+_CONFIG_PATHS: dict[str, list[str]] = {
+    "postfix": ["/etc/postfix/main.cf"],
+    "dovecot": ["/etc/dovecot/dovecot.conf"],
+    "redis": ["/etc/redis/redis.conf"],
+    "openssh": ["/etc/ssh/sshd_config"],
+    "nginx": ["/etc/nginx/nginx.conf"],
+    "apache2": ["/etc/apache2/apache2.conf"],
+    "mysql": ["/etc/mysql/mariadb.conf.d/50-server.cnf", "/etc/mysql/my.cnf"],
+    "mariadb": ["/etc/mysql/mariadb.conf.d/50-server.cnf", "/etc/mysql/my.cnf"],
+    "bind9": ["/etc/bind/named.conf.options"],
+}
+
+_RELOAD_CMDS: dict[str, list[str]] = {
+    "postfix": ["sudo", "postfix", "reload"],
+    "dovecot": ["sudo", "doveadm", "reload"],
+    "redis": ["sudo", "systemctl", "reload", "redis-server"],
+    "openssh": ["sudo", "systemctl", "reload", "ssh"],
+    "nginx": ["sudo", "nginx", "-s", "reload"],
+    "apache2": ["sudo", "apache2ctl", "graceful"],
+    "mysql": ["sudo", "systemctl", "restart", "mariadb"],
+    "mariadb": ["sudo", "systemctl", "restart", "mariadb"],
+    "bind9": ["sudo", "rndc", "reload"],
+}
+
+# Format constants
+_FMT_KV_EQUALS = "kv_equals"   # key = value  (postfix, dovecot, mysql)
+_FMT_KV_SPACE = "kv_space"     # key value    (redis, openssh)
+_FMT_NGINX = "nginx"            # key value;   (nginx directive)
+_FMT_APACHE = "apache"          # Key Value    (apache, case-insensitive)
+
+_KEY_FORMAT: dict[str, str] = {
+    "postfix": _FMT_KV_EQUALS,
+    "dovecot": _FMT_KV_EQUALS,
+    "redis": _FMT_KV_SPACE,
+    "openssh": _FMT_KV_SPACE,
+    "nginx": _FMT_NGINX,
+    "apache2": _FMT_APACHE,
+    "mysql": _FMT_KV_EQUALS,
+    "mariadb": _FMT_KV_EQUALS,
+}
+
+
+def _resolve_config_path(key: str) -> tuple[str | None, bool]:
+    """Returns (path, exists) for the first matching config path for a service key."""
+    for p in _CONFIG_PATHS.get(key, []):
+        if Path(p).exists():
+            return p, True
+    paths = _CONFIG_PATHS.get(key, [])
+    return (paths[0] if paths else None), False
+
+
+def _write_conf(path: str, content: str) -> None:
+    """Write content to path safely using a tempfile + sudo cp."""
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".tmp", delete=False) as tf:
+        tf.write(content)
+        tmp = tf.name
+    try:
+        _, _, rc = _run(["sudo", "cp", tmp, path])
+        if rc != 0:
+            raise RuntimeError(f"sudo cp failed with rc={rc}")
+        _run(["sudo", "chmod", "600", path])
+    finally:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+
+
+def _update_config_lines(
+    content: str,
+    settings: dict[str, str],
+    fmt: str,
+    section: str | None = None,
+) -> tuple[str, list[str], list[str]]:
+    """
+    Apply settings to config file content using in-place line substitution.
+
+    Returns (new_content, applied_keys, not_found_keys).
+    """
+    lines = content.splitlines(keepends=True)
+    applied: set[str] = set()
+    pending = dict(settings)  # keys still to be placed
+
+    in_section = section is None  # if no section filter, always in section
+
+    new_lines: list[str] = []
+
+    for line in lines:
+        stripped = line.rstrip("\n\r")
+
+        # Section tracking (for mysql [mysqld])
+        if section is not None:
+            sec_match = re.match(r'^\s*\[([^\]]+)\]', stripped)
+            if sec_match:
+                in_section = sec_match.group(1).strip().lower() == section.lower()
+            new_lines.append(line)
+            if not in_section:
+                continue
+            # We're in the right section — fall through to normal processing
+            # But we already appended the section header line, skip further processing
+            # Actually we need to check if the line IS the section header
+            if sec_match:
+                continue
+
+        # Determine the key on this line (handles commented-out lines too)
+        raw_stripped = stripped.lstrip()
+        is_comment = raw_stripped.startswith("#")
+        active_part = raw_stripped.lstrip("#").lstrip() if is_comment else raw_stripped
+
+        matched_key: str | None = None
+
+        if fmt == _FMT_KV_EQUALS:
+            m = re.match(r'^([A-Za-z0-9_.+-]+)\s*=', active_part)
+            if m:
+                matched_key = m.group(1).strip()
+        elif fmt == _FMT_KV_SPACE:
+            m = re.match(r'^([A-Za-z0-9_.-]+)\s+', active_part)
+            if m:
+                matched_key = m.group(1).strip()
+        elif fmt == _FMT_NGINX:
+            m = re.match(r'^([A-Za-z0-9_]+)\s+', active_part)
+            if m and not active_part.startswith("{") and not active_part.startswith("}"):
+                matched_key = m.group(1).strip()
+        elif fmt == _FMT_APACHE:
+            m = re.match(r'^([A-Za-z][A-Za-z0-9_]+)\s+', active_part)
+            if m:
+                matched_key = m.group(1).strip()
+
+        # Check if matched key is one we want to set (case-insensitive for openssh/apache)
+        target_key: str | None = None
+        if matched_key:
+            for sk in list(pending.keys()):
+                if fmt in (_FMT_KV_SPACE, _FMT_APACHE):
+                    if matched_key.lower() == sk.lower():
+                        target_key = sk
+                        break
+                else:
+                    if matched_key == sk:
+                        target_key = sk
+                        break
+
+        if target_key is not None:
+            val = pending.pop(target_key)
+            indent = re.match(r'^(\s*)', stripped).group(1)
+            if fmt == _FMT_KV_EQUALS:
+                new_line = f"{indent}{target_key} = {val}\n"
+            elif fmt == _FMT_KV_SPACE:
+                new_line = f"{indent}{target_key} {val}\n"
+            elif fmt == _FMT_NGINX:
+                new_line = f"{indent}{target_key} {val};\n"
+            elif fmt == _FMT_APACHE:
+                new_line = f"{indent}{target_key} {val}\n"
+            else:
+                new_line = line
+            applied.add(target_key)
+            new_lines.append(new_line)
+        else:
+            if section is None:
+                new_lines.append(line)
+            # (section header lines already appended above)
+
+    # Append any keys that weren't found in the file
+    not_found = list(pending.keys())
+    if pending:
+        new_lines.append("\n# Added by FrothIQ MC3\n")
+        for k, v in pending.items():
+            if fmt == _FMT_KV_EQUALS:
+                new_lines.append(f"{k} = {v}\n")
+            elif fmt == _FMT_KV_SPACE:
+                new_lines.append(f"{k} {v}\n")
+            elif fmt == _FMT_NGINX:
+                new_lines.append(f"{k} {v};\n")
+            elif fmt == _FMT_APACHE:
+                new_lines.append(f"{k} {v}\n")
+
+    return "".join(new_lines), list(applied), not_found
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
+
+from pydantic import BaseModel
+
+
+class ConfigRawBody(BaseModel):
+    content: str
+    reload: bool = True
+
+
+class ConfigSettingsBody(BaseModel):
+    settings: dict[str, str]
+    reload: bool = True
+
+
+# ---------------------------------------------------------------------------
+# New endpoints
+# ---------------------------------------------------------------------------
+
+@router.get("/{key}/config-raw")
+async def get_config_raw(key: str, _: str = Depends(require_super_admin)) -> dict:
+    path, exists = _resolve_config_path(key)
+    if path is None:
+        raise HTTPException(404, f"No config path known for service '{key}'")
+    content = None
+    error = None
+    if exists:
+        try:
+            content = Path(path).read_text(errors="replace")
+        except Exception as e:
+            error = str(e)
+    return {"key": key, "path": path, "content": content, "exists": exists, "error": error}
+
+
+@router.put("/{key}/config-raw")
+async def put_config_raw(key: str, body: ConfigRawBody, _: str = Depends(require_super_admin)) -> dict:
+    path, _ = _resolve_config_path(key)
+    if path is None:
+        raise HTTPException(404, f"No config path known for service '{key}'")
+    try:
+        _write_conf(path, body.content)
+    except Exception as e:
+        raise HTTPException(500, f"Write failed: {e}")
+
+    reloaded = False
+    reload_output = ""
+    if body.reload:
+        cmd = _RELOAD_CMDS.get(key)
+        if cmd:
+            stdout, stderr, rc = _run(cmd, timeout=15)
+            reload_output = (stdout + stderr).strip()
+            reloaded = rc == 0
+
+    return {"ok": True, "reloaded": reloaded, "reload_output": reload_output, "path": path}
+
+
+@router.post("/{key}/config")
+async def post_config(key: str, body: ConfigSettingsBody, _: str = Depends(require_super_admin)) -> dict:
+    path, exists = _resolve_config_path(key)
+    if path is None:
+        raise HTTPException(404, f"No config path known for service '{key}'")
+
+    if not exists:
+        raise HTTPException(404, f"Config file not found at {path}")
+
+    try:
+        content = Path(path).read_text(errors="replace")
+    except Exception as e:
+        raise HTTPException(500, f"Read failed: {e}")
+
+    fmt = _KEY_FORMAT.get(key, _FMT_KV_EQUALS)
+    section = "mysqld" if key in ("mysql", "mariadb") else None
+
+    new_content, applied, not_found = _update_config_lines(content, body.settings, fmt, section)
+
+    try:
+        _write_conf(path, new_content)
+    except Exception as e:
+        raise HTTPException(500, f"Write failed: {e}")
+
+    reloaded = False
+    reload_output = ""
+    if body.reload:
+        cmd = _RELOAD_CMDS.get(key)
+        if cmd:
+            stdout, stderr, rc = _run(cmd, timeout=15)
+            reload_output = (stdout + stderr).strip()
+            reloaded = rc == 0
+
+    return {
+        "ok": True,
+        "applied": applied,
+        "not_found": not_found,
+        "reloaded": reloaded,
+        "reload_output": reload_output,
+    }
