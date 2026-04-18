@@ -692,11 +692,20 @@ def _detect_server(key: str, meta: dict) -> dict | None:
 
 @router.get("/servers")
 async def list_servers(_: str = Depends(require_super_admin)) -> dict:
+    detected_keys: set[str] = set()
     servers = []
     for key, meta in KNOWN_SERVERS.items():
-        detected = _detect_server(key, meta)
-        if detected:
-            servers.append(detected)
+        srv = _detect_server(key, meta)
+        if not srv:
+            continue
+        # If MariaDB is present, skip the MySQL entry (MariaDB ships a mysql compat binary)
+        if key == "mysql" and "mariadb" in detected_keys:
+            continue
+        if key == "mariadb" and "mysql" in detected_keys:
+            # Replace the mysql entry with mariadb
+            servers = [s for s in servers if s["key"] != "mysql"]
+        detected_keys.add(key)
+        servers.append(srv)
     return {"servers": servers, "count": len(servers), "checked_at": datetime.now(UTC).isoformat()}
 
 
@@ -741,3 +750,61 @@ async def get_server(key: str, _: str = Depends(require_super_admin)) -> dict:
         "log_lines": log_lines,
         "checked_at": datetime.now(UTC).isoformat(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Network speed test
+# ---------------------------------------------------------------------------
+
+@router.post("/speedtest")
+async def run_speedtest(_: str = Depends(require_super_admin)) -> dict:
+    """Run a network speed test using the first available CLI tool."""
+    import asyncio, json as _json
+
+    async def _run(cmd: list[str]) -> dict | None:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=90)
+            if proc.returncode != 0:
+                return None
+            data = _json.loads(stdout.decode())
+            return data
+        except Exception:
+            return None
+
+    # --- Ookla official speedtest CLI (bytes/sec bandwidth) ---
+    data = await _run(["speedtest", "--accept-gdpr", "--accept-license", "-f", "json"])
+    if data and "download" in data and isinstance(data["download"], dict):
+        bw_dl = data["download"].get("bandwidth", 0)   # bytes/sec
+        bw_ul = data["upload"].get("bandwidth", 0)
+        ping  = data.get("ping", {}).get("latency", 0)
+        srv   = data.get("server", {})
+        return {
+            "download_mbps": round(bw_dl * 8 / 1_000_000, 2),
+            "upload_mbps":   round(bw_ul * 8 / 1_000_000, 2),
+            "ping_ms":       round(ping, 1),
+            "server":        f"{srv.get('name', '')}, {srv.get('location', '')}".strip(", "),
+            "isp":           data.get("isp", ""),
+            "tested_at":     datetime.now(UTC).isoformat(),
+        }
+
+    # --- speedtest-cli Python package (bits/sec) ---
+    for cmd in [["speedtest-cli", "--json"], ["python3", "-m", "speedtest", "--json"]]:
+        data = await _run(cmd)
+        if data and "download" in data and isinstance(data["download"], (int, float)):
+            srv = data.get("server", {})
+            loc = ", ".join(filter(None, [srv.get("name"), srv.get("country")]))
+            return {
+                "download_mbps": round(data["download"] / 1_000_000, 2),
+                "upload_mbps":   round(data["upload"]   / 1_000_000, 2),
+                "ping_ms":       round(data.get("ping", 0), 1),
+                "server":        loc,
+                "isp":           data.get("client", {}).get("isp", ""),
+                "tested_at":     datetime.now(UTC).isoformat(),
+            }
+
+    raise HTTPException(status_code=503, detail="No speedtest tool found. Install: apt install speedtest-cli")
