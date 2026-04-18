@@ -1,6 +1,5 @@
 """
-ServOps — system information endpoints (super_admin only).
-Host metrics, processes, cron, logs, packages, users/groups, filesystems.
+ServOps — system information + management endpoints (super_admin only).
 """
 
 from __future__ import annotations
@@ -9,13 +8,15 @@ import grp
 import platform
 import pwd
 import re
+import shutil
 import subprocess
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 
 import psutil
 
@@ -23,6 +24,143 @@ from .routes_auth import require_super_admin
 
 router = APIRouter(prefix="/sysinfo", tags=["sysinfo"])
 
+# ---------------------------------------------------------------------------
+# Constants / validation
+# ---------------------------------------------------------------------------
+
+SERVICE_NAME_RE = re.compile(r"^[a-zA-Z0-9._@:-]+$")
+ALLOWED_SERVICE_ACTIONS = {"start", "stop", "restart", "enable", "disable", "reload"}
+ALLOWED_KILL_SIGNALS = {1, 9, 15}  # SIGHUP, SIGKILL, SIGTERM
+
+LOG_FILES = [
+    "/var/log/syslog",
+    "/var/log/auth.log",
+    "/var/log/kern.log",
+    "/var/log/dpkg.log",
+    "/var/log/apt/history.log",
+    "/var/log/nginx/access.log",
+    "/var/log/nginx/error.log",
+    "/var/log/apache2/access.log",
+    "/var/log/apache2/error.log",
+    "/var/log/mysql/error.log",
+    "/var/log/fail2ban.log",
+    "/var/log/mail.log",
+]
+
+KNOWN_SERVERS: dict[str, dict] = {
+    "nginx": {
+        "label": "Nginx",
+        "service": "nginx",
+        "binaries": ["nginx"],
+        "config_paths": ["/etc/nginx/nginx.conf", "/etc/nginx/sites-enabled"],
+        "log_paths": ["/var/log/nginx/error.log", "/var/log/nginx/access.log"],
+        "category": "web",
+    },
+    "apache2": {
+        "label": "Apache2",
+        "service": "apache2",
+        "binaries": ["apache2", "httpd"],
+        "config_paths": ["/etc/apache2/apache2.conf"],
+        "log_paths": ["/var/log/apache2/error.log", "/var/log/apache2/access.log"],
+        "category": "web",
+    },
+    "mysql": {
+        "label": "MySQL",
+        "service": "mysql",
+        "binaries": ["mysql", "mysqld"],
+        "config_paths": ["/etc/mysql/my.cnf", "/etc/mysql/mysql.conf.d/mysqld.cnf"],
+        "log_paths": ["/var/log/mysql/error.log"],
+        "category": "database",
+    },
+    "mariadb": {
+        "label": "MariaDB",
+        "service": "mariadb",
+        "binaries": ["mariadbd", "mysqld"],
+        "config_paths": ["/etc/mysql/mariadb.conf.d/50-server.cnf"],
+        "log_paths": ["/var/log/mysql/error.log"],
+        "category": "database",
+    },
+    "postgresql": {
+        "label": "PostgreSQL",
+        "service": "postgresql",
+        "binaries": ["psql", "postgres"],
+        "config_paths": ["/etc/postgresql"],
+        "log_paths": ["/var/log/postgresql"],
+        "category": "database",
+    },
+    "redis": {
+        "label": "Redis",
+        "service": "redis-server",
+        "binaries": ["redis-server", "redis-cli"],
+        "config_paths": ["/etc/redis/redis.conf"],
+        "log_paths": ["/var/log/redis/redis-server.log"],
+        "category": "database",
+    },
+    "mongodb": {
+        "label": "MongoDB",
+        "service": "mongod",
+        "binaries": ["mongod", "mongosh"],
+        "config_paths": ["/etc/mongod.conf"],
+        "log_paths": ["/var/log/mongodb/mongod.log"],
+        "category": "database",
+    },
+    "postfix": {
+        "label": "Postfix",
+        "service": "postfix",
+        "binaries": ["postfix", "postconf"],
+        "config_paths": ["/etc/postfix/main.cf"],
+        "log_paths": ["/var/log/mail.log"],
+        "category": "mail",
+    },
+    "dovecot": {
+        "label": "Dovecot",
+        "service": "dovecot",
+        "binaries": ["dovecot"],
+        "config_paths": ["/etc/dovecot/dovecot.conf"],
+        "log_paths": ["/var/log/mail.log"],
+        "category": "mail",
+    },
+    "openssh": {
+        "label": "OpenSSH",
+        "service": "ssh",
+        "binaries": ["sshd"],
+        "config_paths": ["/etc/ssh/sshd_config"],
+        "log_paths": ["/var/log/auth.log"],
+        "category": "access",
+    },
+    "bind9": {
+        "label": "BIND DNS",
+        "service": "bind9",
+        "binaries": ["named"],
+        "config_paths": ["/etc/bind/named.conf"],
+        "log_paths": ["/var/log/syslog"],
+        "category": "dns",
+    },
+    "haproxy": {
+        "label": "HAProxy",
+        "service": "haproxy",
+        "binaries": ["haproxy"],
+        "config_paths": ["/etc/haproxy/haproxy.cfg"],
+        "log_paths": ["/var/log/haproxy.log"],
+        "category": "proxy",
+    },
+    "vsftpd": {
+        "label": "FTP (vsftpd)",
+        "service": "vsftpd",
+        "binaries": ["vsftpd"],
+        "config_paths": ["/etc/vsftpd.conf"],
+        "log_paths": ["/var/log/vsftpd.log"],
+        "category": "ftp",
+    },
+    "fail2ban": {
+        "label": "Fail2ban",
+        "service": "fail2ban",
+        "binaries": ["fail2ban-client"],
+        "config_paths": ["/etc/fail2ban/jail.conf", "/etc/fail2ban/jail.local"],
+        "log_paths": ["/var/log/fail2ban.log"],
+        "category": "security",
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -42,16 +180,65 @@ def _uptime_str(boot_ts: float) -> str:
     return " ".join(parts)
 
 
-def _run(cmd: list[str], timeout: int = 10) -> str:
+def _run(cmd: list[str], timeout: int = 10) -> tuple[str, str, int]:
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return result.stdout
+        return result.stdout, result.stderr, result.returncode
+    except subprocess.TimeoutExpired:
+        return "", "Timed out", 1
+    except Exception as e:
+        return "", str(e), 1
+
+
+def _run_out(cmd: list[str], timeout: int = 10) -> str:
+    stdout, _, _ = _run(cmd, timeout)
+    return stdout
+
+
+def _service_active(service: str) -> str:
+    out, _, _ = _run(["systemctl", "is-active", service], timeout=5)
+    return out.strip()
+
+
+def _service_enabled(service: str) -> str:
+    out, _, _ = _run(["systemctl", "is-enabled", service], timeout=5)
+    return out.strip()
+
+
+def _system_users(shell_only: bool = False) -> list[str]:
+    users = []
+    for p in pwd.getpwall():
+        if shell_only and p.pw_shell in ("/bin/false", "/usr/sbin/nologin", "/sbin/nologin"):
+            continue
+        users.append(p.pw_name)
+    return users
+
+
+def _parse_crontab_file(path: Path, source: str, jobs: list) -> None:
+    try:
+        for line in path.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("@"):
+                parts = line.split(None, 2)
+                if len(parts) >= 2:
+                    jobs.append({"source": source, "schedule": parts[0], "user": parts[1] if len(parts) > 2 else "", "command": parts[-1]})
+                continue
+            parts = line.split(None, 6)
+            if len(parts) >= 6:
+                jobs.append({
+                    "source": source,
+                    "schedule": " ".join(parts[:5]),
+                    "user": parts[5] if len(parts) > 6 else "",
+                    "command": parts[-1],
+                })
     except Exception:
-        return ""
+        pass
 
 
 # ---------------------------------------------------------------------------
-# Dashboard — overall system health
+# Dashboard
 # ---------------------------------------------------------------------------
 
 @router.get("")
@@ -61,7 +248,6 @@ async def get_sysinfo(_: str = Depends(require_super_admin)) -> dict:
     load_avg = list(psutil.getloadavg())
     mem = psutil.virtual_memory()
     swap = psutil.swap_memory()
-
     disks = []
     for part in psutil.disk_partitions(all=False):
         try:
@@ -77,10 +263,8 @@ async def get_sysinfo(_: str = Depends(require_super_admin)) -> dict:
             "free_gb": round(usage.free / 1e9, 2),
             "percent": usage.percent,
         })
-
     net = psutil.net_io_counters()
     uname = platform.uname()
-
     return {
         "hostname": uname.node,
         "os": f"{uname.system} {uname.release}",
@@ -120,7 +304,7 @@ async def get_sysinfo(_: str = Depends(require_super_admin)) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Running Processes
+# Processes
 # ---------------------------------------------------------------------------
 
 @router.get("/processes")
@@ -145,110 +329,160 @@ async def get_processes(
             })
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
-
     key_map = {"cpu": "cpu_pct", "mem": "mem_pct", "pid": "pid", "name": "name"}
     procs.sort(key=lambda x: x[key_map[sort]], reverse=(sort in ("cpu", "mem")))
+    return {"total": len(procs), "processes": procs[:limit], "checked_at": datetime.now(UTC).isoformat()}
 
-    return {
-        "total": len(procs),
-        "processes": procs[:limit],
-        "checked_at": datetime.now(UTC).isoformat(),
-    }
+
+class KillRequest(BaseModel):
+    signal: int = 15
+
+
+@router.post("/processes/{pid}/kill")
+async def kill_process(pid: int, body: KillRequest, _: str = Depends(require_super_admin)) -> dict:
+    if body.signal not in ALLOWED_KILL_SIGNALS:
+        raise HTTPException(400, f"Signal must be one of {ALLOWED_KILL_SIGNALS}")
+    try:
+        proc = psutil.Process(pid)
+        proc.send_signal(body.signal)
+        return {"ok": True, "pid": pid, "signal": body.signal}
+    except psutil.NoSuchProcess:
+        raise HTTPException(404, "Process not found")
+    except psutil.AccessDenied:
+        raise HTTPException(403, "Access denied")
 
 
 # ---------------------------------------------------------------------------
-# Scheduled Cron Jobs
+# Bootup / Systemd services
+# ---------------------------------------------------------------------------
+
+@router.get("/bootup")
+async def get_bootup(_: str = Depends(require_super_admin)) -> dict:
+    import json
+    out, _, _ = _run([
+        "systemctl", "list-units", "--type=service",
+        "--all", "--no-pager", "--no-legend", "--output=json",
+    ], timeout=10)
+    services = []
+    if out:
+        try:
+            for s in json.loads(out):
+                services.append({
+                    "unit": s.get("unit", ""),
+                    "load": s.get("load", ""),
+                    "active": s.get("active", ""),
+                    "sub": s.get("sub", ""),
+                    "description": s.get("description", ""),
+                })
+        except Exception:
+            pass
+    return {"services": services, "count": len(services), "checked_at": datetime.now(UTC).isoformat()}
+
+
+class ServiceActionRequest(BaseModel):
+    service: str
+    action: str
+
+
+@router.post("/bootup/action")
+async def service_action(body: ServiceActionRequest, _: str = Depends(require_super_admin)) -> dict:
+    if not SERVICE_NAME_RE.match(body.service):
+        raise HTTPException(400, "Invalid service name")
+    if body.action not in ALLOWED_SERVICE_ACTIONS:
+        raise HTTPException(400, f"Action must be one of {ALLOWED_SERVICE_ACTIONS}")
+    _, stderr, rc = _run(["sudo", "systemctl", body.action, body.service], timeout=30)
+    if rc != 0:
+        raise HTTPException(500, stderr.strip() or f"systemctl {body.action} failed")
+    return {"ok": True, "service": body.service, "action": body.action}
+
+
+# ---------------------------------------------------------------------------
+# Cron Jobs
 # ---------------------------------------------------------------------------
 
 @router.get("/cron")
 async def get_cron(_: str = Depends(require_super_admin)) -> dict:
     jobs: list[dict[str, Any]] = []
-
-    # System crontab
     system_crontab = Path("/etc/crontab")
     if system_crontab.exists():
         _parse_crontab_file(system_crontab, "system", jobs)
-
-    # /etc/cron.d/
     cron_d = Path("/etc/cron.d")
     if cron_d.is_dir():
         for f in sorted(cron_d.iterdir()):
             if f.is_file() and not f.name.startswith("."):
                 _parse_crontab_file(f, f"cron.d/{f.name}", jobs)
-
-    # User crontabs via crontab -l for known users
     for user in _system_users(shell_only=True):
-        out = _run(["crontab", "-l", "-u", user], timeout=5)
+        out = _run_out(["crontab", "-l", "-u", user], timeout=5)
         for line in out.splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
             parts = line.split(None, 5)
             if len(parts) >= 6:
-                jobs.append({
-                    "source": f"user:{user}",
-                    "schedule": " ".join(parts[:5]),
-                    "user": user,
-                    "command": parts[5],
-                })
-
+                jobs.append({"source": f"user:{user}", "schedule": " ".join(parts[:5]), "user": user, "command": parts[5]})
     return {"total": len(jobs), "jobs": jobs, "checked_at": datetime.now(UTC).isoformat()}
 
 
-def _parse_crontab_file(path: Path, source: str, jobs: list) -> None:
-    try:
-        for line in path.read_text(errors="replace").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("@"):
-                parts = line.split(None, 2)
-                if len(parts) >= 2:
-                    jobs.append({"source": source, "schedule": parts[0], "user": parts[1] if len(parts) > 2 else "", "command": parts[-1]})
-                continue
-            parts = line.split(None, 6)
-            if len(parts) >= 6:
-                jobs.append({
-                    "source": source,
-                    "schedule": " ".join(parts[:5]),
-                    "user": parts[5] if len(parts) > 6 else "",
-                    "command": parts[-1],
-                })
-    except Exception:
-        pass
+class CronAddRequest(BaseModel):
+    user: str
+    schedule: str
+    command: str
+
+
+@router.post("/cron/entry")
+async def add_cron_entry(body: CronAddRequest, _: str = Depends(require_super_admin)) -> dict:
+    if not re.match(r"^[a-z_][a-z0-9_-]{0,31}$", body.user):
+        raise HTTPException(400, "Invalid username")
+    if len(body.schedule) > 100 or len(body.command) > 500:
+        raise HTTPException(400, "Schedule or command too long")
+    # Read existing crontab
+    existing, _, _ = _run(["crontab", "-l", "-u", body.user], timeout=5)
+    new_entry = f"{body.schedule} {body.command}\n"
+    new_crontab = existing.rstrip("\n") + ("\n" if existing.strip() else "") + new_entry
+    proc = subprocess.run(
+        ["crontab", "-u", body.user, "-"],
+        input=new_crontab, capture_output=True, text=True, timeout=10,
+    )
+    if proc.returncode != 0:
+        raise HTTPException(500, proc.stderr.strip() or "crontab write failed")
+    return {"ok": True}
+
+
+class CronDeleteRequest(BaseModel):
+    user: str
+    schedule: str
+    command: str
+
+
+@router.delete("/cron/entry")
+async def delete_cron_entry(body: CronDeleteRequest, _: str = Depends(require_super_admin)) -> dict:
+    if not re.match(r"^[a-z_][a-z0-9_-]{0,31}$", body.user):
+        raise HTTPException(400, "Invalid username")
+    existing, _, _ = _run(["crontab", "-l", "-u", body.user], timeout=5)
+    target = f"{body.schedule} {body.command}"
+    new_lines = [l for l in existing.splitlines() if l.strip() != target]
+    new_crontab = "\n".join(new_lines) + "\n"
+    proc = subprocess.run(
+        ["crontab", "-u", body.user, "-"],
+        input=new_crontab, capture_output=True, text=True, timeout=10,
+    )
+    if proc.returncode != 0:
+        raise HTTPException(500, proc.stderr.strip() or "crontab write failed")
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
 # System Logs
 # ---------------------------------------------------------------------------
 
-LOG_FILES = [
-    "/var/log/syslog",
-    "/var/log/auth.log",
-    "/var/log/kern.log",
-    "/var/log/dpkg.log",
-    "/var/log/apt/history.log",
-    "/var/log/nginx/access.log",
-    "/var/log/nginx/error.log",
-    "/var/log/apache2/access.log",
-    "/var/log/apache2/error.log",
-    "/var/log/mysql/error.log",
-    "/var/log/fail2ban.log",
-]
-
-
 @router.get("/logs")
 async def get_log_files(_: str = Depends(require_super_admin)) -> dict:
     files = []
     for path_str in LOG_FILES:
         p = Path(path_str)
-        if p.exists():
+        if p.exists() and p.is_file():
             stat = p.stat()
-            files.append({
-                "path": path_str,
-                "size_kb": round(stat.st_size / 1024, 1),
-                "modified": datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat(),
-            })
+            files.append({"path": path_str, "size_kb": round(stat.st_size / 1024, 1), "modified": datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat()})
     return {"files": files}
 
 
@@ -258,12 +492,10 @@ async def tail_log(
     path: str = Query(...),
     lines: int = Query(100, ge=10, le=1000),
 ) -> dict:
-    allowed = {p for p in LOG_FILES}
-    # Allow any file under /var/log/
     if not path.startswith("/var/log/"):
         return {"error": "Path not allowed", "lines": []}
     try:
-        out = _run(["tail", f"-n{lines}", path])
+        out = _run_out(["tail", f"-n{lines}", path])
         return {"path": path, "lines": out.splitlines(), "checked_at": datetime.now(UTC).isoformat()}
     except Exception as e:
         return {"error": str(e), "lines": []}
@@ -278,7 +510,7 @@ async def get_packages(
     _: str = Depends(require_super_admin),
     search: str = Query("", max_length=100),
 ) -> dict:
-    out = _run(["dpkg-query", "-W", "-f=${Package}\t${Version}\t${Status}\t${Architecture}\n"], timeout=15)
+    out = _run_out(["dpkg-query", "-W", "-f=${Package}\t${Version}\t${Status}\t${Architecture}\n"], timeout=15)
     pkgs = []
     for line in out.splitlines():
         parts = line.split("\t")
@@ -296,8 +528,7 @@ async def get_packages(
 
 @router.get("/packages/updates")
 async def get_package_updates(_: str = Depends(require_super_admin)) -> dict:
-    # apt list --upgradable (non-interactive)
-    out = _run(["apt", "list", "--upgradable", "-q"], timeout=30)
+    out = _run_out(["apt", "list", "--upgradable", "-q"], timeout=30)
     updates = []
     for line in out.splitlines():
         if "/" not in line or "Listing" in line:
@@ -308,50 +539,118 @@ async def get_package_updates(_: str = Depends(require_super_admin)) -> dict:
     return {"total": len(updates), "updates": updates, "checked_at": datetime.now(UTC).isoformat()}
 
 
+class PackageActionRequest(BaseModel):
+    name: str
+    action: str  # remove | purge
+
+
+@router.post("/packages/action")
+async def package_action(body: PackageActionRequest, _: str = Depends(require_super_admin)) -> dict:
+    if not re.match(r"^[a-z0-9][a-z0-9+\-.]{0,100}$", body.name):
+        raise HTTPException(400, "Invalid package name")
+    if body.action not in {"remove", "purge"}:
+        raise HTTPException(400, "Action must be remove or purge")
+    env = {"DEBIAN_FRONTEND": "noninteractive"}
+    import os
+    full_env = {**os.environ, **env}
+    _, stderr, rc = _run(["apt-get", body.action, "-y", "--", body.name], timeout=120)
+    if rc != 0:
+        raise HTTPException(500, stderr.strip() or "apt-get failed")
+    return {"ok": True, "package": body.name, "action": body.action}
+
+
 # ---------------------------------------------------------------------------
 # Users and Groups
 # ---------------------------------------------------------------------------
 
-def _system_users(shell_only: bool = False) -> list[str]:
-    users = []
-    for p in pwd.getpwall():
-        if shell_only and p.pw_shell in ("/bin/false", "/usr/sbin/nologin", "/sbin/nologin"):
-            continue
-        users.append(p.pw_name)
-    return users
-
-
 @router.get("/users")
 async def get_users(_: str = Depends(require_super_admin)) -> dict:
-    users = []
-    for p in sorted(pwd.getpwall(), key=lambda x: x.pw_uid):
-        users.append({
-            "username": p.pw_name,
-            "uid": p.pw_uid,
-            "gid": p.pw_gid,
-            "gecos": p.pw_gecos,
-            "home": p.pw_dir,
-            "shell": p.pw_shell,
+    users = [
+        {
+            "username": p.pw_name, "uid": p.pw_uid, "gid": p.pw_gid,
+            "gecos": p.pw_gecos, "home": p.pw_dir, "shell": p.pw_shell,
             "login_shell": p.pw_shell not in ("/bin/false", "/usr/sbin/nologin", "/sbin/nologin", ""),
-        })
-    groups = []
-    for g in sorted(grp.getgrall(), key=lambda x: x.gr_gid):
-        groups.append({
-            "name": g.gr_name,
-            "gid": g.gr_gid,
-            "members": list(g.gr_mem),
-        })
-    return {
-        "users": users,
-        "groups": groups,
-        "user_count": len(users),
-        "group_count": len(groups),
-        "checked_at": datetime.now(UTC).isoformat(),
-    }
+        }
+        for p in sorted(pwd.getpwall(), key=lambda x: x.pw_uid)
+    ]
+    groups = [
+        {"name": g.gr_name, "gid": g.gr_gid, "members": list(g.gr_mem)}
+        for g in sorted(grp.getgrall(), key=lambda x: x.gr_gid)
+    ]
+    return {"users": users, "groups": groups, "user_count": len(users), "group_count": len(groups), "checked_at": datetime.now(UTC).isoformat()}
+
+
+class CreateUserRequest(BaseModel):
+    username: str
+    password: str
+    shell: str = "/bin/bash"
+    groups: list[str] = []
+    comment: str = ""
+
+
+@router.post("/users")
+async def create_user(body: CreateUserRequest, _: str = Depends(require_super_admin)) -> dict:
+    if not re.match(r"^[a-z_][a-z0-9_-]{0,31}$", body.username):
+        raise HTTPException(400, "Invalid username")
+    if body.shell not in ("/bin/bash", "/bin/sh", "/bin/zsh", "/usr/bin/fish", "/bin/false", "/usr/sbin/nologin"):
+        raise HTTPException(400, "Shell not allowed")
+    cmd = ["useradd", "-m", "-s", body.shell]
+    if body.comment:
+        cmd += ["-c", body.comment[:64]]
+    if body.groups:
+        safe_groups = [g for g in body.groups if re.match(r"^[a-z_][a-z0-9_-]{0,31}$", g)]
+        cmd += ["-G", ",".join(safe_groups)]
+    cmd.append(body.username)
+    _, stderr, rc = _run(cmd, timeout=10)
+    if rc != 0:
+        raise HTTPException(500, stderr.strip() or "useradd failed")
+    # Set password via chpasswd
+    proc = subprocess.run(
+        ["chpasswd"],
+        input=f"{body.username}:{body.password}",
+        capture_output=True, text=True, timeout=10,
+    )
+    if proc.returncode != 0:
+        raise HTTPException(500, proc.stderr.strip() or "chpasswd failed")
+    return {"ok": True, "username": body.username}
+
+
+@router.delete("/users/{username}")
+async def delete_user(username: str, _: str = Depends(require_super_admin)) -> dict:
+    if not re.match(r"^[a-z_][a-z0-9_-]{0,31}$", username):
+        raise HTTPException(400, "Invalid username")
+    _, stderr, rc = _run(["userdel", "-r", username], timeout=15)
+    if rc != 0:
+        raise HTTPException(500, stderr.strip() or "userdel failed")
+    return {"ok": True, "username": username}
+
+
+class CreateGroupRequest(BaseModel):
+    name: str
+
+
+@router.post("/groups")
+async def create_group(body: CreateGroupRequest, _: str = Depends(require_super_admin)) -> dict:
+    if not re.match(r"^[a-z_][a-z0-9_-]{0,31}$", body.name):
+        raise HTTPException(400, "Invalid group name")
+    _, stderr, rc = _run(["groupadd", body.name], timeout=10)
+    if rc != 0:
+        raise HTTPException(500, stderr.strip() or "groupadd failed")
+    return {"ok": True, "name": body.name}
+
+
+@router.delete("/groups/{name}")
+async def delete_group(name: str, _: str = Depends(require_super_admin)) -> dict:
+    if not re.match(r"^[a-z_][a-z0-9_-]{0,31}$", name):
+        raise HTTPException(400, "Invalid group name")
+    _, stderr, rc = _run(["groupdel", name], timeout=10)
+    if rc != 0:
+        raise HTTPException(500, stderr.strip() or "groupdel failed")
+    return {"ok": True, "name": name}
 
 
 # ---------------------------------------------------------------------------
-# Disk and Network Filesystems
+# Filesystems
 # ---------------------------------------------------------------------------
 
 @router.get("/filesystems")
@@ -360,49 +659,85 @@ async def get_filesystems(_: str = Depends(require_super_admin)) -> dict:
     for part in psutil.disk_partitions(all=True):
         try:
             usage = psutil.disk_usage(part.mountpoint)
-            used_gb = round(usage.used / 1e9, 2)
-            total_gb = round(usage.total / 1e9, 2)
-            free_gb = round(usage.free / 1e9, 2)
-            percent = usage.percent
+            used_gb, total_gb, free_gb, percent = round(usage.used / 1e9, 2), round(usage.total / 1e9, 2), round(usage.free / 1e9, 2), usage.percent
         except (PermissionError, OSError):
             used_gb = total_gb = free_gb = percent = None
-        mounts.append({
-            "device": part.device,
-            "mountpoint": part.mountpoint,
-            "fstype": part.fstype,
-            "opts": part.opts,
-            "total_gb": total_gb,
-            "used_gb": used_gb,
-            "free_gb": free_gb,
-            "percent": percent,
-        })
+        mounts.append({"device": part.device, "mountpoint": part.mountpoint, "fstype": part.fstype, "opts": part.opts, "total_gb": total_gb, "used_gb": used_gb, "free_gb": free_gb, "percent": percent})
     return {"mounts": mounts, "count": len(mounts), "checked_at": datetime.now(UTC).isoformat()}
 
 
 # ---------------------------------------------------------------------------
-# Bootup and Shutdown — systemd service list
+# Servers — auto-detection
 # ---------------------------------------------------------------------------
 
-@router.get("/bootup")
-async def get_bootup(_: str = Depends(require_super_admin)) -> dict:
-    out = _run([
-        "systemctl", "list-units", "--type=service",
-        "--all", "--no-pager", "--no-legend",
-        "--output=json",
-    ], timeout=10)
-    services = []
-    if out:
-        import json
-        try:
-            raw = json.loads(out)
-            for s in raw:
-                services.append({
-                    "unit": s.get("unit", ""),
-                    "load": s.get("load", ""),
-                    "active": s.get("active", ""),
-                    "sub": s.get("sub", ""),
-                    "description": s.get("description", ""),
-                })
-        except Exception:
-            pass
-    return {"services": services, "count": len(services), "checked_at": datetime.now(UTC).isoformat()}
+def _detect_server(key: str, meta: dict) -> dict | None:
+    found = any(shutil.which(b) for b in meta["binaries"])
+    if not found:
+        # Also check if config path exists
+        found = any(Path(p).exists() for p in meta["config_paths"])
+    if not found:
+        return None
+    active = _service_active(meta["service"])
+    enabled = _service_enabled(meta["service"])
+    return {
+        "key": key,
+        "label": meta["label"],
+        "service": meta["service"],
+        "category": meta["category"],
+        "active": active,
+        "enabled": enabled,
+        "running": active == "active",
+    }
+
+
+@router.get("/servers")
+async def list_servers(_: str = Depends(require_super_admin)) -> dict:
+    servers = []
+    for key, meta in KNOWN_SERVERS.items():
+        detected = _detect_server(key, meta)
+        if detected:
+            servers.append(detected)
+    return {"servers": servers, "count": len(servers), "checked_at": datetime.now(UTC).isoformat()}
+
+
+@router.get("/servers/{key}")
+async def get_server(key: str, _: str = Depends(require_super_admin)) -> dict:
+    if key not in KNOWN_SERVERS:
+        raise HTTPException(404, "Unknown server")
+    meta = KNOWN_SERVERS[key]
+    detected = _detect_server(key, meta)
+    if not detected:
+        raise HTTPException(404, "Server not installed")
+
+    # Read first existing config file (first 200 lines)
+    config_content = None
+    config_path = None
+    for cp in meta["config_paths"]:
+        p = Path(cp)
+        if p.is_file():
+            try:
+                lines = p.read_text(errors="replace").splitlines()[:200]
+                config_content = "\n".join(lines)
+                config_path = cp
+            except Exception:
+                pass
+            break
+
+    # Tail first existing log file
+    log_lines = []
+    log_path = None
+    for lp in meta["log_paths"]:
+        p = Path(lp)
+        if p.is_file():
+            log_lines = _run_out(["tail", "-n50", lp]).splitlines()
+            log_path = lp
+            break
+
+    return {
+        **detected,
+        "config_path": config_path,
+        "config_content": config_content,
+        "log_path": log_path,
+        "log_lines": log_lines,
+        "checked_at": datetime.now(UTC).isoformat(),
+    }
