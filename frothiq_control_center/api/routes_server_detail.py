@@ -85,32 +85,79 @@ def _strip_comments(content: str, style: str = "hash") -> str:
 # Nginx
 # ---------------------------------------------------------------------------
 
+def _read_file_sudo(path: str) -> str:
+    """Read a file via sudo cat — works even when frothiq can't directly access the path."""
+    import subprocess
+    try:
+        r = subprocess.run(["sudo", "cat", path], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            return r.stdout
+    except Exception:
+        pass
+    # Fallback: direct read
+    try:
+        return Path(path).read_text(errors="replace")
+    except Exception:
+        return ""
+
+
 def _nginx_detail() -> dict:
     import glob
+    seen: set[str] = set()
     vhosts = []
+
+    # Collect all nginx vhost config files — including symlinked paths
+    config_files: list[str] = []
     for pattern in ["/etc/nginx/sites-enabled/*", "/etc/nginx/conf.d/*.conf"]:
-        for fpath in sorted(glob.glob(pattern)):
-            try:
-                raw = Path(fpath).read_text(errors="replace")
-                clean = _strip_comments(raw)
-                for block in _extract_braced_blocks(clean, "server"):
-                    listens = _directives(block, "listen")
-                    ports = list({re.search(r'\d+', l).group() for l in listens if re.search(r'\d+', l)})
-                    ssl = any("ssl" in l for l in listens) or bool(_directive(block, "ssl_certificate"))
-                    vhosts.append({
-                        "file": Path(fpath).name,
-                        "server_name": _directive(block, "server_name") or "_",
-                        "listen": listens,
-                        "ports": ports,
-                        "ssl": ssl,
-                        "root": _directive(block, "root"),
-                        "proxy_pass": _directive(block, "proxy_pass"),
-                        "return": _directive(block, "return"),
-                        "access_log": _directive(block, "access_log"),
-                        "error_log": _directive(block, "error_log"),
-                    })
-            except Exception:
+        config_files.extend(sorted(glob.glob(pattern)))
+    # Deduplicate by resolved path if possible
+    config_files = list(dict.fromkeys(config_files))
+
+    for fpath in config_files:
+        try:
+            raw = _read_file_sudo(fpath)
+            if not raw:
                 continue
+            clean = _strip_comments(raw)
+            for block in _extract_braced_blocks(clean, "server"):
+                # Skip upstream blocks that might be mis-detected
+                listens = _directives(block, "listen")
+                if not listens:
+                    continue
+                ports = list({re.search(r'\d+', li).group() for li in listens if re.search(r'\d+', li)})
+                ssl = any("ssl" in li for li in listens) or bool(_directive(block, "ssl_certificate"))
+                # server_name may span multiple lines in Frappe configs
+                sn_raw = _directive(block, "server_name") or ""
+                server_name = " ".join(sn_raw.split())  # normalize whitespace
+
+                # proxy_pass may live inside a location block — extract first occurrence anywhere
+                proxy_pass = None
+                for loc_block in _extract_braced_blocks(block, "location"):
+                    pp = _directive(loc_block, "proxy_pass")
+                    if pp:
+                        proxy_pass = pp
+                        break
+                if not proxy_pass:
+                    proxy_pass = _directive(block, "proxy_pass")
+
+                key = (server_name, ",".join(sorted(ports)))
+                if key in seen:
+                    continue
+                seen.add(key)
+                vhosts.append({
+                    "file": Path(fpath).name,
+                    "server_name": server_name or "_",
+                    "listen": listens,
+                    "ports": ports,
+                    "ssl": ssl,
+                    "root": _directive(block, "root"),
+                    "proxy_pass": proxy_pass,
+                    "return": _directive(block, "return"),
+                    "access_log": _directive(block, "access_log"),
+                    "error_log": _directive(block, "error_log"),
+                })
+        except Exception:
+            continue
 
     # stub_status if available
     stats: dict = {}
@@ -142,16 +189,21 @@ def _nginx_detail() -> dict:
 # ---------------------------------------------------------------------------
 
 def _apache2_detail() -> dict:
+    import subprocess
     vhosts = []
 
-    # Parse sites-enabled configs
+    # Parse sites-enabled configs — use sudo cat to resolve symlinks into protected paths
     sites_dir = Path("/etc/apache2/sites-enabled")
     if sites_dir.is_dir():
-        for f in sorted(sites_dir.iterdir()):
-            if not f.is_file():
-                continue
+        try:
+            files = sorted(f for f in sites_dir.iterdir() if f.name.endswith(".conf"))
+        except Exception:
+            files = []
+        for f in files:
             try:
-                content = f.read_text(errors="replace")
+                content = _read_file_sudo(str(f))
+                if not content:
+                    continue
                 content_clean = _strip_comments(content)
                 for m in re.finditer(r'<VirtualHost\s+([^>]+)>(.*?)</VirtualHost>',
                                      content_clean, re.DOTALL | re.IGNORECASE):
@@ -160,6 +212,8 @@ def _apache2_detail() -> dict:
                     port = re.search(r':(\d+)', addr)
                     port_num = port.group(1) if port else "80"
                     ssl_engine = _apache_directive(block, "SSLEngine") or ""
+                    # ProxyPass may be in a Location block or top-level
+                    proxy_pass = _apache_directive(block, "ProxyPass")
                     vhosts.append({
                         "file": f.name,
                         "address": addr,
@@ -171,32 +225,36 @@ def _apache2_detail() -> dict:
                         "ssl_cert": _apache_directive(block, "SSLCertificateFile"),
                         "error_log": _apache_directive(block, "ErrorLog"),
                         "custom_log": _apache_directive(block, "CustomLog"),
-                        "proxy_pass": _apache_directive(block, "ProxyPass"),
+                        "proxy_pass": proxy_pass,
                     })
             except Exception:
                 continue
 
-    # apache2ctl -S summary
-    ctl_out = _out(["apache2ctl", "-S"], timeout=10)
+    # apache2ctl -S summary (requires sudo)
+    try:
+        r = subprocess.run(["sudo", "apache2ctl", "-S"], capture_output=True, text=True, timeout=10)
+        ctl_out = (r.stdout + r.stderr)[:3000]
+    except Exception:
+        ctl_out = ""
 
     # Active connections via server-status if available
     stats: dict = {}
     for url in ["http://127.0.0.1/server-status?auto", "http://localhost/server-status?auto"]:
         out = _out(["curl", "-s", "--max-time", "2", url])
         if "Total Accesses" in out or "BusyWorkers" in out:
-            for key, pat in [("total_accesses", r"Total Accesses:\s*(\d+)"),
-                              ("busy_workers", r"BusyWorkers:\s*(\d+)"),
-                              ("idle_workers", r"IdleWorkers:\s*(\d+)"),
-                              ("requests_per_sec", r"ReqPerSec:\s*([\d.]+)")]:
+            for stat_key, pat in [("total_accesses", r"Total Accesses:\s*(\d+)"),
+                                   ("busy_workers", r"BusyWorkers:\s*(\d+)"),
+                                   ("idle_workers", r"IdleWorkers:\s*(\d+)"),
+                                   ("requests_per_sec", r"ReqPerSec:\s*([\d.]+)")]:
                 if mm := re.search(pat, out):
-                    stats[key] = float(mm.group(1)) if "." in mm.group(1) else int(mm.group(1))
+                    stats[stat_key] = float(mm.group(1)) if "." in mm.group(1) else int(mm.group(1))
             break
 
     workers = _out(["pgrep", "-c", "apache2"])
     if workers.strip().isdigit():
         stats["worker_processes"] = int(workers.strip())
 
-    return {"vhosts": vhosts, "stats": stats, "ctl_summary": ctl_out[:3000]}
+    return {"vhosts": vhosts, "stats": stats, "ctl_summary": ctl_out}
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +595,170 @@ async def get_server_detail(key: str, _: str = Depends(require_super_admin)) -> 
     except Exception as e:
         data = {"error": str(e)}
     return {"type": key, "data": data, "checked_at": datetime.now(UTC).isoformat()}
+
+
+# ---------------------------------------------------------------------------
+# Health checks
+# ---------------------------------------------------------------------------
+
+_CONFIG_TEST_CMDS: dict[str, list[str]] = {
+    "nginx":   ["sudo", "nginx", "-t"],
+    "apache2": ["sudo", "apache2ctl", "-t"],
+    "bind9":   ["sudo", "named-checkconf", "/etc/bind/named.conf"],
+    "postfix": ["sudo", "postfix", "check"],
+}
+
+_ERROR_LOGS: dict[str, list[str]] = {
+    "nginx":   ["/var/log/nginx/error.log"],
+    "apache2": ["/var/log/apache2/error.log"],
+    "mysql":   ["/var/log/mysql/error.log"],
+    "mariadb": ["/var/log/mysql/error.log"],
+    "redis":   ["/var/log/redis/redis-server.log"],
+    "postfix": ["/var/log/mail.log"],
+    "dovecot": ["/var/log/dovecot.log", "/var/log/mail.log"],
+    "bind9":   ["/var/log/named/default", "/var/log/syslog"],
+    "openssh": ["/var/log/auth.log"],
+}
+
+_SYSTEMD_NAMES: dict[str, str] = {
+    "nginx":   "nginx",
+    "apache2": "apache2",
+    "mysql":   "mysql",
+    "mariadb": "mariadb",
+    "redis":   "redis-server",
+    "postfix": "postfix",
+    "dovecot": "dovecot",
+    "bind9":   "named",
+    "openssh": "ssh",
+}
+
+
+def _health_checks(key: str) -> list[dict]:
+    """Run service-specific health checks and return a list of check results."""
+    import subprocess
+    checks = []
+
+    # 1. Process check
+    svc_name = _SYSTEMD_NAMES.get(key, key)
+    proc_out, _, proc_rc = _run(["pgrep", "-c", "-x", svc_name])
+    if proc_rc == 0 and proc_out.strip().isdigit():
+        count = int(proc_out.strip())
+        checks.append({"name": "Process Running", "status": "ok" if count > 0 else "error",
+                       "detail": f"{count} process(es) running"})
+    else:
+        # fallback to systemctl is-active
+        _, _, rc = _run(["sudo", "systemctl", "is-active", "--quiet", svc_name])
+        checks.append({"name": "Service Active", "status": "ok" if rc == 0 else "error",
+                       "detail": "active" if rc == 0 else "inactive/failed"})
+
+    # 2. Systemd status
+    status_out, _, _ = _run(["sudo", "systemctl", "status", "--no-pager", "-l", svc_name], timeout=5)
+    # Extract last activation time
+    if m := re.search(r'Active:.*?since\s+(.+?);', status_out):
+        checks.append({"name": "Last Started", "status": "info", "detail": m.group(1).strip()})
+    if m := re.search(r'Main PID:\s*(\d+)', status_out):
+        checks.append({"name": "Main PID", "status": "info", "detail": m.group(1).strip()})
+
+    # 3. Config test (if available)
+    if key in _CONFIG_TEST_CMDS:
+        cmd = _CONFIG_TEST_CMDS[key]
+        stdout, stderr, rc = _run(cmd, timeout=10)
+        output = (stdout + stderr).strip()
+        ok = rc == 0
+        checks.append({"name": "Config Test", "status": "ok" if ok else "error",
+                       "detail": output[:200] if output else ("OK" if ok else "FAILED")})
+
+    # 4. Service-specific checks
+    if key in ("nginx", "apache2"):
+        # Check listening ports
+        port_out = _out(["ss", "-tlnp"], timeout=5)
+        ports_80 = ":80 " in port_out
+        ports_443 = ":443 " in port_out
+        checks.append({"name": "Listening :80", "status": "ok" if ports_80 else "warn", "detail": "yes" if ports_80 else "not listening"})
+        checks.append({"name": "Listening :443", "status": "ok" if ports_443 else "warn", "detail": "yes" if ports_443 else "not listening"})
+
+    if key in ("mysql", "mariadb"):
+        # Try connecting
+        result = _out(["mysqladmin", "ping", "--connect-timeout=2"], timeout=5)
+        ok = "alive" in result.lower()
+        checks.append({"name": "DB Ping", "status": "ok" if ok else "error", "detail": result.strip() or "no response"})
+
+    if key == "redis":
+        result = _out(["redis-cli", "ping"], timeout=3)
+        ok = "PONG" in result
+        checks.append({"name": "Redis Ping", "status": "ok" if ok else "error", "detail": result.strip() or "no response"})
+
+    if key == "postfix":
+        # Queue summary
+        queue_out = _out(["sudo", "postfix", "status"], timeout=5)
+        mq_out = _out(["sudo", "mailq"], timeout=5)
+        queue_count = mq_out.count("\n") - 1 if "empty" not in mq_out else 0
+        checks.append({"name": "Mail Queue", "status": "ok" if queue_count == 0 else "warn",
+                       "detail": f"{max(0, queue_count)} message(s) queued"})
+
+    if key == "openssh":
+        # Active connections
+        ss_out = _out(["ss", "-tnp", "sport", "=", ":22"], timeout=5)
+        conns = max(0, ss_out.count("\n") - 1)
+        checks.append({"name": "Active SSH Sessions", "status": "info", "detail": f"{conns} connection(s)"})
+
+    return checks
+
+
+def _modules_list(key: str) -> list[dict]:
+    """Return a list of loaded modules/extensions for the service."""
+    mods = []
+    if key == "apache2":
+        out = _out(["sudo", "apache2ctl", "-M"], timeout=10)
+        for line in out.splitlines():
+            line = line.strip()
+            if line and not line.startswith("Loaded"):
+                parts = line.split()
+                if parts:
+                    mods.append({"name": parts[0], "type": parts[1] if len(parts) > 1 else "static"})
+    elif key == "nginx":
+        out = _out(["nginx", "-V"], timeout=5)
+        for m in re.finditer(r'--with-([\w-]+)', out):
+            mods.append({"name": m.group(1), "type": "compiled-in"})
+    return mods
+
+
+@router.get("/{key}/health")
+async def get_server_health(key: str, _: str = Depends(require_super_admin)) -> dict:
+    """Return comprehensive health check results for a service."""
+    svc_name = _SYSTEMD_NAMES.get(key, key)
+
+    # Full systemd status block
+    status_out, _, _ = _run(["sudo", "systemctl", "status", "--no-pager", "-l", svc_name], timeout=8)
+
+    # Error log tail (last 50 lines)
+    log_lines: list[str] = []
+    log_path: str = ""
+    for lp in _ERROR_LOGS.get(key, []):
+        out = _out(["sudo", "tail", "-n", "50", lp], timeout=5)
+        if out.strip():
+            log_lines = out.splitlines()
+            log_path = lp
+            break
+
+    # Error/warning counts in log
+    error_count = sum(1 for l in log_lines if "error" in l.lower() or "crit" in l.lower())
+    warn_count = sum(1 for l in log_lines if "warn" in l.lower() or "notice" in l.lower())
+
+    checks = _health_checks(key)
+    mods = _modules_list(key)
+
+    return {
+        "key": key,
+        "systemd_status": status_out[:4000],
+        "log_path": log_path,
+        "log_lines": log_lines,
+        "error_count": error_count,
+        "warn_count": warn_count,
+        "checks": checks,
+        "modules": mods,
+        "checked_at": datetime.now(UTC).isoformat(),
+    }
 
 
 # ---------------------------------------------------------------------------
