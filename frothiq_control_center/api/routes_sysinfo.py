@@ -265,10 +265,29 @@ async def get_sysinfo(_: str = Depends(require_super_admin)) -> dict:
         })
     net = psutil.net_io_counters()
     uname = platform.uname()
+
+    # Read the real OS distribution from /etc/os-release (freedesktop standard).
+    # platform.uname().release is the kernel version, not the distro name.
+    try:
+        os_release = platform.freedesktop_os_release()
+        os_name      = os_release.get("PRETTY_NAME", f"{uname.system} {uname.release}")
+        os_id        = os_release.get("ID", "linux").lower()
+        os_version   = os_release.get("VERSION_ID", "")
+        os_codename  = os_release.get("VERSION_CODENAME", "")
+    except (OSError, AttributeError):
+        os_name     = f"{uname.system} {uname.release}"
+        os_id       = "linux"
+        os_version  = ""
+        os_codename = ""
+
     return {
         "hostname": uname.node,
-        "os": f"{uname.system} {uname.release}",
-        "kernel": uname.version,
+        "os": os_name,           # "Ubuntu 24.04.4 LTS" — human-readable distro name
+        "os_id": os_id,          # "ubuntu" — machine-readable ID for logo matching
+        "os_version": os_version,    # "24.04"
+        "os_codename": os_codename,  # "noble"
+        "kernel": uname.release,     # "6.8.0-107-generic" — kernel version
+        "kernel_build": uname.version,  # "#107-Ubuntu SMP PREEMPT_DYNAMIC …" — build string
         "arch": uname.machine,
         "python": platform.python_version(),
         "uptime": _uptime_str(boot_ts),
