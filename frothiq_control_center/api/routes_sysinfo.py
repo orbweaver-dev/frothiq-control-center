@@ -267,6 +267,7 @@ async def get_sysinfo(_: str = Depends(require_super_admin)) -> dict:
             "percent": usage.percent,
         })
     net = psutil.net_io_counters()
+    net_per_nic = psutil.net_io_counters(pernic=True)
     uname = platform.uname()
 
     # Read the real OS distribution from /etc/os-release (freedesktop standard).
@@ -319,6 +320,13 @@ async def get_sysinfo(_: str = Depends(require_super_admin)) -> dict:
             "packets_sent": net.packets_sent,
             "packets_recv": net.packets_recv,
             "interfaces": list(psutil.net_if_addrs().keys()),
+            "per_interface": {
+                iface: {
+                    "bytes_sent_mb": round(counters.bytes_sent / 1e6, 4),
+                    "bytes_recv_mb": round(counters.bytes_recv / 1e6, 4),
+                }
+                for iface, counters in net_per_nic.items()
+            },
         },
         "processes": len(psutil.pids()),
         "checked_at": datetime.now(UTC).isoformat(),
