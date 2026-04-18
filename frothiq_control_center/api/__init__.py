@@ -23,6 +23,7 @@ from .routes_predictive import router as predictive_router
 from .routes_sysinfo import router as sysinfo_router
 from .routes_server_detail import router as server_detail_router
 from .routes_tools import router as tools_router
+from .routes_wireguard import router as wireguard_router
 
 # All control center routes under /api/v1/cc/
 api_router = APIRouter(prefix="/api/v1/cc")
@@ -59,6 +60,8 @@ api_router.include_router(sysinfo_router)
 api_router.include_router(server_detail_router)
 # ServOps — system tools (terminal, file manager, network tools)
 api_router.include_router(tools_router)
+# ServOps — WireGuard VPN management
+api_router.include_router(wireguard_router)
 
 # Public edge registration (no JWT — separate prefix /api/v1/edge/)
 # This is mounted directly on the FastAPI app in main.py
