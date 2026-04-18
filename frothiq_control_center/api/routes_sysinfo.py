@@ -314,8 +314,8 @@ async def get_sysinfo(_: str = Depends(require_super_admin)) -> dict:
         },
         "disks": disks,
         "network": {
-            "bytes_sent_mb": round(net.bytes_sent / 1e6, 2),
-            "bytes_recv_mb": round(net.bytes_recv / 1e6, 2),
+            "bytes_sent_mb": round(net.bytes_sent / 1e6, 4),
+            "bytes_recv_mb": round(net.bytes_recv / 1e6, 4),
             "packets_sent": net.packets_sent,
             "packets_recv": net.packets_recv,
             "interfaces": list(psutil.net_if_addrs().keys()),
@@ -588,43 +588,71 @@ def _run_upgrade() -> None:
         if len(_UPGRADE_JOB["lines"]) > 500:
             _UPGRADE_JOB["lines"] = _UPGRADE_JOB["lines"][-500:]
 
-    apt_env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive", "APT_LISTCHANGES_FRONTEND": "none"}
+    # env_keep in sudoers preserves these through sudo privilege escalation.
+    # NEEDRESTART_MODE=a: auto-restart services without prompting.
+    # DEBIAN_FRONTEND=noninteractive: suppresses debconf/whiptail TUI dialogs.
+    apt_env = {
+        **os.environ,
+        "DEBIAN_FRONTEND": "noninteractive",
+        "APT_LISTCHANGES_FRONTEND": "none",
+        "NEEDRESTART_MODE": "a",
+    }
 
-    # Step 1: refresh package lists
-    _emit("[apt] Refreshing package lists…")
-    proc = subprocess.run(
-        ["sudo", "apt-get", "update", "-q"],
-        capture_output=True, text=True, env=apt_env, timeout=120,
-    )
-    for line in (proc.stdout + proc.stderr).splitlines():
-        if line.strip():
-            _emit(line)
+    try:
+        # Step 1: refresh package lists
+        _emit("[apt] Refreshing package lists…")
+        proc = subprocess.run(
+            ["sudo", "apt-get", "update", "-q"],
+            capture_output=True, text=True, env=apt_env, timeout=120,
+        )
+        for line in (proc.stdout + proc.stderr).splitlines():
+            line = line.strip()
+            # skip raw terminal escape sequences from whiptail
+            if line and not line.startswith("\x1b[") and not line.startswith("[?"):
+                _emit(line)
 
-    if proc.returncode != 0:
-        _UPGRADE_JOB["status"] = "error"
-        _UPGRADE_JOB["error"] = "apt-get update failed"
-        _UPGRADE_JOB["finished_at"] = datetime.now(UTC).isoformat()
-        return
+        if proc.returncode != 0:
+            _UPGRADE_JOB["status"] = "error"
+            _UPGRADE_JOB["error"] = "apt-get update failed (rc={})".format(proc.returncode)
+            _UPGRADE_JOB["finished_at"] = datetime.now(UTC).isoformat()
+            return
 
-    # Step 2: upgrade all packages
-    _emit("[apt] Starting package upgrade…")
-    proc2 = subprocess.run(
-        ["sudo", "apt-get", "upgrade", "-y", "-q", "--no-install-recommends"],
-        capture_output=True, text=True, env=apt_env, timeout=600,
-    )
-    for line in (proc2.stdout + proc2.stderr).splitlines():
-        if line.strip():
-            _emit(line)
+        # Step 2: upgrade all packages.
+        # -o Dpkg::Options force-confdef/confold: handle config file conflicts without prompting.
+        _emit("[apt] Starting package upgrade…")
+        proc2 = subprocess.run(
+            [
+                "sudo", "apt-get", "upgrade", "-y", "-q",
+                "--no-install-recommends",
+                "-o", "Dpkg::Options::=--force-confdef",
+                "-o", "Dpkg::Options::=--force-confold",
+            ],
+            capture_output=True, text=True, env=apt_env, timeout=600,
+        )
+        for line in (proc2.stdout + proc2.stderr).splitlines():
+            line = line.strip()
+            if line and not line.startswith("\x1b[") and not line.startswith("[?"):
+                _emit(line)
             m = re.search(r"(\d+) upgraded", line)
             if m:
                 _UPGRADE_JOB["packages_upgraded"] = int(m.group(1))
 
-    if proc2.returncode != 0:
+        _emit(f"[apt] Exit code: {proc2.returncode}")
+        if proc2.returncode != 0:
+            _UPGRADE_JOB["status"] = "error"
+            err = "\n".join(
+                l for l in (proc2.stderr or "").splitlines()
+                if l.strip() and not l.startswith("\x1b[") and not l.startswith("[?")
+            )
+            _UPGRADE_JOB["error"] = (err or "apt-get upgrade failed")[-300:]
+        else:
+            _UPGRADE_JOB["status"] = "done"
+            _emit("[apt] Upgrade complete.")
+
+    except Exception as exc:
         _UPGRADE_JOB["status"] = "error"
-        _UPGRADE_JOB["error"] = (proc2.stderr.strip() or "apt-get upgrade failed")[-300:]
-    else:
-        _UPGRADE_JOB["status"] = "done"
-        _emit("[apt] Upgrade complete.")
+        _UPGRADE_JOB["error"] = str(exc)[:300]
+        _emit(f"[apt] Exception: {exc}")
 
     _UPGRADE_JOB["finished_at"] = datetime.now(UTC).isoformat()
 
