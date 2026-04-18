@@ -5,12 +5,15 @@ ServOps — system information + management endpoints (super_admin only).
 from __future__ import annotations
 
 import grp
+import os
 import platform
 import pwd
 import re
 import shutil
 import subprocess
+import threading
 import time
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -556,6 +559,107 @@ async def get_package_updates(_: str = Depends(require_super_admin)) -> dict:
         if m:
             updates.append({"name": m.group(1), "new_version": m.group(2), "arch": m.group(3), "old_version": m.group(4)})
     return {"total": len(updates), "updates": updates, "checked_at": datetime.now(UTC).isoformat()}
+
+
+# ---------------------------------------------------------------------------
+# OS upgrade — background job tracker
+# ---------------------------------------------------------------------------
+
+_UPGRADE_JOB: dict = {
+    "id": None,
+    "status": "idle",      # idle | running | done | error
+    "lines": [],
+    "packages_upgraded": 0,
+    "started_at": None,
+    "finished_at": None,
+    "error": "",
+}
+_UPGRADE_LOCK = threading.Lock()
+
+
+def _run_upgrade() -> None:
+    """Run apt-get update + apt-get upgrade in a background thread."""
+    _UPGRADE_JOB["lines"] = []
+    _UPGRADE_JOB["packages_upgraded"] = 0
+    _UPGRADE_JOB["error"] = ""
+
+    def _emit(line: str) -> None:
+        _UPGRADE_JOB["lines"].append(line)
+        if len(_UPGRADE_JOB["lines"]) > 500:
+            _UPGRADE_JOB["lines"] = _UPGRADE_JOB["lines"][-500:]
+
+    apt_env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive", "APT_LISTCHANGES_FRONTEND": "none"}
+
+    # Step 1: refresh package lists
+    _emit("[apt] Refreshing package lists…")
+    proc = subprocess.run(
+        ["sudo", "apt-get", "update", "-q"],
+        capture_output=True, text=True, env=apt_env, timeout=120,
+    )
+    for line in (proc.stdout + proc.stderr).splitlines():
+        if line.strip():
+            _emit(line)
+
+    if proc.returncode != 0:
+        _UPGRADE_JOB["status"] = "error"
+        _UPGRADE_JOB["error"] = "apt-get update failed"
+        _UPGRADE_JOB["finished_at"] = datetime.now(UTC).isoformat()
+        return
+
+    # Step 2: upgrade all packages
+    _emit("[apt] Starting package upgrade…")
+    proc2 = subprocess.run(
+        ["sudo", "apt-get", "upgrade", "-y", "-q", "--no-install-recommends"],
+        capture_output=True, text=True, env=apt_env, timeout=600,
+    )
+    for line in (proc2.stdout + proc2.stderr).splitlines():
+        if line.strip():
+            _emit(line)
+            m = re.search(r"(\d+) upgraded", line)
+            if m:
+                _UPGRADE_JOB["packages_upgraded"] = int(m.group(1))
+
+    if proc2.returncode != 0:
+        _UPGRADE_JOB["status"] = "error"
+        _UPGRADE_JOB["error"] = (proc2.stderr.strip() or "apt-get upgrade failed")[-300:]
+    else:
+        _UPGRADE_JOB["status"] = "done"
+        _emit("[apt] Upgrade complete.")
+
+    _UPGRADE_JOB["finished_at"] = datetime.now(UTC).isoformat()
+
+
+@router.post("/os/upgrade")
+async def start_os_upgrade(_: str = Depends(require_super_admin)) -> dict:
+    with _UPGRADE_LOCK:
+        if _UPGRADE_JOB["status"] == "running":
+            return {"ok": False, "message": "Upgrade already in progress", "job_id": _UPGRADE_JOB["id"]}
+        job_id = str(uuid.uuid4())
+        _UPGRADE_JOB.update({
+            "id": job_id,
+            "status": "running",
+            "lines": [],
+            "packages_upgraded": 0,
+            "started_at": datetime.now(UTC).isoformat(),
+            "finished_at": None,
+            "error": "",
+        })
+    thread = threading.Thread(target=_run_upgrade, daemon=True)
+    thread.start()
+    return {"ok": True, "job_id": job_id}
+
+
+@router.get("/os/upgrade/status")
+async def get_upgrade_status(_: str = Depends(require_super_admin)) -> dict:
+    return {
+        "job_id": _UPGRADE_JOB["id"],
+        "status": _UPGRADE_JOB["status"],
+        "lines": _UPGRADE_JOB["lines"][-60:],   # last 60 lines
+        "packages_upgraded": _UPGRADE_JOB["packages_upgraded"],
+        "started_at": _UPGRADE_JOB["started_at"],
+        "finished_at": _UPGRADE_JOB["finished_at"],
+        "error": _UPGRADE_JOB["error"],
+    }
 
 
 class PackageActionRequest(BaseModel):
