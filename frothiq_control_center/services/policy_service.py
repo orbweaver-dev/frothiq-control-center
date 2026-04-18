@@ -16,8 +16,12 @@ logger = logging.getLogger(__name__)
 async def get_active_policies(bypass_cache: bool = False) -> dict[str, Any]:
     """Fetch all active policies across all tenants (super-admin view)."""
     try:
-        data = await core_client.get("/api/v2/policy/rules", bypass_cache=bypass_cache)
-        policies = data.get("policies", [])
+        data = await core_client.get(
+            "/api/v2/policy/rules",
+            params={"namespace": "global"},
+            bypass_cache=bypass_cache,
+        )
+        policies = data.get("rules", data.get("policies", []))
         return {
             "success": True,
             "total": len(policies),
