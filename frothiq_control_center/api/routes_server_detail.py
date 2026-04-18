@@ -461,6 +461,30 @@ def _dovecot_detail() -> dict:
 # BIND9
 # ---------------------------------------------------------------------------
 
+def _bind9_extract_zone_bodies(content: str) -> list[tuple[str, str]]:
+    """Extract (zone_name, body) pairs from BIND9 config, handling nested braces."""
+    results: list[tuple[str, str]] = []
+    pos = 0
+    pattern = re.compile(r'\bzone\s+"([^"]+)"\s*(?:IN\s*)?\{', re.IGNORECASE)
+    while True:
+        m = pattern.search(content, pos)
+        if not m:
+            break
+        zone_name = m.group(1)
+        start = m.end()
+        depth, i = 1, start
+        while i < len(content) and depth > 0:
+            if content[i] == '{':
+                depth += 1
+            elif content[i] == '}':
+                depth -= 1
+            i += 1
+        body = content[start:i - 1]
+        results.append((zone_name, body))
+        pos = i
+    return results
+
+
 def _bind9_detail() -> dict:
     zones: list[dict] = []
     visited: set[str] = set()
@@ -470,21 +494,19 @@ def _bind9_detail() -> dict:
             return
         visited.add(path)
         try:
-            raw = Path(path).read_text(errors="replace")
+            raw = _read_file_sudo(path)
+            if not raw:
+                raw = Path(path).read_text(errors="replace")
             clean = _strip_comments(raw, style="c")
 
-            # Includes
+            # Includes — collect before processing zones (order matters)
             for m in re.finditer(r'include\s+"([^"]+)"', clean, re.IGNORECASE):
                 inc = m.group(1)
                 if Path(inc).exists():
                     parse_file(inc, depth + 1)
 
-            # Zone blocks
-            for m in re.finditer(
-                r'zone\s+"([^"]+)"\s*(?:IN\s*)?\{([^}]+)\}',
-                clean, re.DOTALL | re.IGNORECASE,
-            ):
-                name, body = m.group(1), m.group(2)
+            # Zone blocks — use brace-aware parser to handle nested blocks
+            for zone_name, body in _bind9_extract_zone_bodies(clean):
                 if tm := re.search(r'type\s+(\w+)', body, re.IGNORECASE):
                     ztype = tm.group(1).lower()
                 else:
@@ -494,21 +516,38 @@ def _bind9_detail() -> dict:
                 if fm := re.search(r'file\s+"([^"]+)"', body, re.IGNORECASE):
                     zfile = fm.group(1)
 
+                # Masters: extract IPs from masters { } or primaries { } blocks
                 masters: list[str] = []
-                if mm := re.search(r'masters\s*\{([^}]+)\}', body, re.IGNORECASE):
-                    masters = [ip.strip().rstrip(';') for ip in mm.group(1).split()
-                               if re.match(r'[\d.:]', ip.strip().rstrip(';'))]
+                for masters_m in re.finditer(
+                    r'(?:masters|primaries)\s*(?:"[^"]*"\s*)?\{([^}]+)\}', body, re.IGNORECASE
+                ):
+                    for tok in masters_m.group(1).split():
+                        tok = tok.strip().rstrip(';')
+                        if re.match(r'^[\d.:a-fA-F]+$', tok) and tok:
+                            masters.append(tok)
+
+                # also-notify IPs
+                also_notify: list[str] = []
+                for an_m in re.finditer(r'also-notify\s*\{([^}]+)\}', body, re.IGNORECASE):
+                    for tok in an_m.group(1).split():
+                        tok = tok.strip().rstrip(';')
+                        if re.match(r'^[\d.:a-fA-F]+$', tok) and tok:
+                            also_notify.append(tok)
 
                 # Count records if file accessible
                 record_count: int | None = None
                 if zfile:
-                    for base in ["/etc/bind/", "/var/cache/bind/", ""]:
+                    for base in ["/var/lib/bind/", "/etc/bind/", "/var/cache/bind/", ""]:
                         fp = Path(base + zfile) if not zfile.startswith('/') else Path(zfile)
-                        if fp.exists():
+                        try:
+                            accessible = fp.exists()
+                        except (PermissionError, OSError):
+                            accessible = False
+                        if accessible:
                             try:
-                                lines = fp.read_text(errors="replace").splitlines()
+                                content_lines = _read_file_sudo(str(fp)).splitlines()
                                 record_count = sum(
-                                    1 for l in lines
+                                    1 for l in content_lines
                                     if l.strip() and not l.strip().startswith(';')
                                     and not l.strip().startswith('$')
                                 )
@@ -517,10 +556,11 @@ def _bind9_detail() -> dict:
                             break
 
                 zones.append({
-                    "name": name,
+                    "name": zone_name,
                     "type": ztype,
                     "file": zfile,
                     "masters": masters,
+                    "also_notify": also_notify,
                     "record_count": record_count,
                     "source": path,
                 })
@@ -538,12 +578,19 @@ def _bind9_detail() -> dict:
                   "forward": 2, "hint": 3, "stub": 4}
     zones.sort(key=lambda z: (type_order.get(z["type"], 5), z["name"]))
 
+    master_zones = [z for z in zones if z["type"] in ("master", "primary")]
+    slave_zones = [z for z in zones if z["type"] in ("slave", "secondary")]
+    forward_zones = [z for z in zones if z["type"] == "forward"]
+
     return {
         "zones": zones,
         "total": len(zones),
-        "master_zones": [z for z in zones if z["type"] in ("master", "primary")],
-        "slave_zones": [z for z in zones if z["type"] in ("slave", "secondary")],
-        "forward_zones": [z for z in zones if z["type"] == "forward"],
+        "zone_count": len(zones),
+        "master_count": len(master_zones),
+        "slave_count": len(slave_zones),
+        "master_zones": master_zones,
+        "slave_zones": slave_zones,
+        "forward_zones": forward_zones,
         "other_zones": [z for z in zones if z["type"] not in (
             "master", "primary", "slave", "secondary", "forward")],
     }
@@ -618,6 +665,7 @@ _ERROR_LOGS: dict[str, list[str]] = {
     "dovecot": ["/var/log/dovecot.log", "/var/log/mail.log"],
     "bind9":   ["/var/log/named/default", "/var/log/syslog"],
     "openssh": ["/var/log/auth.log"],
+    "fail2ban": ["/var/log/fail2ban.log"],
 }
 
 _SYSTEMD_NAMES: dict[str, str] = {
@@ -630,6 +678,7 @@ _SYSTEMD_NAMES: dict[str, str] = {
     "dovecot": "dovecot",
     "bind9":   "named",
     "openssh": "ssh",
+    "fail2ban": "fail2ban",
 }
 
 
@@ -697,10 +746,44 @@ def _health_checks(key: str) -> list[dict]:
                        "detail": f"{max(0, queue_count)} message(s) queued"})
 
     if key == "openssh":
-        # Active connections
         ss_out = _out(["ss", "-tnp", "sport", "=", ":22"], timeout=5)
         conns = max(0, ss_out.count("\n") - 1)
         checks.append({"name": "Active SSH Sessions", "status": "info", "detail": f"{conns} connection(s)"})
+
+    if key == "fail2ban":
+        # Only run client checks if service is running
+        is_active_out, _, is_rc = _run(["sudo", "systemctl", "is-active", "fail2ban"], timeout=5)
+        if is_rc == 0:
+            status_out, _, rc = _run(["sudo", "fail2ban-client", "status"], timeout=8)
+            if rc == 0:
+                # Extract jail list
+                jails_line = ""
+                for line in status_out.splitlines():
+                    if "Jail list:" in line:
+                        jails_line = line.split("Jail list:", 1)[-1].strip()
+                        break
+                jails = [j.strip() for j in jails_line.split(",") if j.strip()] if jails_line else []
+                checks.append({"name": "Active Jails", "status": "ok" if jails else "warn",
+                               "detail": ", ".join(jails) if jails else "No jails active"})
+                # Per-jail banned counts
+                for jail in jails[:5]:
+                    jout, _, jrc = _run(["sudo", "fail2ban-client", "status", jail], timeout=5)
+                    if jrc == 0:
+                        banned = 0
+                        for line in jout.splitlines():
+                            if "Currently banned:" in line:
+                                try:
+                                    banned = int(line.split(":", 1)[-1].strip())
+                                except ValueError:
+                                    pass
+                        checks.append({"name": f"Jail: {jail}", "status": "warn" if banned > 0 else "ok",
+                                       "detail": f"{banned} IP(s) currently banned"})
+            else:
+                checks.append({"name": "fail2ban-client", "status": "error",
+                               "detail": "Could not reach fail2ban socket"})
+        else:
+            checks.append({"name": "Service Status", "status": "warn",
+                           "detail": "fail2ban is not running — service is disabled or stopped"})
 
     return checks
 
@@ -775,6 +858,7 @@ _CONFIG_PATHS: dict[str, list[str]] = {
     "mysql": ["/etc/mysql/mariadb.conf.d/50-server.cnf", "/etc/mysql/my.cnf"],
     "mariadb": ["/etc/mysql/mariadb.conf.d/50-server.cnf", "/etc/mysql/my.cnf"],
     "bind9": ["/etc/bind/named.conf.options"],
+    "fail2ban": ["/etc/fail2ban/jail.local", "/etc/fail2ban/jail.conf"],
 }
 
 _RELOAD_CMDS: dict[str, list[str]] = {
@@ -787,6 +871,7 @@ _RELOAD_CMDS: dict[str, list[str]] = {
     "mysql": ["sudo", "systemctl", "restart", "mariadb"],
     "mariadb": ["sudo", "systemctl", "restart", "mariadb"],
     "bind9": ["sudo", "rndc", "reload"],
+    "fail2ban": ["sudo", "fail2ban-client", "reload"],
 }
 
 # Format constants
@@ -1000,6 +1085,547 @@ async def put_config_raw(key: str, body: ConfigRawBody, _: str = Depends(require
             reloaded = rc == 0
 
     return {"ok": True, "reloaded": reloaded, "reload_output": reload_output, "path": path}
+
+
+# ---------------------------------------------------------------------------
+# BIND9 structured options editor
+# ---------------------------------------------------------------------------
+
+_BIND9_OPTIONS_FILE = "/etc/bind/named.conf.options"
+
+
+def _parse_named_options(content: str) -> dict:
+    """Parse named.conf.options and return structured settings."""
+    clean = re.sub(r'//[^\n]*', '', content)
+    clean = re.sub(r'/\*.*?\*/', '', clean, flags=re.DOTALL)
+
+    # Extract options { ... } block
+    m = re.search(r'\boptions\s*\{', clean)
+    if not m:
+        return {"_raw": content, "_parse_error": "No options { } block found"}
+
+    start = m.end()
+    depth, i = 1, start
+    while i < len(clean) and depth > 0:
+        if clean[i] == '{':
+            depth += 1
+        elif clean[i] == '}':
+            depth -= 1
+        i += 1
+    block = clean[start:i - 1]
+
+    def _directive(name: str) -> str | None:
+        rx = re.search(rf'(?:^|[;\n])\s*{re.escape(name)}\s+([^;{{]+);', block, re.IGNORECASE | re.MULTILINE)
+        return rx.group(1).strip() if rx else None
+
+    def _acl_block(name: str) -> str:
+        rx = re.search(rf'\b{re.escape(name)}\s*\{{([^}}]+)\}}', block, re.IGNORECASE | re.DOTALL)
+        if rx:
+            items = [s.strip().rstrip(';') for s in rx.group(1).split(';') if s.strip()]
+            return "; ".join(items)
+        return ""
+
+    # Forwarders list
+    fw_rx = re.search(r'\bforwarders\s*\{([^}]*)\}', block, re.IGNORECASE | re.DOTALL)
+    forwarders: list[str] = []
+    if fw_rx:
+        for tok in fw_rx.group(1).split():
+            tok = tok.strip().rstrip(';')
+            if re.match(r'^[\d.:a-fA-F]+$', tok) and tok:
+                forwarders.append(tok)
+
+    raw_dir = _directive('directory') or '/var/cache/bind'
+    directory = raw_dir.strip('"').strip("'")
+
+    raw_ver = _directive('version') or ''
+    version = raw_ver.strip('"').strip("'")
+
+    return {
+        "directory": directory,
+        "forwarders": forwarders,
+        "forward": _directive('forward') or 'first',
+        "recursion": _directive('recursion') or 'yes',
+        "auth_nxdomain": _directive('auth-nxdomain') or 'no',
+        "dnssec_validation": _directive('dnssec-validation') or 'auto',
+        "notify": _directive('notify') or 'no',
+        "version": version,
+        "allow_query": _acl_block('allow-query') or 'any',
+        "allow_recursion": _acl_block('allow-recursion') or 'localhost',
+        "allow_transfer": _acl_block('allow-transfer') or 'none',
+        "listen_on": _acl_block('listen-on') or 'any',
+        "listen_on_v6": _acl_block('listen-on-v6') or 'any',
+        "max_cache_size": _directive('max-cache-size') or '',
+        "max_cache_ttl": _directive('max-cache-ttl') or '',
+        "max_ncache_ttl": _directive('max-ncache-ttl') or '',
+        "additional_from_auth": _directive('additional-from-auth') or '',
+        "additional_from_cache": _directive('additional-from-cache') or '',
+    }
+
+
+def _build_named_options(settings: dict) -> str:
+    """Build named.conf.options content from structured settings."""
+    lines: list[str] = ["options {"]
+
+    directory = settings.get("directory", "/var/cache/bind").strip().strip('"')
+    lines.append(f'\tdirectory "{directory}";')
+    lines.append("")
+
+    # Forwarders
+    forwarders = settings.get("forwarders", [])
+    if forwarders:
+        lines.append("\tforwarders {")
+        for ip in forwarders:
+            ip = ip.strip().rstrip(';')
+            if ip:
+                lines.append(f"\t\t{ip};")
+        lines.append("\t};")
+        fwd_mode = settings.get("forward", "first").strip()
+        if fwd_mode in ("only", "first"):
+            lines.append(f"\tforward {fwd_mode};")
+    else:
+        lines.append("\tforwarders { };")
+    lines.append("")
+
+    # Query policy
+    def _acl(name: str, val: str) -> None:
+        val = val.strip().rstrip(';')
+        if not val:
+            val = "none"
+        # normalize semicolons — val may be "any" or "localhost; 10.0.0.0/8"
+        parts = [p.strip().rstrip(';') for p in val.split(';') if p.strip()]
+        inner = "; ".join(parts)
+        lines.append(f"\t{name} {{ {inner}; }};")
+
+    _acl("allow-query", settings.get("allow_query", "any"))
+    _acl("allow-recursion", settings.get("allow_recursion", "localhost"))
+    _acl("allow-transfer", settings.get("allow_transfer", "none"))
+    lines.append("")
+
+    # Network
+    _acl("listen-on", settings.get("listen_on", "any"))
+    _acl("listen-on-v6", settings.get("listen_on_v6", "any"))
+    lines.append("")
+
+    # DNSSEC
+    dnssec = settings.get("dnssec_validation", "auto").strip()
+    lines.append(f"\tdnssec-validation {dnssec};")
+    lines.append("")
+
+    # Behaviour
+    recursion = settings.get("recursion", "yes").strip()
+    lines.append(f"\trecursion {recursion};")
+
+    auth_nx = settings.get("auth_nxdomain", "no").strip()
+    lines.append(f"\tauth-nxdomain {auth_nx};")
+
+    notify = settings.get("notify", "no").strip()
+    lines.append(f"\tnotify {notify};")
+
+    version = settings.get("version", "").strip()
+    if version:
+        lines.append(f'\tversion "{version}";')
+    lines.append("")
+
+    # Performance
+    for key, directive in [
+        ("max_cache_size", "max-cache-size"),
+        ("max_cache_ttl", "max-cache-ttl"),
+        ("max_ncache_ttl", "max-ncache-ttl"),
+    ]:
+        val = settings.get(key, "").strip()
+        if val:
+            lines.append(f"\t{directive} {val};")
+
+    lines.append("};")
+    lines.append("")
+    return "\n".join(lines)
+
+
+class Bind9OptionsBody(BaseModel):
+    settings: dict
+    reload: bool = True
+
+
+@router.get("/bind9/named-options")
+async def get_bind9_options(_: str = Depends(require_super_admin)) -> dict:
+    """Parse /etc/bind/named.conf.options and return structured settings."""
+    path = _BIND9_OPTIONS_FILE
+    if not Path(path).exists():
+        # Try alternate paths
+        for alt in ["/etc/named.conf.options", "/etc/named.conf"]:
+            if Path(alt).exists():
+                path = alt
+                break
+        else:
+            raise HTTPException(404, "named.conf.options not found on this system")
+    try:
+        content = _read_file_sudo(path)
+    except Exception as e:
+        raise HTTPException(500, f"Read failed: {e}")
+    parsed = _parse_named_options(content)
+    return {"path": path, "settings": parsed, "raw": content}
+
+
+@router.post("/bind9/named-options")
+async def save_bind9_options(body: Bind9OptionsBody, _: str = Depends(require_super_admin)) -> dict:
+    """Write structured BIND9 options back to named.conf.options and reload."""
+    path = _BIND9_OPTIONS_FILE
+    if not Path(path).exists():
+        for alt in ["/etc/named.conf.options", "/etc/named.conf"]:
+            if Path(alt).exists():
+                path = alt
+                break
+        else:
+            raise HTTPException(404, "named.conf.options not found on this system")
+
+    new_content = _build_named_options(body.settings)
+
+    # Validate before writing
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False, dir="/tmp") as tf:
+        tf.write(new_content)
+        tmp = tf.name
+    try:
+        _, check_err, check_rc = _run(["sudo", "/usr/bin/named-checkconf", tmp], timeout=10)
+        if check_rc != 0:
+            raise HTTPException(422, f"Config validation failed: {check_err.strip()}")
+    finally:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+
+    try:
+        _write_conf(path, new_content)
+    except Exception as e:
+        raise HTTPException(500, f"Write failed: {e}")
+
+    reloaded = False
+    reload_output = ""
+    if body.reload:
+        stdout, stderr, rc = _run(["sudo", "rndc", "reload"], timeout=15)
+        reload_output = (stdout + stderr).strip()
+        reloaded = rc == 0
+
+    return {
+        "ok": True,
+        "path": path,
+        "reloaded": reloaded,
+        "reload_output": reload_output or "OK",
+    }
+
+
+# ---------------------------------------------------------------------------
+# BIND9 zone status + records editor
+# ---------------------------------------------------------------------------
+
+def _file_exists_sudo(path: str) -> bool:
+    """Check if a file exists, using sudo stat to bypass permission restrictions."""
+    _, _, rc = _run(["sudo", "stat", "--format=%F", path], timeout=5)
+    return rc == 0
+
+
+def _bind9_zone_file(zone_name: str) -> str | None:
+    """Return path to zone file for the given zone, or None if not found."""
+    # First: parse named.conf.local to get the declared file path
+    try:
+        local = _read_file_sudo("/etc/bind/named.conf.local")
+        clean = _strip_comments(local, style="c")
+        for zn, body in _bind9_extract_zone_bodies(clean):
+            if zn.lower() == zone_name.lower():
+                if fm := re.search(r'file\s+"([^"]+)"', body, re.IGNORECASE):
+                    declared = fm.group(1)
+                    # Try declared path directly or with common bases
+                    for candidate in [
+                        declared,
+                        "/var/lib/bind/" + declared.lstrip("/"),
+                        "/etc/bind/" + declared.lstrip("/"),
+                        "/var/cache/bind/" + declared.lstrip("/"),
+                    ]:
+                        if _file_exists_sudo(candidate):
+                            return candidate
+    except Exception:
+        pass
+
+    # Fallback: probe common paths by name pattern
+    for base in ["/var/lib/bind/", "/etc/bind/", "/var/cache/bind/"]:
+        for suffix in [".hosts", ".zone", ".db", ""]:
+            candidate = base + zone_name + suffix
+            if _file_exists_sudo(candidate):
+                return candidate
+
+    return None
+
+
+def _rndc_zone_status(zone_name: str) -> dict:
+    """Call rndc zonestatus and return parsed fields."""
+    out, _, rc = _run(["sudo", "rndc", "zonestatus", zone_name], timeout=10)
+    result: dict = {"raw": out.strip(), "ok": rc == 0}
+    for line in out.splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            result[k.strip().lower().replace(" ", "_")] = v.strip()
+    return result
+
+
+def _dig_soa_serial(zone_name: str, server_ip: str) -> dict:
+    """Query @server_ip for zone SOA serial. Returns {ip, serial, ok}."""
+    out, err, rc = _run(
+        ["dig", f"@{server_ip}", zone_name, "SOA", "+short", "+time=3", "+tries=1"],
+        timeout=8,
+    )
+    serial: int | None = None
+    if rc == 0 and out.strip():
+        parts = out.strip().split()
+        if len(parts) >= 3:
+            try:
+                serial = int(parts[2])
+            except ValueError:
+                pass
+    return {"ip": server_ip, "serial": serial, "ok": serial is not None}
+
+
+def _parse_zone_records(content: str) -> list[dict]:
+    """Parse zone file content into a list of record dicts."""
+    records: list[dict] = []
+    default_ttl: str = ""
+    origin: str = ""
+
+    # Join continuation lines (inside parentheses)
+    joined = re.sub(r'\(([^)]*)\)', lambda m: m.group(0).replace('\n', ' '), content)
+
+    for line in joined.splitlines():
+        line = line.strip()
+        if not line or line.startswith(';'):
+            continue
+        if line.startswith('$TTL'):
+            parts = line.split(None, 1)
+            if len(parts) > 1:
+                default_ttl = parts[1].split(';')[0].strip()
+            continue
+        if line.startswith('$ORIGIN'):
+            parts = line.split(None, 1)
+            if len(parts) > 1:
+                origin = parts[1].split(';')[0].strip()
+            continue
+
+        # Strip inline comments
+        line = re.sub(r'\s;.*$', '', line).strip()
+        if not line:
+            continue
+
+        # Try to parse: name [ttl] [class] type data
+        m = re.match(
+            r'^(\S+)\s+'                          # name
+            r'(?:(\d+)\s+)?'                      # optional TTL
+            r'(?:(IN|CH|HS|ANY)\s+)?'             # optional class
+            r'(SOA|NS|A|AAAA|MX|CNAME|TXT|SRV|PTR|CAA|DNSKEY|RRSIG|NSEC|NSEC3|DS|TLSA)\s+'
+            r'(.+)$',
+            line, re.IGNORECASE,
+        )
+        if not m:
+            continue
+
+        name, ttl, cls, rtype, data = m.groups()
+        data = data.strip()
+        managed = rtype.upper() in ('DNSKEY', 'RRSIG', 'NSEC', 'NSEC3', 'DS')
+        records.append({
+            "name": name,
+            "ttl": ttl or default_ttl,
+            "class": (cls or "IN").upper(),
+            "type": rtype.upper(),
+            "data": data,
+            "managed": managed,
+        })
+
+    return records
+
+
+def _increment_zone_serial(current: str) -> str:
+    """Increment zone serial. Handles YYYYMMDDNN and plain integer formats."""
+    from datetime import date
+    today = date.today().strftime("%Y%m%d")
+    try:
+        n = int(current)
+        if len(current) == 10 and current[:8] == today:
+            nn = n % 100
+            return f"{today}{(nn + 1):02d}"
+        elif len(current) == 10:
+            return f"{today}00"
+        else:
+            return str(n + 1)
+    except ValueError:
+        return current
+
+
+def _build_zone_file(records: list[dict], default_ttl: str, origin: str) -> str:
+    """Reconstruct zone file text from records list."""
+    lines = []
+    if default_ttl:
+        lines.append(f"$TTL {default_ttl}")
+    if origin:
+        lines.append(f"$ORIGIN {origin}")
+    for r in records:
+        ttl_part = f"{r['ttl']}\t" if r.get("ttl") and r["ttl"] != default_ttl else ""
+        cls = r.get("class", "IN")
+        lines.append(f"{r['name']}\t{ttl_part}{cls}\t{r['type']}\t{r['data']}")
+    return "\n".join(lines) + "\n"
+
+
+class ZoneRecordsBody(BaseModel):
+    records: list[dict]
+    default_ttl: str = "3600"
+    origin: str = ""
+    reload: bool = True
+
+
+@router.get("/bind9/zones/{zone_name}/status")
+async def get_bind9_zone_status(zone_name: str, _: str = Depends(require_super_admin)) -> dict:
+    """Return rndc zonestatus + notify IP sync status for a master zone."""
+    status = _rndc_zone_status(zone_name)
+    master_serial = None
+    if s := status.get("serial"):
+        try:
+            master_serial = int(s)
+        except ValueError:
+            pass
+
+    # Find also_notify IPs from named.conf.local
+    notify_ips: list[str] = []
+    try:
+        local = _read_file_sudo("/etc/bind/named.conf.local")
+        clean = _strip_comments(local, style="c")
+        for zn, body in _bind9_extract_zone_bodies(clean):
+            if zn.lower() == zone_name.lower():
+                for an_m in re.finditer(r'also-notify\s*\{([^}]+)\}', body, re.IGNORECASE):
+                    for tok in an_m.group(1).split():
+                        tok = tok.strip().rstrip(';')
+                        if re.match(r'^[\d.:a-fA-F]+$', tok) and tok:
+                            notify_ips.append(tok)
+                break
+    except Exception:
+        pass
+
+    notify_status: list[dict] = []
+    for ip in notify_ips:
+        result = _dig_soa_serial(zone_name, ip)
+        result["in_sync"] = result["serial"] == master_serial if (result["serial"] is not None and master_serial is not None) else None
+        notify_status.append(result)
+
+    return {
+        "zone": zone_name,
+        "rndc": status,
+        "master_serial": master_serial,
+        "notify_status": notify_status,
+    }
+
+
+@router.get("/bind9/zones/{zone_name}/records")
+async def get_bind9_zone_records(zone_name: str, _: str = Depends(require_super_admin)) -> dict:
+    """Return parsed DNS records for a zone."""
+    zone_file = _bind9_zone_file(zone_name)
+    if not zone_file:
+        raise HTTPException(404, f"Zone file for '{zone_name}' not found")
+    try:
+        content = _read_file_sudo(zone_file)
+    except Exception as e:
+        raise HTTPException(500, f"Read failed: {e}")
+
+    records = _parse_zone_records(content)
+    default_ttl = ""
+    origin = ""
+    for line in content.splitlines():
+        if line.startswith('$TTL'):
+            parts = line.split(None, 1)
+            if len(parts) > 1:
+                default_ttl = parts[1].split(';')[0].strip()
+        if line.startswith('$ORIGIN'):
+            parts = line.split(None, 1)
+            if len(parts) > 1:
+                origin = parts[1].split(';')[0].strip()
+
+    rndc = _rndc_zone_status(zone_name)
+
+    return {
+        "zone": zone_name,
+        "file": zone_file,
+        "default_ttl": default_ttl,
+        "origin": origin,
+        "serial": rndc.get("serial"),
+        "records": records,
+        "raw": content,
+    }
+
+
+@router.post("/bind9/zones/{zone_name}/records")
+async def save_bind9_zone_records(
+    zone_name: str, body: ZoneRecordsBody, _: str = Depends(require_super_admin)
+) -> dict:
+    """Save DNS records to zone file, auto-increment serial, reload zone."""
+    zone_file = _bind9_zone_file(zone_name)
+    if not zone_file:
+        raise HTTPException(404, f"Zone file for '{zone_name}' not found")
+
+    # Find SOA record and increment serial
+    records = list(body.records)
+    for r in records:
+        if r.get("type") == "SOA":
+            # SOA data: master. admin. (serial refresh retry expire min)
+            # serial is 3rd token, may be inside parens
+            data = r["data"]
+            parts = data.split()
+            if len(parts) >= 3:
+                old_serial = parts[2].strip("();")
+                new_serial = _increment_zone_serial(old_serial)
+                r["data"] = data.replace(old_serial, new_serial, 1)
+            break
+
+    new_content = _build_zone_file(records, body.default_ttl, body.origin)
+
+    # Validate with named-checkzone
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".zone", delete=False, dir="/tmp") as tf:
+        tf.write(new_content)
+        tmp = tf.name
+    try:
+        out, err, rc = _run(
+            ["sudo", "named-checkzone", zone_name, tmp], timeout=10
+        )
+        if rc != 0:
+            raise HTTPException(422, f"Zone validation failed: {(out + err).strip()}")
+    finally:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+
+    # Write via sudo tee
+    try:
+        import subprocess
+        proc = subprocess.run(
+            ["sudo", "tee", zone_file],
+            input=new_content, capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode != 0:
+            raise HTTPException(500, f"Write failed: {proc.stderr.strip()}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Write failed: {e}")
+
+    reloaded = False
+    reload_output = ""
+    if body.reload:
+        out, err, rc = _run(["sudo", "rndc", "reload", zone_name], timeout=15)
+        reload_output = (out + err).strip()
+        reloaded = rc == 0
+
+    return {
+        "ok": True,
+        "file": zone_file,
+        "reloaded": reloaded,
+        "reload_output": reload_output or "OK",
+    }
 
 
 @router.post("/{key}/config")
