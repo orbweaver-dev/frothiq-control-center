@@ -28,8 +28,11 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import io
+
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
+from PIL import Image
 from pydantic import BaseModel
 
 from frothiq_control_center.auth import TokenPayload, require_super_admin
@@ -47,6 +50,9 @@ _SETTINGS_ROOT = Path(
 )
 _SETTINGS_FILE = _SETTINGS_ROOT / "portal_settings.json"
 _UPLOADS_DIR   = _SETTINGS_ROOT / "uploads"
+# Canonical static brand files — served directly by Apache, no backend dependency.
+# Always these fixed filenames regardless of the original upload extension/format.
+_BRAND_DIR     = _SETTINGS_ROOT / "brand"
 
 _ALLOWED_TYPES = {
     "image/png",
@@ -58,6 +64,71 @@ _ALLOWED_TYPES = {
     "image/vnd.microsoft.icon",
 }
 _MAX_LOGO_BYTES = 2 * 1024 * 1024  # 2 MB
+
+# Canonical brand filenames — Apache serves /brand/<name> directly.
+_BRAND_SLOTS: dict[str, str] = {
+    "logo":      "logo.png",
+    "menu_logo": "menu-logo.png",
+    "favicon":   "favicon.ico",
+}
+
+
+def _normalize_favicon(raw: bytes) -> bytes:
+    """Convert any uploaded image to a multi-size ICO file (industry standard).
+
+    Produces an ICO containing 16×16, 32×32, 48×48, and 256×256 frames so the
+    browser can pick the best resolution for each context (tab, taskbar, bookmark).
+    """
+    try:
+        img = Image.open(io.BytesIO(raw))
+        if img.mode not in ("RGBA", "LA"):
+            img = img.convert("RGBA")
+        sizes = [16, 32, 48, 256]
+        frames = [img.resize((s, s), Image.LANCZOS) for s in sizes]
+        buf = io.BytesIO()
+        frames[0].save(
+            buf,
+            format="ICO",
+            sizes=[(s, s) for s in sizes],
+            append_images=frames[1:],
+        )
+        return buf.getvalue()
+    except Exception:
+        logger.warning("favicon ICO conversion failed — storing raw bytes")
+        return raw
+
+
+def _publish_brand(slot: str, content: bytes) -> None:
+    """Write brand asset content to the canonical static filesystem path."""
+    _BRAND_DIR.mkdir(parents=True, exist_ok=True)
+    dest = _BRAND_DIR / _BRAND_SLOTS[slot]
+    dest.write_bytes(content)
+    dest.chmod(0o644)
+
+
+def _remove_brand(slot: str) -> None:
+    """Remove canonical brand file (leaves Apache serving a 404 for that slot)."""
+    dest = _BRAND_DIR / _BRAND_SLOTS[slot]
+    if dest.exists():
+        dest.unlink()
+
+
+async def _download_url_to_brand(slot: str, url: str) -> None:
+    """Download an external URL and publish it to the canonical brand path."""
+    import urllib.request
+    import ssl
+    try:
+        ctx = ssl.create_default_context()
+        req = urllib.request.Request(url, headers={"User-Agent": "FrothIQ-MC3-BrandSync/1.0"})
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+            content = resp.read(_MAX_LOGO_BYTES + 1)
+        if len(content) > _MAX_LOGO_BYTES:
+            logger.warning("Brand URL %s too large for slot %s — skipped", url, slot)
+            return
+        publish_content = _normalize_favicon(content) if slot == "favicon" else content
+        _publish_brand(slot, publish_content)
+    except Exception as exc:
+        logger.warning("Failed to download brand asset for slot %s from %s: %s", slot, url, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +152,9 @@ class PortalSettings(BaseModel):
     session_timeout_minutes: int         = 60
     login_notice:          str           = ""
     maintenance_mode:      bool          = False
+    # Network access — IP/CIDR allowlist for the control center UI
+    # Empty list = allow all (default). Non-empty = restrict to listed IPs/CIDRs.
+    safe_ips:              list[str]     = []
     # Audit
     updated_at:            Optional[float] = None
     updated_by:            Optional[str]   = None
@@ -96,6 +170,8 @@ class PortalSettingsPatch(BaseModel):
     logo_url_override:       Optional[str]  = None
     menu_logo_url_override:  Optional[str]  = None
     favicon_url_override:    Optional[str]  = None
+    # Replace the entire safe_ips list (null = no change)
+    safe_ips:                Optional[list[str]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -233,8 +309,10 @@ async def update_portal_settings(
             _delete_file(s.logo_filename)
             s.logo_filename    = None
             s.logo_url_override = patch.logo_url_override
+            await _download_url_to_brand("logo", patch.logo_url_override)
         else:
             s.logo_url_override = None   # empty string = clear override
+            _remove_brand("logo")
 
     # URL override for menu logo
     if patch.menu_logo_url_override is not None:
@@ -242,8 +320,10 @@ async def update_portal_settings(
             _delete_file(s.menu_logo_filename)
             s.menu_logo_filename    = None
             s.menu_logo_url_override = patch.menu_logo_url_override
+            await _download_url_to_brand("menu_logo", patch.menu_logo_url_override)
         else:
             s.menu_logo_url_override = None
+            _remove_brand("menu_logo")
 
     # URL override for favicon
     if patch.favicon_url_override is not None:
@@ -251,8 +331,25 @@ async def update_portal_settings(
             _delete_file(s.favicon_filename)
             s.favicon_filename    = None
             s.favicon_url_override = patch.favicon_url_override
+            await _download_url_to_brand("favicon", patch.favicon_url_override)
         else:
             s.favicon_url_override = None
+            _remove_brand("favicon")
+
+    # Safe IP / CIDR allowlist
+    if patch.safe_ips is not None:
+        import ipaddress as _ip
+        validated: list[str] = []
+        for entry in patch.safe_ips:
+            entry = entry.strip()
+            if not entry:
+                continue
+            try:
+                _ip.ip_network(entry, strict=False) if "/" in entry else _ip.ip_address(entry)
+                validated.append(entry)
+            except ValueError:
+                raise HTTPException(status_code=422, detail=f"Invalid IP/CIDR: {entry!r}")
+        s.safe_ips = validated
 
     s.updated_at = time.time()
     s.updated_by = user.sub
@@ -284,6 +381,7 @@ async def upload_logo(
     # (same name means new content already overwrote the old file in _save_upload)
     if old_filename and old_filename != dest.name:
         _delete_file(old_filename)
+    _publish_brand("logo", dest.read_bytes())
     logo_url = _resolve_logo_url(None, dest.name, "/api/v1/cc/settings/portal/logo", s.updated_at)
     logger.info("Portal logo uploaded by %s → %s", user.sub, dest.name)
     return {"ok": True, "logo_url": logo_url, "filename": dest.name}
@@ -328,6 +426,7 @@ async def upload_menu_logo(
     _save(s)
     if old_filename and old_filename != dest.name:
         _delete_file(old_filename)
+    _publish_brand("menu_logo", dest.read_bytes())
     logo_url = _resolve_logo_url(None, dest.name, "/api/v1/cc/settings/portal/menu-logo", s.updated_at)
     logger.info("Menu logo uploaded by %s → %s", user.sub, dest.name)
     return {"ok": True, "logo_url": logo_url, "filename": dest.name}
@@ -372,6 +471,7 @@ async def upload_favicon(
     _save(s)
     if old_filename and old_filename != dest.name:
         _delete_file(old_filename)
+    _publish_brand("favicon", _normalize_favicon(dest.read_bytes()))
     favicon_url = _resolve_logo_url(None, dest.name, "/api/v1/cc/settings/portal/favicon", s.updated_at)
     logger.info("Favicon uploaded by %s → %s", user.sub, dest.name)
     return {"ok": True, "favicon_url": favicon_url, "filename": dest.name}
