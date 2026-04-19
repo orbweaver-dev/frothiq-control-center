@@ -1528,4 +1528,313 @@ async def get_hardware(_: str = Depends(require_super_admin)) -> dict:
         "checked_at": datetime.now(UTC).isoformat(),
     }
 
-    raise HTTPException(status_code=503, detail="Speed test returned unrecognised data format.")
+
+# ---------------------------------------------------------------------------
+# Audit logger
+# ---------------------------------------------------------------------------
+
+import logging as _logging
+
+_audit_log = _logging.getLogger("mc3.audit")
+if not _audit_log.handlers:
+    _h = _logging.FileHandler("/var/log/mc3-audit.log")
+    _h.setFormatter(_logging.Formatter("%(asctime)s  %(message)s"))
+    _audit_log.addHandler(_h)
+    _audit_log.setLevel(_logging.INFO)
+
+
+def _audit(user: str, action: str, detail: str, result: str) -> None:
+    _audit_log.info("user=%s action=%s detail=%r result=%s", user, action, detail, result)
+
+
+# ---------------------------------------------------------------------------
+# Allowed network interfaces (validated against psutil at call time)
+# ---------------------------------------------------------------------------
+
+def _validate_iface(name: str) -> None:
+    allowed = set(psutil.net_if_addrs().keys())
+    if name not in allowed:
+        raise HTTPException(status_code=400, detail=f"Unknown interface: {name!r}")
+
+
+def _validate_ip(addr: str) -> None:
+    import ipaddress
+    try:
+        ipaddress.ip_address(addr)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid IP address: {addr!r}")
+
+
+def _validate_prefix(prefix: int) -> None:
+    if not (0 <= prefix <= 128):
+        raise HTTPException(status_code=400, detail=f"Invalid prefix length: {prefix}")
+
+
+# ---------------------------------------------------------------------------
+# Network: Interface link up/down
+# ---------------------------------------------------------------------------
+
+class IfaceLinkRequest(BaseModel):
+    action: str  # "up" | "down"
+
+
+@router.post("/network/interface/{name}/link")
+async def iface_link(name: str, body: IfaceLinkRequest, user: str = Depends(require_super_admin)) -> dict:
+    if body.action not in ("up", "down"):
+        raise HTTPException(status_code=400, detail="action must be 'up' or 'down'")
+    _validate_iface(name)
+    out, err, rc = _run(["ip", "link", "set", name, body.action])
+    result = "ok" if rc == 0 else "error"
+    _audit(user, f"iface_link_{body.action}", name, result)
+    if rc != 0:
+        raise HTTPException(status_code=500, detail=err.strip() or f"ip link set {name} {body.action} failed")
+    # Verify new state
+    stats = psutil.net_if_stats().get(name)
+    return {
+        "ok": True,
+        "interface": name,
+        "action": body.action,
+        "is_up": stats.isup if stats else None,
+        "executed_at": datetime.now(UTC).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Network: IP configuration (static or DHCP)
+# ---------------------------------------------------------------------------
+
+class IfaceIPRequest(BaseModel):
+    mode: str           # "static" | "dhcp"
+    address: str = ""   # required for static
+    prefix: int = 24    # CIDR prefix length
+    gateway: str = ""   # optional for static
+
+
+@router.post("/network/interface/{name}/ip")
+async def iface_ip(name: str, body: IfaceIPRequest, user: str = Depends(require_super_admin)) -> dict:
+    if body.mode not in ("static", "dhcp"):
+        raise HTTPException(status_code=400, detail="mode must be 'static' or 'dhcp'")
+    _validate_iface(name)
+
+    if body.mode == "static":
+        if not body.address:
+            raise HTTPException(status_code=400, detail="address is required for static mode")
+        _validate_ip(body.address)
+        _validate_prefix(body.prefix)
+        if body.gateway:
+            _validate_ip(body.gateway)
+
+        # Flush existing IPv4 addresses, assign new one
+        _run(["ip", "addr", "flush", "dev", name])
+        out, err, rc = _run(["ip", "addr", "add", f"{body.address}/{body.prefix}", "dev", name])
+        if rc != 0:
+            _audit(user, "iface_ip_static", f"{name} {body.address}/{body.prefix}", "error")
+            raise HTTPException(status_code=500, detail=err.strip() or "ip addr add failed")
+
+        if body.gateway:
+            _run(["ip", "route", "replace", "default", "via", body.gateway, "dev", name])
+
+        detail = f"{name} {body.address}/{body.prefix} gw={body.gateway or 'unchanged'}"
+        _audit(user, "iface_ip_static", detail, "ok")
+        return {"ok": True, "interface": name, "mode": "static", "address": body.address,
+                "prefix": body.prefix, "gateway": body.gateway or None,
+                "executed_at": datetime.now(UTC).isoformat()}
+
+    else:  # dhcp
+        # Release existing static config and request DHCP lease via dhclient
+        _run(["ip", "addr", "flush", "dev", name])
+        out, err, rc = _run(["dhclient", "-v", name], timeout=20)
+        if rc != 0:
+            # Try dhcpcd as fallback
+            out2, err2, rc2 = _run(["dhcpcd", name], timeout=20)
+            if rc2 != 0:
+                _audit(user, "iface_ip_dhcp", name, "error")
+                raise HTTPException(status_code=500, detail="dhclient and dhcpcd both failed — no DHCP client available")
+        _audit(user, "iface_ip_dhcp", name, "ok")
+        return {"ok": True, "interface": name, "mode": "dhcp",
+                "executed_at": datetime.now(UTC).isoformat()}
+
+
+# ---------------------------------------------------------------------------
+# Network: DNS configuration
+# ---------------------------------------------------------------------------
+
+class DNSRequest(BaseModel):
+    servers: list[str]  # list of IP address strings
+
+
+@router.put("/network/dns")
+async def update_dns(body: DNSRequest, user: str = Depends(require_super_admin)) -> dict:
+    if not body.servers:
+        raise HTTPException(status_code=400, detail="At least one DNS server required")
+    if len(body.servers) > 4:
+        raise HTTPException(status_code=400, detail="Maximum 4 DNS servers allowed")
+    for s in body.servers:
+        _validate_ip(s)
+
+    resolv = Path("/etc/resolv.conf")
+
+    # Backup original
+    backup_path = Path(f"/etc/resolv.conf.mc3bak.{int(time.time())}")
+    try:
+        if resolv.exists():
+            import shutil as _shutil
+            _shutil.copy2(str(resolv), str(backup_path))
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Could not create backup: {e}")
+
+    # Preserve existing search/domain lines, replace nameserver lines
+    existing_lines: list[str] = []
+    try:
+        with open(resolv) as f:
+            existing_lines = f.readlines()
+    except OSError:
+        pass
+
+    non_ns_lines = [l for l in existing_lines if not l.startswith("nameserver")]
+    new_lines = non_ns_lines + [f"nameserver {s}\n" for s in body.servers]
+
+    try:
+        with open(resolv, "w") as f:
+            f.writelines(new_lines)
+    except OSError as e:
+        _audit(user, "update_dns", str(body.servers), "error")
+        raise HTTPException(status_code=500, detail=f"Could not write /etc/resolv.conf: {e}")
+
+    _audit(user, "update_dns", f"servers={body.servers}", "ok")
+    return {
+        "ok": True,
+        "servers": body.servers,
+        "backup": str(backup_path),
+        "executed_at": datetime.now(UTC).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Network: Restart networking
+# ---------------------------------------------------------------------------
+
+@router.post("/network/restart")
+async def restart_networking(user: str = Depends(require_super_admin)) -> dict:
+    # Try systemd-networkd first, then networking, then NetworkManager
+    for service in ("systemd-networkd", "networking", "NetworkManager"):
+        _, _, rc = _run(["systemctl", "is-active", service])
+        if rc == 0:
+            out, err, rc2 = _run(["systemctl", "restart", service], timeout=30)
+            result = "ok" if rc2 == 0 else "error"
+            _audit(user, "restart_networking", service, result)
+            if rc2 != 0:
+                raise HTTPException(status_code=500, detail=err.strip() or f"systemctl restart {service} failed")
+            return {"ok": True, "service": service, "executed_at": datetime.now(UTC).isoformat()}
+
+    _audit(user, "restart_networking", "none_found", "error")
+    raise HTTPException(status_code=404, detail="No active network service found (systemd-networkd / networking / NetworkManager)")
+
+
+# ---------------------------------------------------------------------------
+# Disk: Mount / Unmount
+# ---------------------------------------------------------------------------
+
+# Allowed filesystem types for mounting
+_ALLOWED_FSTYPES = {
+    "ext2", "ext3", "ext4", "xfs", "btrfs", "vfat", "exfat",
+    "ntfs", "tmpfs", "iso9660", "udf",
+}
+
+# Block device path must start with /dev/
+_DEV_RE = re.compile(r"^/dev/[a-zA-Z0-9/_-]+$")
+# Mountpoint must be an absolute path
+_MP_RE  = re.compile(r"^/[a-zA-Z0-9_/.-]*$")
+
+
+class MountRequest(BaseModel):
+    device: str
+    mountpoint: str
+    fstype: str = "ext4"
+    options: str = "defaults"
+
+
+@router.post("/disk/mount")
+async def disk_mount(body: MountRequest, user: str = Depends(require_super_admin)) -> dict:
+    if not _DEV_RE.match(body.device):
+        raise HTTPException(status_code=400, detail="Invalid device path")
+    if not _MP_RE.match(body.mountpoint):
+        raise HTTPException(status_code=400, detail="Invalid mountpoint path")
+    if body.fstype not in _ALLOWED_FSTYPES:
+        raise HTTPException(status_code=400, detail=f"Filesystem type not allowed: {body.fstype!r}")
+    # options: allow only safe alphanumeric/comma/= chars
+    if not re.match(r"^[a-zA-Z0-9,=_-]+$", body.options):
+        raise HTTPException(status_code=400, detail="Invalid mount options")
+
+    # Ensure mountpoint exists
+    Path(body.mountpoint).mkdir(parents=True, exist_ok=True)
+
+    cmd = ["mount", "-t", body.fstype, "-o", body.options, body.device, body.mountpoint]
+    out, err, rc = _run(cmd, timeout=15)
+    result = "ok" if rc == 0 else "error"
+    _audit(user, "disk_mount", f"{body.device} → {body.mountpoint} ({body.fstype})", result)
+    if rc != 0:
+        raise HTTPException(status_code=500, detail=err.strip() or "mount failed")
+    return {"ok": True, "device": body.device, "mountpoint": body.mountpoint,
+            "fstype": body.fstype, "executed_at": datetime.now(UTC).isoformat()}
+
+
+class UnmountRequest(BaseModel):
+    mountpoint: str
+    lazy: bool = False   # -l flag — unmount when no longer busy
+
+
+@router.post("/disk/unmount")
+async def disk_unmount(body: UnmountRequest, user: str = Depends(require_super_admin)) -> dict:
+    if not _MP_RE.match(body.mountpoint):
+        raise HTTPException(status_code=400, detail="Invalid mountpoint path")
+
+    # Refuse to unmount critical system paths
+    protected = {"/", "/boot", "/boot/efi", "/proc", "/sys", "/dev", "/run", "/tmp"}
+    if body.mountpoint.rstrip("/") in protected:
+        raise HTTPException(status_code=403, detail=f"Cannot unmount protected path: {body.mountpoint}")
+
+    cmd = ["umount"]
+    if body.lazy:
+        cmd.append("-l")
+    cmd.append(body.mountpoint)
+    out, err, rc = _run(cmd, timeout=15)
+    result = "ok" if rc == 0 else "error"
+    _audit(user, "disk_unmount", body.mountpoint, result)
+    if rc != 0:
+        raise HTTPException(status_code=500, detail=err.strip() or "umount failed")
+    return {"ok": True, "mountpoint": body.mountpoint, "executed_at": datetime.now(UTC).isoformat()}
+
+
+# ---------------------------------------------------------------------------
+# System: Reboot / Shutdown
+# ---------------------------------------------------------------------------
+
+class SystemPowerRequest(BaseModel):
+    confirm: bool = False  # must be True to execute
+
+
+@router.post("/system/reboot")
+async def system_reboot(body: SystemPowerRequest, user: str = Depends(require_super_admin)) -> dict:
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="confirm must be true")
+    _audit(user, "system_reboot", "requested", "executing")
+    out, err, rc = _run(["shutdown", "-r", "+0"], timeout=10)
+    result = "ok" if rc == 0 else "error"
+    _audit(user, "system_reboot", "shutdown -r +0", result)
+    if rc != 0:
+        raise HTTPException(status_code=500, detail=err.strip() or "reboot failed")
+    return {"ok": True, "action": "reboot", "executed_at": datetime.now(UTC).isoformat()}
+
+
+@router.post("/system/shutdown")
+async def system_shutdown(body: SystemPowerRequest, user: str = Depends(require_super_admin)) -> dict:
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="confirm must be true")
+    _audit(user, "system_shutdown", "requested", "executing")
+    out, err, rc = _run(["shutdown", "-h", "+0"], timeout=10)
+    result = "ok" if rc == 0 else "error"
+    _audit(user, "system_shutdown", "shutdown -h +0", result)
+    if rc != 0:
+        raise HTTPException(status_code=500, detail=err.strip() or "shutdown failed")
+    return {"ok": True, "action": "shutdown", "executed_at": datetime.now(UTC).isoformat()}
