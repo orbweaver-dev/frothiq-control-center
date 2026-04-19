@@ -547,6 +547,178 @@ async def service_action(body: ServiceActionRequest, _: str = Depends(require_su
     return {"ok": True, "service": body.service, "action": body.action}
 
 
+# Classification labels
+_CLS_GHOST       = "ghost_record"
+_CLS_SUPERSEDED  = "superseded"
+_CLS_CRASHED     = "crashed"
+_CLS_MISSING_DEP = "missing_dependency"
+_CLS_UNKNOWN     = "unknown"
+
+
+def _classify_failed_unit(unit: str, load_state: str) -> dict:
+    """Inspect a failed systemd unit and return classification + recommended fix."""
+
+    # ── Ghost record: unit file no longer exists ───────────────────────────
+    if load_state == "not-found":
+        return {
+            "classification": _CLS_GHOST,
+            "reason": "Unit file has been deleted but systemd still holds a failure record for it.",
+            "recommended_action": "reset-failed",
+            "recommended_label": "Clear record",
+            "safe_to_autofix": True,
+        }
+
+    # ── Load the unit file for pattern inspection ──────────────────────────
+    unit_path_out, _, _ = _run(["systemctl", "show", unit, "--property=FragmentPath"], timeout=5)
+    unit_path = ""
+    for line in unit_path_out.splitlines():
+        if line.startswith("FragmentPath="):
+            unit_path = line.split("=", 1)[1].strip()
+
+    unit_content = ""
+    if unit_path:
+        try:
+            unit_content = open(unit_path).read()
+        except OSError:
+            pass
+
+    # ── fcgiwrap superseded by PHP-FPM ─────────────────────────────────────
+    if unit.startswith("fcgiwrap-"):
+        # Extract the socket ID from ExecStart to find matching PHP-FPM pool
+        import re as _re
+        sock_match = _re.search(r"/var/fcgiwrap/(\d+)\.sock", unit_content)
+        fpm_running = False
+        if sock_match:
+            pool_id = sock_match.group(1)
+            fpm_out, _, _ = _run(
+                ["systemctl", "is-active", f"php8.3-fpm@{pool_id}.service"],
+                timeout=5,
+            )
+            # Also check generic pool activity via ps
+            ps_out, _, _ = _run(["pgrep", "-f", f"pool {pool_id}"], timeout=5)
+            fpm_running = fpm_out.strip() == "active" or bool(ps_out.strip())
+
+        if fpm_running:
+            return {
+                "classification": _CLS_SUPERSEDED,
+                "reason": "fcgiwrap was replaced by PHP-FPM for this virtual host. "
+                          "The PHP-FPM pool is active and serving PHP requests normally.",
+                "recommended_action": "disable-and-reset",
+                "recommended_label": "Disable & clear",
+                "safe_to_autofix": True,
+            }
+        # fcgiwrap for a non-PHP site (no fpm pool found)
+        return {
+            "classification": _CLS_SUPERSEDED,
+            "reason": "fcgiwrap is not needed — this virtual host does not serve PHP. "
+                      "No PHP-FPM pool was found either.",
+            "recommended_action": "disable-and-reset",
+            "recommended_label": "Disable & clear",
+            "safe_to_autofix": True,
+        }
+
+    # ── Check journal for dependency / exec errors ─────────────────────────
+    journal_out, _, _ = _run(
+        ["journalctl", "-u", unit, "-n", "20", "--no-pager", "--output=short"],
+        timeout=8,
+    )
+
+    if "Dependency failed" in journal_out or "dependency" in journal_out.lower():
+        dep_hint = ""
+        for line in journal_out.splitlines():
+            if "Dependency" in line or "Required" in line:
+                dep_hint = line.strip()
+                break
+        return {
+            "classification": _CLS_MISSING_DEP,
+            "reason": f"Service failed due to an unmet dependency. Last log: {dep_hint or 'see journal'}",
+            "recommended_action": "investigate",
+            "recommended_label": "View logs",
+            "safe_to_autofix": False,
+        }
+
+    # ── Legitimate crashed service ─────────────────────────────────────────
+    last_error = ""
+    for line in reversed(journal_out.splitlines()):
+        if "error" in line.lower() or "failed" in line.lower() or "killed" in line.lower():
+            last_error = line.strip()
+            break
+
+    return {
+        "classification": _CLS_CRASHED,
+        "reason": f"Service exited unexpectedly. {('Last error: ' + last_error) if last_error else 'Check journal for details.'}",
+        "recommended_action": "restart",
+        "recommended_label": "Restart",
+        "safe_to_autofix": False,
+    }
+
+
+@router.get("/bootup/failed-analysis")
+async def failed_service_analysis(_: str = Depends(require_super_admin)) -> dict:
+    """Classify all failed systemd units and return per-service fix recommendations."""
+    import json
+    out, _, _ = _run([
+        "systemctl", "list-units", "--state=failed",
+        "--all", "--no-pager", "--no-legend", "--output=json",
+    ], timeout=10)
+
+    results = []
+    if out:
+        try:
+            units = json.loads(out)
+        except Exception:
+            units = []
+        for u in units:
+            name = u.get("unit", "")
+            load = u.get("load", "")
+            if not name:
+                continue
+            classification = _classify_failed_unit(name, load)
+            results.append({
+                "unit": name,
+                "load": load,
+                "active": u.get("active", ""),
+                "sub": u.get("sub", ""),
+                "description": u.get("description", ""),
+                **classification,
+            })
+
+    return {
+        "failed": results,
+        "count": len(results),
+        "analyzed_at": datetime.now(UTC).isoformat(),
+    }
+
+
+class FailedFixRequest(BaseModel):
+    service: str
+    action: str  # "reset-failed" | "disable-and-reset"
+
+
+@router.post("/bootup/failed-analysis/fix")
+async def fix_failed_service(body: FailedFixRequest, _: str = Depends(require_super_admin)) -> dict:
+    """Apply the recommended fix for a classified failed service."""
+    if not SERVICE_NAME_RE.match(body.service):
+        raise HTTPException(400, "Invalid service name")
+    if body.action not in {"reset-failed", "disable-and-reset"}:
+        raise HTTPException(400, "action must be reset-failed or disable-and-reset")
+
+    if body.action == "disable-and-reset":
+        _, err, rc = _run(["sudo", "systemctl", "disable", body.service], timeout=15)
+        if rc != 0:
+            # disable may fail if unit is not-found — proceed to reset anyway
+            pass
+        _, err2, rc2 = _run(["sudo", "systemctl", "reset-failed", body.service], timeout=10)
+        if rc2 != 0:
+            raise HTTPException(500, err2.strip() or "reset-failed failed")
+    else:
+        _, err, rc = _run(["sudo", "systemctl", "reset-failed", body.service], timeout=10)
+        if rc != 0:
+            raise HTTPException(500, err.strip() or "reset-failed failed")
+
+    return {"ok": True, "service": body.service, "action": body.action}
+
+
 # ---------------------------------------------------------------------------
 # Cron Jobs
 # ---------------------------------------------------------------------------
@@ -1300,25 +1472,80 @@ async def get_network_config(_: str = Depends(require_super_admin)) -> dict:
         None,
     )
 
-    # Firewall state (ufw or nftables)
-    firewall: dict[str, str | list] = {"tool": "unknown", "state": "unknown", "rules": []}
-    ufw_out, _, ufw_rc = _run(["ufw", "status", "verbose"])
-    if ufw_rc == 0:
-        lines = ufw_out.splitlines()
-        state_line = next((l for l in lines if l.lower().startswith("status:")), "")
+    # Firewall state — CSF/LFD preferred, then ufw, then nftables
+    firewall: dict = {"tool": "unknown", "state": "unknown", "rules": []}
+
+    import shutil as _shutil
+    csf_bin = _shutil.which("csf") or "/usr/sbin/csf"
+    if _os.path.isfile(csf_bin):
+        # --- CSF detected ---
+        # Version
+        csf_ver_out, _, _ = _run([csf_bin, "-v"])
+        csf_version = csf_ver_out.splitlines()[0].strip() if csf_ver_out else "unknown"
+
+        # TESTING mode and allowed ports from csf.conf
+        csf_conf = "/etc/csf/csf.conf"
+        testing_mode = False
+        tcp_in = tcp_out = udp_in = udp_out = ""
+        try:
+            with open(csf_conf) as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if _line.startswith("TESTING") and "=" in _line:
+                        testing_mode = _line.split("=", 1)[1].strip().strip('"') == "1"
+                    elif _line.startswith("TCP_IN") and "=" in _line:
+                        tcp_in = _line.split("=", 1)[1].strip().strip('"')
+                    elif _line.startswith("TCP_OUT") and "=" in _line:
+                        tcp_out = _line.split("=", 1)[1].strip().strip('"')
+                    elif _line.startswith("UDP_IN") and "=" in _line:
+                        udp_in = _line.split("=", 1)[1].strip().strip('"')
+                    elif _line.startswith("UDP_OUT") and "=" in _line:
+                        udp_out = _line.split("=", 1)[1].strip().strip('"')
+        except OSError:
+            pass
+
+        # LFD daemon state
+        lfd_out, _, lfd_rc = _run(["systemctl", "is-active", "lfd"])
+        lfd_state = lfd_out.strip() if lfd_rc == 0 else "inactive"
+
+        # CSF active = iptables has CSF chains (CC_DENY or DENYIN)
+        ipt_out, _, ipt_rc = _run(["iptables", "-L", "INPUT", "-n", "--line-numbers"])
+        csf_chains_present = ipt_rc == 0 and ("CC_DENY" in ipt_out or "DENYIN" in ipt_out or "LOCALINPUT" in ipt_out)
+        csf_state = "testing" if testing_mode else ("active" if csf_chains_present else "inactive")
+
+        # Recent iptables INPUT summary (first 20 meaningful lines)
+        rules_lines = [l for l in (ipt_out or "").splitlines() if l.strip() and not l.startswith("Chain") and not l.startswith("num")][:20]
+
         firewall = {
-            "tool": "ufw",
-            "state": state_line.replace("Status:", "").strip() if state_line else "unknown",
-            "rules": [l for l in lines if l and not l.startswith("Status") and not l.startswith("Logging") and not l.startswith("Default") and not l.startswith("New profiles") and l.strip()],
+            "tool": "csf",
+            "version": csf_version,
+            "state": csf_state,
+            "testing_mode": testing_mode,
+            "lfd_state": lfd_state,
+            "tcp_in": tcp_in,
+            "tcp_out": tcp_out,
+            "udp_in": udp_in,
+            "udp_out": udp_out,
+            "rules": rules_lines,
         }
     else:
-        nft_out, _, nft_rc = _run(["nft", "list", "ruleset"])
-        if nft_rc == 0:
+        ufw_out, _, ufw_rc = _run(["ufw", "status", "verbose"])
+        if ufw_rc == 0:
+            lines = ufw_out.splitlines()
+            state_line = next((l for l in lines if l.lower().startswith("status:")), "")
             firewall = {
-                "tool": "nftables",
-                "state": "active",
-                "rules": nft_out.splitlines()[:40],
+                "tool": "ufw",
+                "state": state_line.replace("Status:", "").strip() if state_line else "unknown",
+                "rules": [l for l in lines if l and not l.startswith("Status") and not l.startswith("Logging") and not l.startswith("Default") and not l.startswith("New profiles") and l.strip()],
             }
+        else:
+            nft_out, _, nft_rc = _run(["nft", "list", "ruleset"])
+            if nft_rc == 0:
+                firewall = {
+                    "tool": "nftables",
+                    "state": "active",
+                    "rules": nft_out.splitlines()[:40],
+                }
 
     # Open listening ports via ss
     ports: list[dict] = []
