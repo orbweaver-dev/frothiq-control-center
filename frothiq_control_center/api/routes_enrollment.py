@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from frothiq_control_center.auth import verify_password
 from frothiq_control_center.config import get_settings
+from frothiq_control_center.middleware.ip_allowlist import build_allowlist, _ip_in_allowlist, _LOCALHOST_IPS
 from frothiq_control_center.models.enrollment import IPAllowlist, IPEnrollmentPending
 from frothiq_control_center.models.user import CCUser
 from frothiq_control_center.services.audit_service import log_action
@@ -160,6 +161,23 @@ def _approval_html(success: bool, ip: str = "", message: str = "") -> str:
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+@router.get("/ip-status")
+async def ip_status(request: Request):
+    """
+    Public endpoint — returns whether the requesting IP is on the allowlist.
+    Called by the Next.js middleware on every page load to decide /login vs /enroll.
+    """
+    client_ip = _client_ip(request)
+    if client_ip in _LOCALHOST_IPS:
+        return {"allowed": True, "ip": client_ip}
+
+    redis = _get_redis(request)
+    db = _get_db(request)
+    allowlist = await build_allowlist(redis, db)
+    allowed = bool(allowlist) and _ip_in_allowlist(client_ip, allowlist)
+    return {"allowed": allowed, "ip": client_ip}
+
 
 @router.post("/enroll/start")
 async def enroll_start(payload: EnrollStartRequest, request: Request):

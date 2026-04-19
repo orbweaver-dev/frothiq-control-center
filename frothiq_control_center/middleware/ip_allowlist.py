@@ -48,6 +48,7 @@ _LOCALHOST_IPS = frozenset({"127.0.0.1", "::1"})
 _PUBLIC_PREFIXES = (
     "/api/v1/cc/auth/enroll",       # enrollment flow (new IPs)
     "/api/v1/cc/auth/approve-ip",   # admin approval link
+    "/api/v1/cc/auth/ip-status",    # Next.js middleware IP check
     "/api/v1/cc/settings/portal",   # portal branding
     "/health",
 )
@@ -84,6 +85,33 @@ def _ip_in_allowlist(client_ip: str, allowlist: list[str]) -> bool:
     return False
 
 
+async def build_allowlist(redis, db) -> list[str]:
+    """Build the merged IP allowlist from all sources with Redis caching."""
+    cached = None
+    if redis:
+        try:
+            cached = await redis.get(_IP_CACHE_KEY)
+        except Exception:
+            pass
+
+    if cached:
+        return json.loads(cached if isinstance(cached, str) else cached.decode())
+
+    settings = get_settings()
+    env_ips = settings.admin_ip_allowlist_parsed
+    portal_ips = _load_portal_safe_ips()
+    db_ips = await _load_db_ips(db) if db else []
+    allowlist = list({*env_ips, *portal_ips, *db_ips})
+
+    if redis:
+        try:
+            await redis.setex(_IP_CACHE_KEY, _IP_CACHE_TTL, json.dumps(allowlist))
+        except Exception:
+            pass
+
+    return allowlist
+
+
 async def _load_db_ips(db) -> list[str]:
     """Query the cc_ip_allowlist table. Returns empty list on error."""
     try:
@@ -112,30 +140,9 @@ class IPAllowlistMiddleware(BaseHTTPMiddleware):
         if client_ip in _LOCALHOST_IPS:
             return await call_next(request)
 
-        # Build merged allowlist — try Redis cache first
         redis = getattr(request.state, "redis", None)
-        cached = None
-        if redis:
-            try:
-                cached = await redis.get(_IP_CACHE_KEY)
-            except Exception:
-                pass
-
-        if cached:
-            allowlist: list[str] = json.loads(cached if isinstance(cached, str) else cached.decode())
-        else:
-            settings = get_settings()
-            env_ips = settings.admin_ip_allowlist_parsed
-            portal_ips = _load_portal_safe_ips()
-            db = getattr(request.state, "db", None)
-            db_ips = await _load_db_ips(db) if db else []
-            allowlist = list({*env_ips, *portal_ips, *db_ips})
-
-            if redis:
-                try:
-                    await redis.setex(_IP_CACHE_KEY, _IP_CACHE_TTL, json.dumps(allowlist))
-                except Exception:
-                    pass
+        db = getattr(request.state, "db", None)
+        allowlist = await build_allowlist(redis, db)
 
         # Default deny — empty list = block all
         if not allowlist or not _ip_in_allowlist(client_ip, allowlist):
