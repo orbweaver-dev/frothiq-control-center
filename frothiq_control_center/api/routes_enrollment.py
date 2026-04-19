@@ -84,12 +84,34 @@ def _get_redis(request: Request):
     return request.state.redis
 
 
+def _get_smtp_cfg():
+    """Return SMTP config from the settings file, falling back to env vars."""
+    from pathlib import Path as _Path
+    import os as _os
+    _smtp_file = _Path(_os.environ.get("CC_PORTAL_SETTINGS_DIR", "/var/lib/frothiq/control-center")) / "smtp_settings.json"
+    if _smtp_file.exists():
+        try:
+            import json as _json
+            data = _json.loads(_smtp_file.read_text())
+            return data
+        except Exception:
+            pass
+    s = get_settings()
+    return {"smtp_host": s.smtp_host, "smtp_port": s.smtp_port, "smtp_from": s.smtp_from, "admin_email": s.admin_email}
+
+
 async def _send_approval_email(ip: str, user_email: str, raw_token: str) -> None:
     """Send admin approval email in a thread pool to avoid blocking the event loop."""
-    settings = get_settings()
-    if not settings.admin_email:
-        logger.warning("CC_ADMIN_EMAIL not set — skipping approval email")
+    smtp_cfg = _get_smtp_cfg()
+    if not smtp_cfg.get("admin_email"):
+        logger.warning("admin_email not configured — skipping approval email")
         return
+    settings = get_settings()
+
+    admin_email = smtp_cfg["admin_email"]
+    smtp_host = smtp_cfg.get("smtp_host", settings.smtp_host)
+    smtp_port = smtp_cfg.get("smtp_port", settings.smtp_port)
+    smtp_from = smtp_cfg.get("smtp_from", settings.smtp_from)
 
     approval_url = f"https://mc3.orbweaver.dev/api/v1/cc/auth/approve-ip/{raw_token}"
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -126,15 +148,15 @@ async def _send_approval_email(ip: str, user_email: str, raw_token: str) -> None
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"[MC³] IP Access Request — {ip}"
-    msg["From"] = settings.smtp_from
-    msg["To"] = settings.admin_email
+    msg["From"] = smtp_from
+    msg["To"] = admin_email
     msg.attach(MIMEText(html, "html"))
 
     def _send():
         try:
-            with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=10) as s:
-                s.sendmail(settings.smtp_from, [settings.admin_email], msg.as_string())
-            logger.info("Approval email sent to %s for IP %s", settings.admin_email, ip)
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as srv:
+                srv.sendmail(smtp_from, [admin_email], msg.as_string())
+            logger.info("Approval email sent to %s for IP %s", admin_email, ip)
         except Exception as exc:
             logger.error("Failed to send approval email: %s", exc)
 
@@ -196,7 +218,7 @@ async def enroll_start(payload: EnrollStartRequest, request: Request):
     user = result.scalar_one_or_none()
 
     if not user or not verify_password(payload.password, user.hashed_password):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect email or password. Check your credentials and try again.")
 
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is disabled")

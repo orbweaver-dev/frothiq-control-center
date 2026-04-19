@@ -494,3 +494,117 @@ async def delete_favicon(user: TokenPayload = Depends(require_super_admin)):
 async def serve_favicon():
     """Serve the uploaded favicon. Public endpoint."""
     return _serve_file(_load().favicon_filename, "favicon")
+
+
+# ---------------------------------------------------------------------------
+# SMTP settings — stored in smtp_settings.json (super_admin only)
+# ---------------------------------------------------------------------------
+
+_SMTP_FILE = _SETTINGS_ROOT / "smtp_settings.json"
+
+
+class SMTPSettings(BaseModel):
+    smtp_host:    str = "localhost"
+    smtp_port:    int = 25
+    smtp_from:    str = "no-reply@orbweaver.dev"
+    admin_email:  str = ""
+
+
+class SMTPSettingsPatch(BaseModel):
+    smtp_host:   str | None = None
+    smtp_port:   int | None = None
+    smtp_from:   str | None = None
+    admin_email: str | None = None
+
+
+def _load_smtp() -> SMTPSettings:
+    """Load SMTP settings from disk, falling back to env-derived defaults."""
+    if _SMTP_FILE.exists():
+        try:
+            return SMTPSettings(**json.loads(_SMTP_FILE.read_text()))
+        except Exception as exc:
+            logger.warning("Failed to load smtp_settings.json: %s", exc)
+    # Bootstrap defaults from environment / config
+    from frothiq_control_center.config import get_settings as _gs
+    s = _gs()
+    return SMTPSettings(
+        smtp_host=s.smtp_host,
+        smtp_port=s.smtp_port,
+        smtp_from=s.smtp_from,
+        admin_email=s.admin_email,
+    )
+
+
+def _save_smtp(s: SMTPSettings) -> None:
+    _SETTINGS_ROOT.mkdir(parents=True, exist_ok=True)
+    _SMTP_FILE.write_text(s.model_dump_json(indent=2))
+    _SMTP_FILE.chmod(0o600)
+
+
+@router.get("/smtp")
+async def get_smtp_settings(user: TokenPayload = Depends(require_super_admin)):
+    """Return current SMTP settings. Requires super_admin."""
+    return _load_smtp().model_dump()
+
+
+@router.patch("/smtp")
+async def update_smtp_settings(
+    patch: SMTPSettingsPatch,
+    user: TokenPayload = Depends(require_super_admin),
+):
+    """Update SMTP settings. Requires super_admin."""
+    s = _load_smtp()
+    if patch.smtp_host is not None:
+        s.smtp_host = patch.smtp_host.strip()
+    if patch.smtp_port is not None:
+        if not (1 <= patch.smtp_port <= 65535):
+            raise HTTPException(status_code=422, detail="smtp_port must be 1–65535")
+        s.smtp_port = patch.smtp_port
+    if patch.smtp_from is not None:
+        s.smtp_from = patch.smtp_from.strip()
+    if patch.admin_email is not None:
+        s.admin_email = patch.admin_email.strip()
+    _save_smtp(s)
+    logger.info("SMTP settings updated by %s", user.sub)
+    return {"ok": True, "settings": s.model_dump()}
+
+
+@router.post("/smtp/test")
+async def test_smtp(user: TokenPayload = Depends(require_super_admin)):
+    """Send a test email to admin_email using current SMTP settings."""
+    import asyncio
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+
+    s = _load_smtp()
+    if not s.admin_email:
+        raise HTTPException(status_code=422, detail="admin_email is not configured — set it first")
+
+    html = """<!DOCTYPE html>
+<html>
+<body style="font-family:sans-serif;background:#060b14;color:#e2e8f0;max-width:480px;margin:40px auto;padding:24px">
+  <div style="background:#0f1629;border:1px solid #1e2d4a;border-radius:12px;padding:32px;text-align:center">
+    <h2 style="color:#4f8ef7;margin:0 0 12px">FrothIQ MC³ — SMTP Test</h2>
+    <p style="color:#94a3b8;margin:0">Your SMTP configuration is working correctly.</p>
+  </div>
+</body>
+</html>"""
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = "[MC³] SMTP configuration test"
+    msg["From"] = s.smtp_from
+    msg["To"] = s.admin_email
+    msg.attach(MIMEText(html, "html"))
+
+    def _send():
+        with smtplib.SMTP(s.smtp_host, s.smtp_port, timeout=10) as srv:
+            srv.sendmail(s.smtp_from, [s.admin_email], msg.as_string())
+
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, _send)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"SMTP error: {exc}")
+
+    logger.info("SMTP test email sent to %s by %s", s.admin_email, user.sub)
+    return {"ok": True, "sent_to": s.admin_email}
