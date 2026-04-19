@@ -166,6 +166,96 @@ KNOWN_SERVERS: dict[str, dict] = {
 }
 
 # ---------------------------------------------------------------------------
+# Per-IP nftables accounting (IPv4 + IPv6)
+# ---------------------------------------------------------------------------
+
+_ipacct_ips: set[str]  = set()
+_ipacct6_ips: set[str] = set()
+_ipacct_lock  = threading.Lock()
+_ipacct6_lock = threading.Lock()
+
+def _nft(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["sudo", "nft"] + list(args), capture_output=True, text=True)
+
+def _parse_nft_counters(table: str, family: str, proto_fields: tuple[str, ...]) -> dict[str, dict[str, int]]:
+    """Generic parser for nftables counter rules. Works for both ip and ip6 families."""
+    import json as _json
+    result = _nft("-j", "list", "table", family, table)
+    if result.returncode != 0:
+        return {}
+    try:
+        data = _json.loads(result.stdout)
+    except Exception:
+        return {}
+    totals: dict[str, dict[str, int]] = {}
+    for item in data.get("nftables", []):
+        rule = item.get("rule")
+        if not rule:
+            continue
+        chain  = rule.get("chain")
+        exprs  = rule.get("expr", [])
+        ip_val: str | None = None
+        bytes_v: int = 0
+        for expr in exprs:
+            match   = expr.get("match", {})
+            payload = match.get("left", {}).get("payload", {})
+            if payload.get("protocol") in proto_fields and payload.get("field") in ("daddr", "saddr"):
+                ip_val = match.get("right")
+            counter = expr.get("counter", {})
+            if "bytes" in counter:
+                bytes_v = counter["bytes"]
+        if ip_val:
+            if ip_val not in totals:
+                totals[ip_val] = {"bytes_in": 0, "bytes_out": 0}
+            if chain == "in":
+                totals[ip_val]["bytes_in"] = bytes_v
+            elif chain == "out":
+                totals[ip_val]["bytes_out"] = bytes_v
+    return totals
+
+# --- IPv4 ---
+
+def _setup_ipacct(ips: set[str]) -> None:
+    _nft("delete", "table", "ip", "cc_ipacct")
+    _nft("add", "table", "ip", "cc_ipacct")
+    _nft("add", "chain", "ip", "cc_ipacct", "in",
+         "{ type filter hook input priority -10 ; policy accept ; }")
+    _nft("add", "chain", "ip", "cc_ipacct", "out",
+         "{ type filter hook output priority -10 ; policy accept ; }")
+    for ip in sorted(ips):
+        _nft("add", "rule", "ip", "cc_ipacct", "in",  "ip", "daddr", ip, "counter")
+        _nft("add", "rule", "ip", "cc_ipacct", "out", "ip", "saddr", ip, "counter")
+
+def _get_ipacct(current_ips: set[str]) -> dict[str, dict[str, int]]:
+    global _ipacct_ips
+    with _ipacct_lock:
+        if current_ips != _ipacct_ips:
+            _setup_ipacct(current_ips)
+            _ipacct_ips = current_ips.copy()
+    return _parse_nft_counters("cc_ipacct", "ip", ("ip",))
+
+# --- IPv6 ---
+
+def _setup_ipacct6(ips: set[str]) -> None:
+    _nft("delete", "table", "ip6", "cc_ipacct6")
+    _nft("add", "table", "ip6", "cc_ipacct6")
+    _nft("add", "chain", "ip6", "cc_ipacct6", "in",
+         "{ type filter hook input priority -10 ; policy accept ; }")
+    _nft("add", "chain", "ip6", "cc_ipacct6", "out",
+         "{ type filter hook output priority -10 ; policy accept ; }")
+    for ip in sorted(ips):
+        _nft("add", "rule", "ip6", "cc_ipacct6", "in",  "ip6", "daddr", ip, "counter")
+        _nft("add", "rule", "ip6", "cc_ipacct6", "out", "ip6", "saddr", ip, "counter")
+
+def _get_ipacct6(current_ips: set[str]) -> dict[str, dict[str, int]]:
+    global _ipacct6_ips
+    with _ipacct6_lock:
+        if current_ips != _ipacct6_ips:
+            _setup_ipacct6(current_ips)
+            _ipacct6_ips = current_ips.copy()
+    return _parse_nft_counters("cc_ipacct6", "ip6", ("ip6",))
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -269,6 +359,22 @@ async def get_sysinfo(_: str = Depends(require_super_admin)) -> dict:
         })
     net = psutil.net_io_counters()
     net_per_nic = psutil.net_io_counters(pernic=True)
+    net_if_addrs = psutil.net_if_addrs()
+    # Collect non-loopback IPv4 + global-scope IPv6 addresses for per-IP accounting
+    _all_ips: set[str]  = set()
+    _all_ip6s: set[str] = set()
+    for iface, addrs in net_if_addrs.items():
+        if iface == "lo":
+            continue
+        for a in addrs:
+            if a.family == 2:    # AF_INET — IPv4
+                _all_ips.add(a.address)
+            elif a.family == 10: # AF_INET6 — IPv6, skip link-local (fe80::)
+                addr = a.address.split("%")[0]  # strip interface suffix e.g. "fe80::1%eth0"
+                if not addr.lower().startswith("fe80"):
+                    _all_ip6s.add(addr)
+    ip_acct  = _get_ipacct(_all_ips)
+    ip6_acct = _get_ipacct6(_all_ip6s)
     uname = platform.uname()
 
     # Read the real OS distribution from /etc/os-release (freedesktop standard).
@@ -321,14 +427,27 @@ async def get_sysinfo(_: str = Depends(require_super_admin)) -> dict:
             "bytes_recv_mb": round(net.bytes_recv / 1e6, 4),
             "packets_sent": net.packets_sent,
             "packets_recv": net.packets_recv,
-            "interfaces": list(psutil.net_if_addrs().keys()),
+            "interfaces": list(net_if_addrs.keys()),
             "per_interface": {
                 iface: {
                     "bytes_sent": counters.bytes_sent,
                     "bytes_recv": counters.bytes_recv,
+                    "ip": next(
+                        (a.address for a in net_if_addrs.get(iface, []) if a.family == 2),  # AF_INET = 2
+                        None,
+                    ),
+                    "all_ips": [
+                        a.address for a in net_if_addrs.get(iface, []) if a.family == 2
+                    ],
+                    "all_ipv6s": [
+                        a.address.split("%")[0] for a in net_if_addrs.get(iface, [])
+                        if a.family == 10 and not a.address.lower().startswith("fe80")
+                    ],
                 }
                 for iface, counters in net_per_nic.items()
             },
+            "per_ip_bytes":  ip_acct,
+            "per_ip6_bytes": ip6_acct,
         },
         "processes": len(psutil.pids()),
         "checked_at": datetime.now(UTC).isoformat(),
@@ -920,52 +1039,493 @@ async def get_server(key: str, _: str = Depends(require_super_admin)) -> dict:
 @router.post("/speedtest")
 async def run_speedtest(_: str = Depends(require_super_admin)) -> dict:
     """Run a network speed test using the first available CLI tool."""
-    import asyncio, json as _json
+    import asyncio, json as _json, shutil
 
-    async def _run(cmd: list[str]) -> dict | None:
+    async def _run(cmd: list[str], timeout: int = 60) -> dict | None:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=90)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             if proc.returncode != 0:
                 return None
-            data = _json.loads(stdout.decode())
-            return data
+            return _json.loads(stdout.decode())
         except Exception:
             return None
 
+    def _is_valid(dl: float, ul: float, ping: float) -> bool:
+        # speedtest-cli returns ping=1800000 and speeds=0 when test servers are unreachable
+        return ping < 10_000 and (dl > 0 or ul > 0)
+
     # --- Ookla official speedtest CLI (bytes/sec bandwidth) ---
-    data = await _run(["speedtest", "--accept-gdpr", "--accept-license", "-f", "json"])
-    if data and "download" in data and isinstance(data["download"], dict):
-        bw_dl = data["download"].get("bandwidth", 0)   # bytes/sec
-        bw_ul = data["upload"].get("bandwidth", 0)
-        ping  = data.get("ping", {}).get("latency", 0)
-        srv   = data.get("server", {})
+    # Only attempt if it's actually the Ookla binary (not Python speedtest-cli)
+    ookla_path = shutil.which("speedtest")
+    if ookla_path:
+        ver_proc = await _run([ookla_path, "--version"], timeout=5)
+        # Ookla binary returns structured JSON for --version; Python speedtest-cli returns None (non-JSON stdout)
+        ookla_available = ver_proc is not None
+    else:
+        ookla_available = False
+
+    if ookla_available:
+        data = await _run([ookla_path, "--accept-gdpr", "--accept-license", "-f", "json"])
+        if data and "download" in data and isinstance(data["download"], dict):
+            bw_dl = data["download"].get("bandwidth", 0)   # bytes/sec
+            bw_ul = data["upload"].get("bandwidth", 0)
+            ping  = data.get("ping", {}).get("latency", 0)
+            dl_mbps = round(bw_dl * 8 / 1_000_000, 2)
+            ul_mbps = round(bw_ul * 8 / 1_000_000, 2)
+            if _is_valid(dl_mbps, ul_mbps, ping):
+                srv = data.get("server", {})
+                return {
+                    "download_mbps": dl_mbps,
+                    "upload_mbps":   ul_mbps,
+                    "ping_ms":       round(ping, 1),
+                    "server":        f"{srv.get('name', '')}, {srv.get('location', '')}".strip(", "),
+                    "isp":           data.get("isp", ""),
+                    "tested_at":     datetime.now(UTC).isoformat(),
+                }
+
+    # --- speedtest-cli Python package (bits/sec) ---
+    # speedtest-cli exits 0 even on HTTP errors (403, network failures), returning
+    # error text to stdout instead of JSON. We must distinguish:
+    #   - tool not found (shutil.which returns None)
+    #   - speedtest.net blocked/rate-limited (HTTP 4xx in stdout)
+    #   - server unresponsive (ping=1800000, speeds=0)
+    #   - success
+
+    _BLOCK_PATTERNS = ("403", "Forbidden", "Cannot retrieve", "Unable to connect", "ERROR")
+
+    async def _run_raw(cmd: list[str], timeout: int = 60) -> tuple[int, str, str]:
+        """Run command and return (returncode, stdout, stderr)."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return proc.returncode, stdout.decode(), stderr.decode()
+        except Exception as exc:
+            return -1, "", str(exc)
+
+    async def _get_nearest_server_id(binary: str) -> tuple[str | None, str | None]:
+        """Return (server_id, error_detail). error_detail is set when blocked."""
+        import re as _re
+        rc, stdout, _ = await _run_raw([binary, "--list"], timeout=20)
+        combined = stdout
+        for pat in _BLOCK_PATTERNS:
+            if pat in combined:
+                return None, f"speedtest.net refused the connection ({combined.strip().splitlines()[-1]}). This is usually temporary rate-limiting — try again in a few minutes."
+        for line in combined.splitlines():
+            m = _re.match(r"^\s*(\d+)\)", line)
+            if m:
+                return m.group(1), None
+        return None, None   # no servers found but no explicit error
+
+    # Check tool is installed before attempting
+    cli_binary = shutil.which("speedtest-cli")
+    if not cli_binary:
+        raise HTTPException(status_code=503, detail="speedtest-cli is not installed. Run: apt install speedtest-cli")
+
+    server_id, block_error = await _get_nearest_server_id(cli_binary)
+    if block_error:
+        raise HTTPException(status_code=503, detail=block_error)
+
+    cmd = [cli_binary, "--json"]
+    if server_id:
+        cmd += ["--server", server_id]
+    rc, stdout, stderr = await _run_raw(cmd, timeout=90)
+
+    # Check for blocking errors in the test output too
+    for pat in _BLOCK_PATTERNS:
+        if pat in stdout or pat in stderr:
+            raise HTTPException(
+                status_code=503,
+                detail=f"speedtest.net blocked the test. This is usually temporary — try again in a few minutes.",
+            )
+
+    try:
+        data = _json.loads(stdout)
+    except Exception:
+        raw = (stdout + stderr).strip().splitlines()
+        last = raw[-1] if raw else "no output"
+        raise HTTPException(status_code=503, detail=f"Speed test returned unexpected output: {last}")
+
+    if "download" in data and isinstance(data["download"], (int, float)):
+        dl_mbps = round(data["download"] / 1_000_000, 2)
+        ul_mbps = round(data["upload"]   / 1_000_000, 2)
+        ping    = data.get("ping", 0)
+        if not _is_valid(dl_mbps, ul_mbps, ping):
+            raise HTTPException(
+                status_code=503,
+                detail="Speed test completed but returned invalid measurements (ping>10s or zero speeds). Try again.",
+            )
+        srv = data.get("server", {})
+        loc = ", ".join(filter(None, [srv.get("name"), srv.get("country")]))
         return {
-            "download_mbps": round(bw_dl * 8 / 1_000_000, 2),
-            "upload_mbps":   round(bw_ul * 8 / 1_000_000, 2),
+            "download_mbps": dl_mbps,
+            "upload_mbps":   ul_mbps,
             "ping_ms":       round(ping, 1),
-            "server":        f"{srv.get('name', '')}, {srv.get('location', '')}".strip(", "),
-            "isp":           data.get("isp", ""),
+            "server":        loc,
+            "isp":           data.get("client", {}).get("isp", ""),
             "tested_at":     datetime.now(UTC).isoformat(),
         }
 
-    # --- speedtest-cli Python package (bits/sec) ---
-    for cmd in [["speedtest-cli", "--json"], ["python3", "-m", "speedtest", "--json"]]:
-        data = await _run(cmd)
-        if data and "download" in data and isinstance(data["download"], (int, float)):
-            srv = data.get("server", {})
-            loc = ", ".join(filter(None, [srv.get("name"), srv.get("country")]))
-            return {
-                "download_mbps": round(data["download"] / 1_000_000, 2),
-                "upload_mbps":   round(data["upload"]   / 1_000_000, 2),
-                "ping_ms":       round(data.get("ping", 0), 1),
-                "server":        loc,
-                "isp":           data.get("client", {}).get("isp", ""),
-                "tested_at":     datetime.now(UTC).isoformat(),
+
+# ---------------------------------------------------------------------------
+# Network Configuration
+# ---------------------------------------------------------------------------
+
+@router.get("/network-config")
+async def get_network_config(_: str = Depends(require_super_admin)) -> dict:
+    import socket
+    import struct
+
+    af_inet  = 2   # AF_INET  (IPv4)
+    af_inet6 = 10  # AF_INET6 (IPv6)
+    af_link  = 17  # AF_PACKET (MAC address on Linux)
+
+    net_if_addrs  = psutil.net_if_addrs()
+    net_if_stats  = psutil.net_if_stats()
+    net_io        = psutil.net_io_counters(pernic=True)
+
+    interfaces = []
+    for iface, addrs in net_if_addrs.items():
+        stats   = net_if_stats.get(iface)
+        io      = net_io.get(iface)
+        ipv4    = [a for a in addrs if a.family == af_inet]
+        ipv6    = [a for a in addrs if a.family == af_inet6]
+        mac_rec = next((a for a in addrs if a.family == af_link), None)
+
+        def _cidr(netmask: str | None) -> str | None:
+            if not netmask:
+                return None
+            try:
+                return str(sum(bin(int(o)).count("1") for o in netmask.split(".")))
+            except Exception:
+                return None
+
+        interfaces.append({
+            "name":       iface,
+            "is_up":      stats.isup if stats else False,
+            "speed_mbps": stats.speed if stats else 0,
+            "mtu":        stats.mtu if stats else 0,
+            "mac":        mac_rec.address if mac_rec else None,
+            "ipv4": [
+                {
+                    "address": a.address,
+                    "netmask": a.netmask,
+                    "cidr":    _cidr(a.netmask),
+                    "broadcast": a.broadcast,
+                }
+                for a in ipv4
+            ],
+            "ipv6": [
+                {
+                    "address": a.address.split("%")[0],
+                    "netmask": a.netmask,
+                }
+                for a in ipv6
+                if not a.address.lower().startswith("fe80")
+            ],
+            "io": {
+                "bytes_sent": io.bytes_sent if io else 0,
+                "bytes_recv": io.bytes_recv if io else 0,
+                "packets_sent": io.packets_sent if io else 0,
+                "packets_recv": io.packets_recv if io else 0,
+                "errin": io.errin if io else 0,
+                "errout": io.errout if io else 0,
+                "dropin": io.dropin if io else 0,
+                "dropout": io.dropout if io else 0,
+            } if io else None,
+        })
+
+    # DNS servers from /etc/resolv.conf
+    dns_servers: list[str] = []
+    dns_search: list[str] = []
+    try:
+        with open("/etc/resolv.conf") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("nameserver"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        dns_servers.append(parts[1])
+                elif line.startswith("search") or line.startswith("domain"):
+                    dns_search.extend(line.split()[1:])
+    except OSError:
+        pass
+
+    # Routing table via `ip route show`
+    routes: list[dict] = []
+    try:
+        out = _run_out(["ip", "route", "show"])
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            route: dict[str, str | None] = {
+                "destination": parts[0] if parts else None,
+                "gateway": None,
+                "interface": None,
+                "metric": None,
+                "proto": None,
+                "scope": None,
+            }
+            i = 1
+            while i < len(parts):
+                if parts[i] == "via" and i + 1 < len(parts):
+                    route["gateway"] = parts[i + 1]; i += 2
+                elif parts[i] == "dev" and i + 1 < len(parts):
+                    route["interface"] = parts[i + 1]; i += 2
+                elif parts[i] == "metric" and i + 1 < len(parts):
+                    route["metric"] = parts[i + 1]; i += 2
+                elif parts[i] == "proto" and i + 1 < len(parts):
+                    route["proto"] = parts[i + 1]; i += 2
+                elif parts[i] == "scope" and i + 1 < len(parts):
+                    route["scope"] = parts[i + 1]; i += 2
+                else:
+                    i += 1
+            routes.append(route)
+    except Exception:
+        pass
+
+    # Default gateway
+    default_gateway: str | None = next(
+        (r["gateway"] for r in routes if r.get("destination") in ("default", "0.0.0.0/0") and r.get("gateway")),
+        None,
+    )
+
+    # Firewall state (ufw or nftables)
+    firewall: dict[str, str | list] = {"tool": "unknown", "state": "unknown", "rules": []}
+    ufw_out, _, ufw_rc = _run(["ufw", "status", "verbose"])
+    if ufw_rc == 0:
+        lines = ufw_out.splitlines()
+        state_line = next((l for l in lines if l.lower().startswith("status:")), "")
+        firewall = {
+            "tool": "ufw",
+            "state": state_line.replace("Status:", "").strip() if state_line else "unknown",
+            "rules": [l for l in lines if l and not l.startswith("Status") and not l.startswith("Logging") and not l.startswith("Default") and not l.startswith("New profiles") and l.strip()],
+        }
+    else:
+        nft_out, _, nft_rc = _run(["nft", "list", "ruleset"])
+        if nft_rc == 0:
+            firewall = {
+                "tool": "nftables",
+                "state": "active",
+                "rules": nft_out.splitlines()[:40],
             }
 
-    raise HTTPException(status_code=503, detail="No speedtest tool found. Install: apt install speedtest-cli")
+    # Open listening ports via ss
+    ports: list[dict] = []
+    try:
+        ss_out = _run_out(["ss", "-tlnp"])
+        for line in ss_out.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            local = parts[3]
+            process = parts[6] if len(parts) > 6 else ""
+            addr, _, port = local.rpartition(":")
+            ports.append({"local_address": addr or "*", "port": port, "process": process})
+    except Exception:
+        pass
+
+    # DNS resolution check
+    dns_ok = False
+    try:
+        socket.getaddrinfo("google.com", 80, proto=socket.IPPROTO_TCP)
+        dns_ok = True
+    except Exception:
+        pass
+
+    # Connectivity checks: ping 8.8.8.8 (external) and default gateway (internal)
+    def _ping(host: str) -> dict:
+        out, _, rc = _run(["ping", "-c", "3", "-W", "2", host])
+        if rc == 0:
+            rtt = None
+            for l in out.splitlines():
+                if "rtt" in l or "round-trip" in l:
+                    parts = l.split("=")
+                    if len(parts) > 1:
+                        rtt = parts[1].strip().split("/")[1] + " ms" if "/" in parts[1] else parts[1].strip()
+            return {"host": host, "reachable": True, "rtt_avg": rtt}
+        return {"host": host, "reachable": False, "rtt_avg": None}
+
+    ping_external = _ping("8.8.8.8")
+    ping_gateway  = _ping(default_gateway) if default_gateway else {"host": default_gateway, "reachable": None, "rtt_avg": None}
+
+    return {
+        "interfaces":       interfaces,
+        "dns_servers":      dns_servers,
+        "dns_search":       dns_search,
+        "dns_resolves":     dns_ok,
+        "routes":           routes,
+        "default_gateway":  default_gateway,
+        "firewall":         firewall,
+        "open_ports":       ports,
+        "connectivity": {
+            "external": ping_external,
+            "gateway":  ping_gateway,
+        },
+        "checked_at": datetime.now(UTC).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Hardware Info
+# ---------------------------------------------------------------------------
+
+@router.get("/hardware")
+async def get_hardware(_: str = Depends(require_super_admin)) -> dict:
+    uname = platform.uname()
+
+    # CPU
+    cpu_freq = psutil.cpu_freq()
+    cpu_info: dict = {
+        "logical_cores":  psutil.cpu_count(logical=True),
+        "physical_cores": psutil.cpu_count(logical=False),
+        "percent":        psutil.cpu_percent(interval=0.3),
+        "per_core":       psutil.cpu_percent(interval=0, percpu=True),
+        "freq_mhz":       round(cpu_freq.current, 1) if cpu_freq else None,
+        "freq_max_mhz":   round(cpu_freq.max, 1) if cpu_freq else None,
+        "model":          None,
+        "arch":           uname.machine,
+        "load_avg_1m":    round(psutil.getloadavg()[0], 2),
+        "load_avg_5m":    round(psutil.getloadavg()[1], 2),
+        "load_avg_15m":   round(psutil.getloadavg()[2], 2),
+    }
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    cpu_info["model"] = line.split(":", 1)[1].strip()
+                    break
+    except OSError:
+        pass
+
+    # Memory
+    mem  = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    memory = {
+        "total_gb":     round(mem.total / 1e9, 2),
+        "used_gb":      round(mem.used / 1e9, 2),
+        "available_gb": round(mem.available / 1e9, 2),
+        "cached_gb":    round(getattr(mem, "cached", 0) / 1e9, 2),
+        "buffers_gb":   round(getattr(mem, "buffers", 0) / 1e9, 2),
+        "percent":      mem.percent,
+        "swap_total_gb": round(swap.total / 1e9, 2),
+        "swap_used_gb":  round(swap.used / 1e9, 2),
+        "swap_percent":  swap.percent,
+    }
+
+    # Disks
+    disks = []
+    for part in psutil.disk_partitions(all=False):
+        try:
+            usage = psutil.disk_usage(part.mountpoint)
+        except PermissionError:
+            continue
+        disks.append({
+            "device":     part.device,
+            "mountpoint": part.mountpoint,
+            "fstype":     part.fstype,
+            "opts":       part.opts,
+            "total_gb":   round(usage.total / 1e9, 2),
+            "used_gb":    round(usage.used / 1e9, 2),
+            "free_gb":    round(usage.free / 1e9, 2),
+            "percent":    usage.percent,
+        })
+
+    # Block devices (lsblk)
+    block_devices: list[dict] = []
+    try:
+        out = _run_out(["lsblk", "-J", "-o", "NAME,SIZE,TYPE,MODEL,ROTA,TRAN"])
+        import json as _json
+        lsblk = _json.loads(out)
+        block_devices = lsblk.get("blockdevices", [])
+    except Exception:
+        pass
+
+    # Temperature sensors
+    temps: dict = {}
+    try:
+        raw = psutil.sensors_temperatures()
+        for name, entries in raw.items():
+            temps[name] = [
+                {"label": e.label or name, "current": e.current, "high": e.high, "critical": e.critical}
+                for e in entries
+            ]
+    except (AttributeError, Exception):
+        pass
+
+    # GPU (nvidia-smi if available)
+    gpu: list[dict] = []
+    try:
+        out = _run_out(["nvidia-smi", "--query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu",
+                        "--format=csv,noheader,nounits"])
+        for line in out.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 5:
+                gpu.append({
+                    "name":         parts[0],
+                    "memory_total": parts[1] + " MiB",
+                    "memory_used":  parts[2] + " MiB",
+                    "utilization":  parts[3] + "%",
+                    "temperature":  parts[4] + "°C",
+                })
+    except Exception:
+        pass
+
+    # System / OS info
+    try:
+        os_release = platform.freedesktop_os_release()
+        os_pretty = os_release.get("PRETTY_NAME", f"{uname.system} {uname.release}")
+    except (OSError, AttributeError):
+        os_pretty = f"{uname.system} {uname.release}"
+
+    # DMI / hardware info (dmidecode — requires root; graceful fallback)
+    dmi: dict = {}
+    try:
+        for dmi_type, key in [("system", "system"), ("baseboard", "baseboard"), ("bios", "bios")]:
+            out, _, rc = _run(["dmidecode", "-t", dmi_type])
+            if rc == 0:
+                entry: dict = {}
+                for line in out.splitlines():
+                    if ":" in line:
+                        k, _, v = line.partition(":")
+                        k = k.strip(); v = v.strip()
+                        if k and v and v not in ("Not Specified", "Not Present", "To Be Filled By O.E.M."):
+                            entry[k] = v
+                dmi[key] = entry
+    except Exception:
+        pass
+
+    boot_ts = psutil.boot_time()
+
+    return {
+        "cpu":     cpu_info,
+        "memory":  memory,
+        "disks":   disks,
+        "block_devices": block_devices,
+        "temperatures": temps,
+        "gpu":     gpu,
+        "dmi":     dmi,
+        "system": {
+            "hostname": uname.node,
+            "os":       os_pretty,
+            "kernel":   uname.release,
+            "arch":     uname.machine,
+            "uptime":   _uptime_str(boot_ts),
+            "boot_time": datetime.fromtimestamp(boot_ts, tz=UTC).isoformat(),
+            "processes": len(psutil.pids()),
+            "python":   platform.python_version(),
+        },
+        "checked_at": datetime.now(UTC).isoformat(),
+    }
+
+    raise HTTPException(status_code=503, detail="Speed test returned unrecognised data format.")
