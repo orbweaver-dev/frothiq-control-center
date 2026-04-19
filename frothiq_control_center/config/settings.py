@@ -108,6 +108,14 @@ class Settings(BaseSettings):
     billing_webhook_secret: str = ""
 
     # -----------------------------------------------------------------
+    # Email (SMTP via local Postfix → Mailjet relay)
+    # -----------------------------------------------------------------
+    smtp_host: str = "localhost"
+    smtp_port: int = 25
+    smtp_from: str = "no-reply@orbweaver.dev"
+    admin_email: str = ""  # where IP approval requests are sent
+
+    # -----------------------------------------------------------------
     # Rate limiting
     # -----------------------------------------------------------------
     rate_limit_default: str = "120/minute"

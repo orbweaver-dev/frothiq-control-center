@@ -27,6 +27,7 @@ from .routes_wireguard import router as wireguard_router
 from .routes_frappe import router as frappe_router
 from .routes_converter import router as converter_router
 from .routes_webops import router as webops_router
+from .routes_enrollment import router as enrollment_router
 
 # All control center routes under /api/v1/cc/
 api_router = APIRouter(prefix="/api/v1/cc")
@@ -71,6 +72,8 @@ api_router.include_router(frappe_router)
 api_router.include_router(converter_router)
 # WebOps — virtual server inventory and controlled management
 api_router.include_router(webops_router)
+# IP enrollment flow — enroll/start, enroll/complete, approve-ip
+api_router.include_router(enrollment_router)
 
 # Public edge registration (no JWT — separate prefix /api/v1/edge/)
 # This is mounted directly on the FastAPI app in main.py
