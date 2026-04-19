@@ -1537,9 +1537,13 @@ import logging as _logging
 
 _audit_log = _logging.getLogger("mc3.audit")
 if not _audit_log.handlers:
-    _h = _logging.FileHandler("/var/log/mc3-audit.log")
-    _h.setFormatter(_logging.Formatter("%(asctime)s  %(message)s"))
-    _audit_log.addHandler(_h)
+    try:
+        _h = _logging.FileHandler("/var/log/mc3-audit.log", delay=True)
+        _h.setFormatter(_logging.Formatter("%(asctime)s  %(message)s"))
+        _audit_log.addHandler(_h)
+    except OSError:
+        pass
+    _audit_log.addHandler(_logging.StreamHandler())
     _audit_log.setLevel(_logging.INFO)
 
 
