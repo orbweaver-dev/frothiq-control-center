@@ -507,6 +507,7 @@ class SMTPSettings(BaseModel):
     smtp_host:    str = "localhost"
     smtp_port:    int = 25
     smtp_from:    str = "no-reply@orbweaver.dev"
+    sender_name:  str = "OrbWeaver MC³"
     admin_email:  str = ""
 
 
@@ -514,6 +515,7 @@ class SMTPSettingsPatch(BaseModel):
     smtp_host:   str | None = None
     smtp_port:   int | None = None
     smtp_from:   str | None = None
+    sender_name: str | None = None
     admin_email: str | None = None
 
 
@@ -562,6 +564,8 @@ async def update_smtp_settings(
         s.smtp_port = patch.smtp_port
     if patch.smtp_from is not None:
         s.smtp_from = patch.smtp_from.strip()
+    if patch.sender_name is not None:
+        s.sender_name = patch.sender_name.strip() or "OrbWeaver MC³"
     if patch.admin_email is not None:
         s.admin_email = patch.admin_email.strip()
     _save_smtp(s)
@@ -591,9 +595,10 @@ async def test_smtp(user: TokenPayload = Depends(require_super_admin)):
 </body>
 </html>"""
 
+    from email.utils import formataddr
     msg = MIMEMultipart("alternative")
     msg["Subject"] = "[MC³] SMTP configuration test"
-    msg["From"] = s.smtp_from
+    msg["From"] = formataddr((s.sender_name, s.smtp_from))
     msg["To"] = s.admin_email
     msg.attach(MIMEText(html, "html"))
 

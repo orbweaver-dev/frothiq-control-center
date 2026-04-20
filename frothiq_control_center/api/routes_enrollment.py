@@ -22,6 +22,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import formataddr
 
 import pyotp
 from fastapi import APIRouter, HTTPException, Request, status
@@ -112,6 +113,7 @@ async def _send_approval_email(ip: str, user_email: str, raw_token: str) -> None
     smtp_host = smtp_cfg.get("smtp_host", settings.smtp_host)
     smtp_port = smtp_cfg.get("smtp_port", settings.smtp_port)
     smtp_from = smtp_cfg.get("smtp_from", settings.smtp_from)
+    sender_name = smtp_cfg.get("sender_name", "OrbWeaver MC³")
 
     approval_url = f"https://mc3.orbweaver.dev/api/v1/cc/auth/approve-ip/{raw_token}"
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -148,7 +150,7 @@ async def _send_approval_email(ip: str, user_email: str, raw_token: str) -> None
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"[MC³] IP Access Request — {ip}"
-    msg["From"] = smtp_from
+    msg["From"] = formataddr((sender_name, smtp_from))
     msg["To"] = admin_email
     msg.attach(MIMEText(html, "html"))
 
