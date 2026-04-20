@@ -157,18 +157,20 @@ def _ssh_check(server: dict) -> dict:
 
 
 def _ssh_metrics(server: dict) -> dict:
-    """Fetch resource metrics over SSH using hardcoded read-only commands."""
-    # Single connection: run compound one-liner producing key:value lines
-    # All commands are hardcoded; no user input is embedded here.
+    """Fetch resource metrics over SSH — single connection, hardcoded commands only."""
     script = (
         "echo LOAD:$(cat /proc/loadavg 2>/dev/null | awk '{print $1\",\"$2\",\"$3}');"
         "echo MEM:$(free -b 2>/dev/null | awk 'NR==2{print $2\",\"$3\",\"$4}');"
-        "echo DISK:$(df -B1 / 2>/dev/null | awk 'NR==2{print $2\",\"$3\",\"$4\",\"$5}');"
+        "echo SWAP:$(free -b 2>/dev/null | awk 'NR==3{print $2\",\"$3\",\"$4}');"
         "echo UPTIME:$(awk '{print $1}' /proc/uptime 2>/dev/null);"
         "echo HOST:$(hostname -s 2>/dev/null);"
         "echo OS:$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '\"');"
         "echo PROCS:$(ps aux --no-headers 2>/dev/null | wc -l);"
-        "echo CPU:$(grep -m1 'cpu ' /proc/stat | awk '{u=$2+$4; t=$2+$3+$4+$5; if(t>0) printf \"%.1f\", u*100/t; else print 0}')"
+        "echo CPU:$(grep -m1 'cpu ' /proc/stat | awk '{u=$2+$4; t=$2+$3+$4+$5; if(t>0) printf \"%.1f\", u*100/t; else print 0}');"
+        # Multiple disk mounts — semicolon-delimited: mountpoint|size|used|avail|pct|fstype
+        "echo DISKS:$(df -P -B1 2>/dev/null | awk 'NR>1 && $6!=\"\" {gsub(/%/,\"\",$5); printf \"%s|%s|%s|%s|%s|%s;\", $6,$2,$3,$4,$5,$1}' | grep -v 'tmpfs\\|devtmpfs\\|squashfs\\|loop\\|udev\\|sysfs\\|proc' | head -c 2000);"
+        # Network IO — semicolon-delimited: iface|bytes_rx|bytes_tx (from /proc/net/dev)
+        "echo NETIO:$(awk 'NR>2 && $1!~/lo:/{gsub(/:/,\"\",$1); printf \"%s|%s|%s;\", $1,$2,$10}' /proc/net/dev 2>/dev/null | head -c 500)"
     )
     out, _, rc = _run(_ssh_base(server) + [script], timeout=20)
     if rc != 0:
@@ -195,16 +197,58 @@ def _ssh_metrics(server: dict) -> dict:
                 "percent":  round(used / total * 100, 1) if total else 0,
             }
 
-        elif key == "DISK":
+        elif key == "SWAP":
             parts = val.split(",")
-            total = _safe_int(parts, 0); used = _safe_int(parts, 1); free = _safe_int(parts, 2)
-            pct_str = parts[3].rstrip("%") if len(parts) > 3 else "0"
-            result["disk"] = {
-                "total_gb": round(total / 1e9, 2),
-                "used_gb":  round(used  / 1e9, 2),
-                "free_gb":  round(free  / 1e9, 2),
-                "percent":  _safe_float([pct_str], 0),
-            }
+            total = _safe_int(parts, 0); used = _safe_int(parts, 1)
+            if total > 0:
+                result["swap"] = {
+                    "total_gb": round(total / 1e9, 2),
+                    "used_gb":  round(used  / 1e9, 2),
+                    "percent":  round(used / total * 100, 1),
+                }
+
+        elif key == "DISKS":
+            disks = []
+            for entry in val.split(";"):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                parts = entry.split("|")
+                if len(parts) < 5:
+                    continue
+                mount = parts[0]; size_b = _safe_int(parts, 1)
+                used_b = _safe_int(parts, 2); avail_b = _safe_int(parts, 3)
+                pct = _safe_float(parts, 4); fstype = parts[5] if len(parts) > 5 else ""
+                disks.append({
+                    "mountpoint": mount,
+                    "total_gb":   round(size_b  / 1e9, 2),
+                    "used_gb":    round(used_b  / 1e9, 2),
+                    "free_gb":    round(avail_b / 1e9, 2),
+                    "percent":    pct,
+                    "fstype":     fstype,
+                })
+            if disks:
+                result["disks"] = disks
+                # Keep legacy single-disk key pointing at root or first disk
+                root = next((d for d in disks if d["mountpoint"] == "/"), disks[0])
+                result["disk"] = {k: root[k] for k in ("total_gb", "used_gb", "free_gb", "percent")}
+
+        elif key == "NETIO":
+            ifaces = []
+            for entry in val.split(";"):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                parts = entry.split("|")
+                if len(parts) < 3:
+                    continue
+                ifaces.append({
+                    "iface":    parts[0],
+                    "bytes_rx": _safe_int(parts, 1),
+                    "bytes_tx": _safe_int(parts, 2),
+                })
+            if ifaces:
+                result["network_io"] = ifaces
 
         elif key == "UPTIME":
             secs = _safe_float([val], 0)
@@ -224,6 +268,81 @@ def _ssh_metrics(server: dict) -> dict:
             result["cpu_percent"] = _safe_float([val], 0)
 
     return result
+
+
+def _ssh_vhosts(server: dict) -> list[dict]:
+    """Read virtual host configs from Apache / Nginx over SSH. No user input embedded."""
+    script = (
+        # Apache (apache2ctl or apachectl or httpd)
+        "if command -v apache2ctl >/dev/null 2>&1; then "
+        "  echo 'WEB:apache'; apache2ctl -S 2>&1 | grep 'namevhost'; "
+        "elif command -v apachectl >/dev/null 2>&1; then "
+        "  echo 'WEB:apache'; apachectl -S 2>&1 | grep 'namevhost'; "
+        "elif command -v httpd >/dev/null 2>&1; then "
+        "  echo 'WEB:httpd'; httpd -S 2>&1 | grep 'namevhost'; "
+        "fi; "
+        # Nginx — iterate enabled site configs
+        "if command -v nginx >/dev/null 2>&1; then "
+        "  echo 'WEB:nginx'; "
+        "  for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do "
+        "    [ -f \"$f\" ] || continue; "
+        "    sn=$(grep -m1 'server_name' \"$f\" 2>/dev/null | sed 's/.*server_name[[:space:]]*//' | tr -d ';' | awk '{print $1}'); "
+        "    lt=$(grep -m1 'listen' \"$f\" 2>/dev/null | sed 's/.*listen[[:space:]]*//' | tr -d ';' | awk '{print $1}'); "
+        "    ssl=$(grep -c 'ssl_certificate' \"$f\" 2>/dev/null || echo 0); "
+        "    dr=$(grep -m1 'root ' \"$f\" 2>/dev/null | sed 's/.*root[[:space:]]*//' | tr -d ';' | awk '{print $1}'); "
+        "    [ -n \"$sn\" ] && echo \"NGINX_VH:${sn}|${lt}|${ssl}|${dr}\"; "
+        "  done; "
+        "fi"
+    )
+    out, _, rc = _run(_ssh_base(server) + [script], timeout=25)
+    if rc != 0:
+        return []
+
+    vhosts: list[dict] = []
+    current_web = "apache"
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("WEB:"):
+            current_web = line[4:].strip()
+        elif "namevhost" in line:
+            # Apache: "         port 80 namevhost example.com (/path/conf:1)"
+            m = re.search(r"port\s+(\d+)\s+namevhost\s+(\S+)\s+\((.+?):\d+\)", line)
+            if m:
+                port = int(m.group(1)); domain = m.group(2); cfg = m.group(3)
+                vhosts.append({
+                    "domain": domain, "port": port,
+                    "ssl": port == 443,
+                    "server": current_web,
+                    "doc_root": None,
+                    "config_file": cfg,
+                })
+        elif line.startswith("NGINX_VH:"):
+            parts = line[9:].split("|")
+            domain   = parts[0] if parts else "_"
+            raw_port = parts[1] if len(parts) > 1 else "80"
+            ssl_cnt  = _safe_int(parts, 2)
+            doc_root = (parts[3].strip() or None) if len(parts) > 3 else None
+            m2 = re.search(r"(\d+)", raw_port)
+            port_num = int(m2.group(1)) if m2 else 80
+            vhosts.append({
+                "domain": domain, "port": port_num,
+                "ssl": ssl_cnt > 0 or port_num == 443,
+                "server": "nginx",
+                "doc_root": doc_root,
+                "config_file": None,
+            })
+
+    # Deduplicate domain+port pairs
+    seen: set[tuple] = set()
+    unique: list[dict] = []
+    for v in vhosts:
+        key_t = (v["domain"], v["port"])
+        if key_t not in seen:
+            seen.add(key_t)
+            unique.append(v)
+    return sorted(unique, key=lambda v: (v["domain"], v["port"]))
 
 
 def _ssh_services(server: dict) -> list[dict]:
@@ -500,6 +619,26 @@ async def server_status(server_id: str, _: str = Depends(require_super_admin)) -
             result["ports"]    = []
 
     return result
+
+
+@router.get("/servers/{server_id}/vhosts")
+async def server_vhosts(server_id: str, _: str = Depends(require_super_admin)) -> dict:
+    """Return virtual host configurations scraped from the remote server."""
+    server = _find_server(server_id)
+    if server.get("type") != "ssh":
+        return {"vhosts": [], "web_servers": [], "note": "vhost scraping only available for SSH servers",
+                "checked_at": datetime.now(UTC).isoformat()}
+    ssh = _ssh_check(server)
+    if not ssh["reachable"]:
+        raise HTTPException(status_code=503, detail="Server is not reachable via SSH")
+    vhosts = _ssh_vhosts(server)
+    web_servers = list({v["server"] for v in vhosts})
+    return {
+        "vhosts": vhosts,
+        "web_servers": web_servers,
+        "count": len(vhosts),
+        "checked_at": datetime.now(UTC).isoformat(),
+    }
 
 
 @router.post("/servers/{server_id}/action")

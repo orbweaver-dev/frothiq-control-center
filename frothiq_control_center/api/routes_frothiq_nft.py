@@ -163,7 +163,7 @@ async def remove_port(
 
 
 # ---------------------------------------------------------------------------
-# LFD Settings
+# LFD Settings (per-service thresholds — mirrors CSF LF_SSHD, LF_FTPD, etc.)
 # ---------------------------------------------------------------------------
 
 @router.get("/lfd/settings")
@@ -171,87 +171,80 @@ async def lfd_settings(
     _: TokenPayload = Depends(require_super_admin),
     session: AsyncSession = Depends(_db),
 ):
-    return await svc.get_lfd_settings(session)
-
-
-class LFDSettingsBody(BaseModel):
-    block_threshold: str | None = None
-    block_duration_minutes: str | None = None
-    permanent_block: str | None = None
-    email_alerts: str | None = None
-    alert_email: str | None = None
+    return await svc.get_category_settings(session, "lfd", svc.LFD_DEFAULTS)
 
 
 @router.put("/lfd/settings")
 async def update_lfd(
-    body: LFDSettingsBody,
+    body: dict,
     request: Request,
     token: TokenPayload = Depends(require_super_admin),
     session: AsyncSession = Depends(_db),
 ):
-    payload = {k: v for k, v in body.model_dump().items() if v is not None}
-    return await svc.update_lfd_settings(session, payload, token.email, _ip(request))
+    return await svc.update_category_settings(session, "lfd", body, svc.LFD_DEFAULTS.keys(), token.email, _ip(request))
 
 
 # ---------------------------------------------------------------------------
-# Validation
+# Port Settings (TCP_IN, TCP_OUT, UDP_IN, etc. — mirrors CSF port config)
 # ---------------------------------------------------------------------------
 
-@router.get("/validation/status")
-async def validation_status(
+@router.get("/settings/ports")
+async def get_port_settings(
     _: TokenPayload = Depends(require_super_admin),
     session: AsyncSession = Depends(_db),
 ):
-    return await svc.get_validation_status(session)
+    return await svc.get_category_settings(session, "ports", svc.PORT_DEFAULTS)
 
 
-class ValidationSettingsBody(BaseModel):
-    interval_minutes: str | None = None
-    passes_required: str | None = None
-
-
-@router.put("/validation/settings")
-async def update_validation(
-    body: ValidationSettingsBody,
+@router.put("/settings/ports")
+async def update_port_settings(
+    body: dict,
     request: Request,
     token: TokenPayload = Depends(require_super_admin),
     session: AsyncSession = Depends(_db),
 ):
-    payload = {k: v for k, v in body.model_dump().items() if v is not None}
-    return await svc.update_validation_settings(session, payload, token.email, _ip(request))
+    return await svc.update_category_settings(session, "ports", body, svc.PORT_DEFAULTS.keys(), token.email, _ip(request))
 
 
 # ---------------------------------------------------------------------------
-# Decommission
+# Blocking Settings (SYNFLOOD, CONNLIMIT, CC_DENY, LF_PERMBLOCK, etc.)
 # ---------------------------------------------------------------------------
 
-@router.get("/decommission/status")
-async def decommission_status(
+@router.get("/settings/blocking")
+async def get_blocking_settings(
     _: TokenPayload = Depends(require_super_admin),
     session: AsyncSession = Depends(_db),
 ):
-    return await svc.get_decommission_status(session)
+    return await svc.get_category_settings(session, "blocking", svc.BLOCKING_DEFAULTS)
 
 
-@router.post("/decommission/run")
-async def run_decommission(
+@router.put("/settings/blocking")
+async def update_blocking_settings(
+    body: dict,
     request: Request,
     token: TokenPayload = Depends(require_super_admin),
     session: AsyncSession = Depends(_db),
 ):
-    return await svc.run_decommission(session, token.email, _ip(request))
+    return await svc.update_category_settings(session, "blocking", body, svc.BLOCKING_DEFAULTS.keys(), token.email, _ip(request))
 
 
 # ---------------------------------------------------------------------------
-# Defense Audit Log
+# Alert Settings (LF_ALERT_TO, LF_EMAIL_ALERT, per-event toggles)
 # ---------------------------------------------------------------------------
 
-@router.get("/audit")
-async def defense_audit(
-    limit: int = Query(100, ge=1, le=500),
-    offset: int = Query(0, ge=0),
-    category: str | None = Query(None),
+@router.get("/settings/alerts")
+async def get_alert_settings(
     _: TokenPayload = Depends(require_super_admin),
     session: AsyncSession = Depends(_db),
 ):
-    return await svc.get_defense_audit(session, limit=limit, offset=offset, category=category)
+    return await svc.get_category_settings(session, "alerts", svc.ALERT_DEFAULTS)
+
+
+@router.put("/settings/alerts")
+async def update_alert_settings(
+    body: dict,
+    request: Request,
+    token: TokenPayload = Depends(require_super_admin),
+    session: AsyncSession = Depends(_db),
+):
+    return await svc.update_category_settings(session, "alerts", body, svc.ALERT_DEFAULTS.keys(), token.email, _ip(request))

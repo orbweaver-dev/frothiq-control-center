@@ -28,6 +28,55 @@ from frothiq_control_center.models.defense_settings import (
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Settings default dicts — mirrors CSF/LFD config keys 1:1
+# ---------------------------------------------------------------------------
+
+PORT_DEFAULTS: dict[str, str] = {
+    "TCP_IN":    "20,21,25,53,853,80,110,143,443,465,587,993,995,3000,3112,8782,8780,10000,20000",
+    "TCP_OUT":   "20,21,25,53,853,80,110,113,443,587,993,995,3000,3112,8782,8780,10000,20000",
+    "UDP_IN":    "20,21,53,853,80,443",
+    "UDP_OUT":   "20,21,53,853,113,123",
+    "TCP6_IN":   "20,21,25,53,853,80,110,143,443,465,587,993,995,3112,8782,8780",
+    "TCP6_OUT":  "20,21,25,53,853,80,110,113,443,587,993,995,3112,8782,8780",
+    "UDP6_IN":   "20,21,53,853,80,443",
+    "UDP6_OUT":  "20,21,53,853,113,123",
+    "DROP_NOLOG":"23,67,68,111,113,135:139,445,500,513,520",
+}
+
+LFD_DEFAULTS: dict[str, str] = {
+    "LF_SSHD": "5",     "LF_SSHD_PERM": "1",
+    "LF_FTPD": "5",     "LF_FTPD_PERM": "1",
+    "LF_SMTPAUTH": "3", "LF_SMTPAUTH_PERM": "1",
+    "LF_POP3D": "5",    "LF_POP3D_PERM": "1",
+    "LF_IMAPD": "5",    "LF_IMAPD_PERM": "1",
+    "LF_HTACCESS": "5", "LF_HTACCESS_PERM": "1",
+    "LF_MODSEC": "5",   "LF_MODSEC_PERM": "1",
+    "LF_WEBMIN": "1",   "LF_WEBMIN_PERM": "0",
+}
+
+BLOCKING_DEFAULTS: dict[str, str] = {
+    "SYNFLOOD": "0", "SYNFLOOD_RATE": "100/s", "SYNFLOOD_BURST": "150",
+    "CONNLIMIT": "25;20,465;20,587;20",
+    "PORTFLOOD": "143;tcp;20;5,993;tcp;20;5,110;tcp;20;5,995;tcp;20;5",
+    "LF_PERMBLOCK": "1", "LF_PERMBLOCK_INTERVAL": "86400", "LF_PERMBLOCK_COUNT": "4",
+    "LF_NETBLOCK": "1", "LF_NETBLOCK_INTERVAL": "86400",
+    "LF_NETBLOCK_COUNT": "4", "LF_NETBLOCK_CLASS": "C",
+    "CC_DENY": "CN,RU,IN,BR,VN,TW,IR,KP,RO,UA,MD,PH",
+    "CC_ALLOW": "",
+}
+
+ALERT_DEFAULTS: dict[str, str] = {
+    "LF_ALERT_TO": "adrianguerraii@gmail.com",
+    "LF_ALERT_FROM": "", "LF_ALERT_SMTP": "",
+    "LF_EMAIL_ALERT": "1", "LF_TEMP_EMAIL_ALERT": "1",
+    "LF_SSH_EMAIL_ALERT": "1", "LF_SU_EMAIL_ALERT": "1",
+    "LF_WEBMIN_EMAIL_ALERT": "1", "LF_CONSOLE_EMAIL_ALERT": "1",
+    "LF_PERMBLOCK_ALERT": "1", "LF_NETBLOCK_ALERT": "1",
+}
+
+# ---------------------------------------------------------------------------
+
 VALIDATION_DIR = "/var/lib/frothiq-validation"
 DECOMMISSION_LOG = f"{VALIDATION_DIR}/decommission-cron.log"
 DECOMMISSION_FLAG = f"{VALIDATION_DIR}/DECOMMISSION_COMPLETE"
@@ -380,6 +429,37 @@ async def remove_port_rule(
     await session.delete(row)
     await session.commit()
     await _audit(session, user_email, "REMOVE_PORT_RULE", "port_rules", detail, ip_address)
+    return {"success": True}
+
+
+# ---------------------------------------------------------------------------
+# Generic category settings (get/update) used by ports, lfd, blocking, alerts
+# ---------------------------------------------------------------------------
+
+async def get_category_settings(
+    session: AsyncSession, category: str, defaults: dict[str, str]
+) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for key, default in defaults.items():
+        out[key] = await _get_setting(session, category, key, default)
+    return out
+
+
+async def update_category_settings(
+    session: AsyncSession,
+    category: str,
+    settings: dict[str, Any],
+    allowed_keys: Any,
+    user_email: str,
+    ip_address: str | None,
+) -> dict[str, Any]:
+    allowed = set(allowed_keys)
+    for key, value in settings.items():
+        if key not in allowed:
+            continue
+        await _set_setting(session, category, key, str(value), user_email)
+    await _audit(session, user_email, f"UPDATE_{category.upper()}_SETTINGS", category,
+                 json.dumps({k: v for k, v in settings.items() if k in allowed}), ip_address)
     return {"success": True}
 
 

@@ -111,12 +111,14 @@ class TerminalRequest(BaseModel):
 
 @router.post("/exec")
 async def execute_command(req: TerminalRequest, _: str = Depends(require_super_admin)) -> dict:
-    """Execute a shell command and return combined output."""
-    cwd = req.cwd if Path(req.cwd).is_dir() else "/"
+    """Execute a shell command as root and return combined output."""
+    safe_cwd = req.cwd.replace("'", "\\'") if req.cwd.startswith("/") else "/"
+    wrapped = f"cd '{safe_cwd}' 2>/dev/null; {req.command}"
     try:
         result = subprocess.run(
-            req.command, shell=True, capture_output=True, text=True,
-            timeout=30, cwd=cwd,
+            ["sudo", "bash", "-c", wrapped],
+            capture_output=True, text=True,
+            timeout=30, cwd="/tmp",
             env={**os.environ, "TERM": "xterm-256color", "COLUMNS": "200"},
         )
         return {
