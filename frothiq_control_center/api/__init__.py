@@ -29,6 +29,7 @@ from .routes_converter import router as converter_router
 from .routes_webops import router as webops_router
 from .routes_enrollment import router as enrollment_router
 from .routes_traffic import router as traffic_router
+from .routes_frothiq_nft import router as frothiq_nft_router
 
 # All control center routes under /api/v1/cc/
 api_router = APIRouter(prefix="/api/v1/cc")
@@ -77,6 +78,8 @@ api_router.include_router(webops_router)
 api_router.include_router(enrollment_router)
 # IP Traffic Monitor — live feed and stats from gateway audit stream
 api_router.include_router(traffic_router)
+# FrothIQ NFT Defense Settings — service control, IP/port management, decommission
+api_router.include_router(frothiq_nft_router)
 
 # Public edge registration (no JWT — separate prefix /api/v1/edge/)
 # This is mounted directly on the FastAPI app in main.py

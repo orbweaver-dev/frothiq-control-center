@@ -16,6 +16,7 @@ import frothiq_control_center.models.billing          # noqa: F401
 import frothiq_control_center.models.reconciliation   # noqa: F401
 import frothiq_control_center.models.predictive_sync  # noqa: F401
 import frothiq_control_center.models.enrollment       # noqa: F401
+import frothiq_control_center.models.defense_settings  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
