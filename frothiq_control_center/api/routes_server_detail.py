@@ -261,11 +261,12 @@ def _apache2_detail() -> dict:
 # MySQL / MariaDB
 # ---------------------------------------------------------------------------
 
+_MYSQL_DEFAULTS_FILE = "/etc/mysql/frothiq_monitor.cnf"
+
 def _mysql_query(sql: str, timeout: int = 5) -> str:
     for cmd in [
-        ["mysql", "--no-defaults", "-N", "-B", "-e", sql],
-        ["mariadb", "--no-defaults", "-N", "-B", "-e", sql],
-        ["sudo", "mysql", "-N", "-B", "-e", sql],
+        ["mysql", f"--defaults-file={_MYSQL_DEFAULTS_FILE}", "-N", "-B", "-e", sql],
+        ["mariadb", f"--defaults-file={_MYSQL_DEFAULTS_FILE}", "-N", "-B", "-e", sql],
     ]:
         out, err, rc = _run(cmd, timeout)
         if rc == 0 and "Access denied" not in err:
@@ -728,7 +729,7 @@ def _health_checks(key: str) -> list[dict]:
 
     if key in ("mysql", "mariadb"):
         # Try connecting
-        result = _out(["mysqladmin", "ping", "--connect-timeout=2"], timeout=5)
+        result = _out(["mysqladmin", f"--defaults-file={_MYSQL_DEFAULTS_FILE}", "ping", "--connect-timeout=2"], timeout=5)
         ok = "alive" in result.lower()
         checks.append({"name": "DB Ping", "status": "ok" if ok else "error", "detail": result.strip() or "no response"})
 
@@ -1368,6 +1369,118 @@ def _rndc_zone_status(zone_name: str) -> dict:
     return result
 
 
+def _dnssec_external_check(zone_name: str) -> dict:
+    """Check DNSSEC validation externally via 8.8.8.8. Returns structured status."""
+    out, _, rc = _run(
+        ["dig", "+dnssec", "+time=4", "+tries=1", f"@8.8.8.8", zone_name, "SOA"],
+        timeout=10,
+    )
+    validated = False
+    bogus = False
+    status_code = ""
+    ede_msg = ""
+    for line in out.splitlines():
+        if "flags:" in line and " ad " in line:
+            validated = True
+        if "status:" in line:
+            m = re.search(r'status:\s*(\w+)', line)
+            if m:
+                status_code = m.group(1)
+                bogus = status_code == "SERVFAIL"
+        if "EDE:" in line or "Extended DNS Error" in line:
+            ede_msg = line.strip().lstrip("; ")
+    return {
+        "validated": validated,
+        "bogus": bogus,
+        "status": status_code,
+        "ede": ede_msg,
+        "ok": rc == 0 and not bogus,
+    }
+
+
+def _get_zone_notify_ips(zone_name: str) -> list[str]:
+    """Return the also-notify IPs for a zone from named.conf.local."""
+    ips: list[str] = []
+    try:
+        local = _read_file_sudo("/etc/bind/named.conf.local")
+        clean = _strip_comments(local, style="c")
+        for zn, body in _bind9_extract_zone_bodies(clean):
+            if zn.lower() == zone_name.lower():
+                for an_m in re.finditer(r'also-notify\s*\{([^}]+)\}', body, re.IGNORECASE):
+                    for tok in an_m.group(1).split():
+                        tok = tok.strip().rstrip(';')
+                        if re.match(r'^[\d.:a-fA-F]+$', tok) and tok:
+                            ips.append(tok)
+                break
+    except Exception:
+        pass
+    return ips
+
+
+def _set_zone_notify_ips(zone_name: str, notify_ips: list[str]) -> tuple[bool, str]:
+    """Update also-notify IPs for a zone in named.conf.local. Returns (ok, error_msg)."""
+    path = "/etc/bind/named.conf.local"
+    content = _read_file_sudo(path)
+    if not content:
+        return False, "Could not read named.conf.local"
+
+    # Locate zone block using brace-depth tracking
+    pattern = re.compile(r'\bzone\s+"' + re.escape(zone_name) + r'"\s*(?:IN\s*)?\{', re.IGNORECASE)
+    m = pattern.search(content)
+    if not m:
+        return False, f"Zone '{zone_name}' not found in named.conf.local"
+
+    brace_start = m.end()
+    depth, i = 1, brace_start
+    while i < len(content) and depth > 0:
+        if content[i] == '{':
+            depth += 1
+        elif content[i] == '}':
+            depth -= 1
+        i += 1
+    block_end = i  # position after closing '}'
+
+    zone_body = content[brace_start:i - 1]
+    prefix = content[:brace_start]
+    suffix = content[i - 1:]  # includes closing '}'
+
+    # Build new also-notify directive
+    notify_directive = (
+        "    also-notify { " + " ".join(ip + ";" for ip in notify_ips) + " };\n"
+        if notify_ips else ""
+    )
+
+    # Replace existing also-notify or add before closing brace
+    also_notify_re = re.compile(r'[ \t]*also-notify\s*\{[^}]*\}\s*;\n?', re.IGNORECASE)
+    if also_notify_re.search(zone_body):
+        new_body = also_notify_re.sub(notify_directive, zone_body)
+    else:
+        if notify_directive:
+            new_body = zone_body.rstrip('\n') + "\n" + notify_directive
+        else:
+            new_body = zone_body
+
+    new_content = prefix + new_body + suffix
+
+    # Validate with named-checkconf before writing
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False, dir="/tmp") as tf:
+        tf.write(new_content)
+        tmp = tf.name
+    try:
+        _, check_err, check_rc = _run(["sudo", "/usr/bin/named-checkconf", tmp], timeout=10)
+        if check_rc != 0:
+            return False, f"Config validation failed: {check_err.strip()}"
+    finally:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+
+    _write_conf(path, new_content)
+    return True, ""
+
+
 def _dig_soa_serial(zone_name: str, server_ip: str) -> dict:
     """Query @server_ip for zone SOA serial. Returns {ip, serial, ok}."""
     out, err, rc = _run(
@@ -1479,9 +1592,13 @@ class ZoneRecordsBody(BaseModel):
     reload: bool = True
 
 
+class NotifyIpsBody(BaseModel):
+    notify_ips: list[str]
+
+
 @router.get("/bind9/zones/{zone_name}/status")
 async def get_bind9_zone_status(zone_name: str, _: str = Depends(require_super_admin)) -> dict:
-    """Return rndc zonestatus + notify IP sync status for a master zone."""
+    """Return rndc zonestatus + DNSSEC validation + notify IP sync status."""
     status = _rndc_zone_status(zone_name)
     master_serial = None
     if s := status.get("serial"):
@@ -1490,33 +1607,68 @@ async def get_bind9_zone_status(zone_name: str, _: str = Depends(require_super_a
         except ValueError:
             pass
 
-    # Find also_notify IPs from named.conf.local
-    notify_ips: list[str] = []
-    try:
-        local = _read_file_sudo("/etc/bind/named.conf.local")
-        clean = _strip_comments(local, style="c")
-        for zn, body in _bind9_extract_zone_bodies(clean):
-            if zn.lower() == zone_name.lower():
-                for an_m in re.finditer(r'also-notify\s*\{([^}]+)\}', body, re.IGNORECASE):
-                    for tok in an_m.group(1).split():
-                        tok = tok.strip().rstrip(';')
-                        if re.match(r'^[\d.:a-fA-F]+$', tok) and tok:
-                            notify_ips.append(tok)
-                break
-    except Exception:
-        pass
+    # DNSSEC: local config from rndc + external validation check
+    dnssec_local = status.get("secure", "no").lower() == "yes"
+    dnssec_external: dict = {}
+    if dnssec_local:
+        dnssec_external = _dnssec_external_check(zone_name)
+    dnssec = {
+        "local_secure": dnssec_local,
+        "next_resign_time": status.get("next_resign_time"),
+        "next_resign_node": status.get("next_resign_node"),
+        "key_maintenance": status.get("key_maintenance"),
+        "inline_signing": status.get("inline_signing"),
+        **dnssec_external,
+    }
 
+    notify_ips = _get_zone_notify_ips(zone_name)
     notify_status: list[dict] = []
     for ip in notify_ips:
         result = _dig_soa_serial(zone_name, ip)
-        result["in_sync"] = result["serial"] == master_serial if (result["serial"] is not None and master_serial is not None) else None
+        result["in_sync"] = (
+            result["serial"] == master_serial
+            if (result["serial"] is not None and master_serial is not None)
+            else None
+        )
         notify_status.append(result)
 
     return {
         "zone": zone_name,
         "rndc": status,
         "master_serial": master_serial,
+        "dnssec": dnssec,
+        "notify_ips": notify_ips,
         "notify_status": notify_status,
+    }
+
+
+@router.put("/bind9/zones/{zone_name}/notify-ips")
+async def update_bind9_notify_ips(
+    zone_name: str, body: NotifyIpsBody, _: str = Depends(require_super_admin)
+) -> dict:
+    """Add or remove also-notify IPs for a zone in named.conf.local."""
+    # Basic IP validation
+    valid_ips = []
+    for ip in body.notify_ips:
+        ip = ip.strip()
+        if re.match(r'^[\d.:a-fA-F]+$', ip) and ip:
+            valid_ips.append(ip)
+        else:
+            raise HTTPException(422, f"Invalid IP address: '{ip}'")
+
+    ok, err = _set_zone_notify_ips(zone_name, valid_ips)
+    if not ok:
+        raise HTTPException(500, err)
+
+    # Reload BIND to pick up named.conf.local change
+    out, stderr, rc = _run(["sudo", "rndc", "reload"], timeout=15)
+    reloaded = rc == 0
+
+    return {
+        "ok": True,
+        "notify_ips": valid_ips,
+        "reloaded": reloaded,
+        "reload_output": (out + stderr).strip() or "OK",
     }
 
 
