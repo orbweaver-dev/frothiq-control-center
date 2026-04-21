@@ -323,6 +323,21 @@ async def list_ip_entries(session: AsyncSession) -> list[dict[str, Any]]:
     ]
 
 
+def _validate_ip_or_cidr(raw: str) -> str | None:
+    """
+    Validate and normalize an IPv4 address or CIDR range.
+    Returns the normalized string, or None if invalid.
+    Both whitelist and blacklist sets have 'flags interval', so CIDR is supported.
+    """
+    import ipaddress
+    raw = raw.strip()
+    try:
+        net = ipaddress.ip_network(raw, strict=False)
+        return str(net) if net.prefixlen < 32 else str(net.network_address)
+    except ValueError:
+        return None
+
+
 async def add_ip_entry(
     session: AsyncSession,
     ip: str,
@@ -335,9 +350,13 @@ async def add_ip_entry(
     if list_type not in ("whitelist", "blacklist"):
         return {"success": False, "error": "list_type must be whitelist or blacklist"}
 
+    normalized = _validate_ip_or_cidr(ip)
+    if normalized is None:
+        return {"success": False, "error": f"Invalid IP address or CIDR: {ip!r}"}
+
     entry = FrothiqIPEntry(
         id=str(uuid.uuid4()),
-        ip=ip.strip(),
+        ip=normalized,
         label=label.strip(),
         list_type=list_type,
         notes=notes,
@@ -347,8 +366,16 @@ async def add_ip_entry(
     session.add(entry)
     await session.commit()
 
-    await _audit(session, user_email, f"ADD_IP_{list_type.upper()}", "ip_list", f"{ip} — {label}", ip_address)
-    return {"success": True, "id": entry.id}
+    # Apply to live nftables set immediately
+    rc, _, nft_err = await _run(["nft", "add", "element", "inet", "frothiq", list_type, f"{{ {normalized} }}"])
+    if rc != 0:
+        logger.warning("nft add element %s %s failed: %s", list_type, normalized, nft_err.strip())
+
+    await _audit(
+        session, user_email, f"ADD_IP_{list_type.upper()}", "ip_list",
+        f"{normalized} — {label} (nft_rc={rc})", ip_address,
+    )
+    return {"success": True, "id": entry.id, "nft_applied": rc == 0}
 
 
 async def remove_ip_entry(
@@ -362,10 +389,16 @@ async def remove_ip_entry(
         return {"success": False, "error": "Entry not found"}
 
     detail = f"{row.ip} ({row.label}, {row.list_type})"
+
+    # Remove from live nftables set before deleting DB record
+    rc, _, nft_err = await _run(["nft", "delete", "element", "inet", "frothiq", row.list_type, f"{{ {row.ip} }}"])
+    if rc != 0:
+        logger.warning("nft delete element %s %s failed (may not be in set): %s", row.list_type, row.ip, nft_err.strip())
+
     await session.delete(row)
     await session.commit()
-    await _audit(session, user_email, "REMOVE_IP", "ip_list", detail, ip_address)
-    return {"success": True}
+    await _audit(session, user_email, "REMOVE_IP", "ip_list", f"{detail} (nft_rc={rc})", ip_address)
+    return {"success": True, "nft_applied": rc == 0}
 
 
 # ---------------------------------------------------------------------------
