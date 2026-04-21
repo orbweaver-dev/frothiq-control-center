@@ -91,6 +91,12 @@ async def lifespan(app: FastAPI):
         name="predictive_sync_scheduler",
     )
 
+    # Start CIDR consolidation analyzer (runs every 6 hours)
+    cidr_task = asyncio.create_task(
+        _run_cidr_analyzer_loop(),
+        name="cidr_analyzer",
+    )
+
     logger.info(
         "Control Center ready — core: %s | port: %d",
         settings.core_base_url,
@@ -101,12 +107,13 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down FrothIQ Control Center")
+    cidr_task.cancel()
     predictive_task.cancel()
     recon_task.cancel()
     dispatcher_task.cancel()
     try:
         await asyncio.gather(
-            predictive_task, recon_task, dispatcher_task, return_exceptions=True
+            cidr_task, predictive_task, recon_task, dispatcher_task, return_exceptions=True
         )
     except asyncio.CancelledError:
         pass
@@ -115,6 +122,37 @@ async def lifespan(app: FastAPI):
     await dispose_engine()
     await close_redis()
     logger.info("Shutdown complete")
+
+
+async def _run_cidr_analyzer_loop() -> None:
+    """
+    Background loop: scan the live blacklist for CIDR consolidation opportunities.
+    Runs at startup (after a short delay) then every 6 hours.
+    """
+    from frothiq_control_center.integrations.database import get_session_factory as _gsf
+    from frothiq_control_center.services import cidr_analyzer
+
+    # Wait for DB and nft to settle after startup
+    await asyncio.sleep(60)
+
+    interval = 6 * 3600  # 6 hours
+    while True:
+        try:
+            factory = _gsf()
+            async with factory() as session:
+                result = await cidr_analyzer.run_scan(session)
+                if result["new_recommendations"] > 0:
+                    logger.info(
+                        "cidr_analyzer: %d new recommendations (%d analyzed, %.2fs)",
+                        result["new_recommendations"],
+                        result["total_analyzed"],
+                        result["elapsed_seconds"],
+                    )
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error("cidr_analyzer: loop error: %s", exc)
+        await asyncio.sleep(interval)
 
 
 async def _seed_default_flags() -> None:

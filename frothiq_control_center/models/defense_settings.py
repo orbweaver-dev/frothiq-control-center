@@ -7,7 +7,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, Integer, String, Text
+from sqlalchemy import DateTime, Enum, Float, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .user import Base
@@ -72,3 +72,33 @@ class FrothiqNftAudit(Base):
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+
+
+class FrothiqCidrRecommendation(Base):
+    """
+    A CIDR consolidation recommendation produced by the background analyzer.
+
+    Each row represents one suggested CIDR block that could replace multiple
+    individual IP entries in the blacklist.  Status transitions:
+      pending  → applied   (operator accepted and nft applied)
+      pending  → dismissed (operator rejected)
+    """
+
+    __tablename__ = "frothiq_cidr_recommendations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    scan_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    cidr: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    prefix_len: Mapped[int] = mapped_column(Integer, nullable=False)
+    covered_ips: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    covered_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_in_subnet: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    density_pct: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    entries_saved: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(
+        Enum("pending", "applied", "dismissed", name="cidr_rec_status"),
+        nullable=False, default="pending", index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)

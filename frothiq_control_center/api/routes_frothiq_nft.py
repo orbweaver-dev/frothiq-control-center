@@ -248,3 +248,81 @@ async def update_alert_settings(
     session: AsyncSession = Depends(_db),
 ):
     return await svc.update_category_settings(session, "alerts", body, svc.ALERT_DEFAULTS.keys(), token.email, _ip(request))
+
+
+# ---------------------------------------------------------------------------
+# CIDR Consolidation Analysis
+# ---------------------------------------------------------------------------
+
+@router.get("/cidr-analysis")
+async def list_cidr_recommendations(
+    status: str | None = Query(None, description="Filter by status: pending, applied, dismissed"),
+    _: TokenPayload = Depends(require_super_admin),
+    session: AsyncSession = Depends(_db),
+):
+    """
+    List CIDR consolidation recommendations produced by background scans.
+
+    Each recommendation represents a CIDR range that could replace multiple
+    individual IP blacklist entries, reducing list size and improving coverage.
+    """
+    from frothiq_control_center.services import cidr_analyzer
+    recs = await cidr_analyzer.list_recommendations(session, status)
+
+    pending = [r for r in recs if r["status"] == "pending"]
+    total_savings = sum(r["entries_saved"] for r in pending)
+    return {
+        "recommendations": recs,
+        "count": len(recs),
+        "pending_count": len(pending),
+        "potential_entries_saved": total_savings,
+    }
+
+
+@router.post("/cidr-analysis/scan")
+async def trigger_cidr_scan(
+    token: TokenPayload = Depends(require_super_admin),
+    session: AsyncSession = Depends(_db),
+):
+    """
+    Trigger an immediate CIDR consolidation scan of the live blacklist.
+    Results are persisted as recommendations for operator review.
+    """
+    from frothiq_control_center.services import cidr_analyzer
+    result = await cidr_analyzer.run_scan(session)
+    return result
+
+
+@router.post("/cidr-analysis/{rec_id}/apply")
+async def apply_cidr_recommendation(
+    rec_id: str,
+    request: Request,
+    token: TokenPayload = Depends(require_super_admin),
+    session: AsyncSession = Depends(_db),
+):
+    """
+    Apply a pending CIDR recommendation:
+    - Adds the CIDR to the live nftables blacklist
+    - Removes individual IPs now covered by the CIDR from nftables
+    - Removes covered IPs from the frothiq_ip_list DB table
+    """
+    from frothiq_control_center.services import cidr_analyzer
+    result = await cidr_analyzer.apply_recommendation(session, rec_id, token.email)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error"))
+    return result
+
+
+@router.post("/cidr-analysis/{rec_id}/dismiss")
+async def dismiss_cidr_recommendation(
+    rec_id: str,
+    request: Request,
+    token: TokenPayload = Depends(require_super_admin),
+    session: AsyncSession = Depends(_db),
+):
+    """Dismiss a pending CIDR recommendation without applying it."""
+    from frothiq_control_center.services import cidr_analyzer
+    result = await cidr_analyzer.dismiss_recommendation(session, rec_id, token.email)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error"))
+    return result
