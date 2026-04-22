@@ -81,9 +81,15 @@ async def log_action(
     # Write to Redis stream (for real-time WebSocket broadcast)
     if redis is not None:
         try:
+            def _serialize(v: Any) -> str:
+                if isinstance(v, str):
+                    return v
+                if hasattr(v, "isoformat"):
+                    return v.isoformat()
+                return json.dumps(v)
             await redis.xadd(
                 _AUDIT_STREAM_KEY,
-                {k: json.dumps(v) if not isinstance(v, str) else v for k, v in entry.items() if v is not None},
+                {k: _serialize(v) for k, v in entry.items() if v is not None},
                 maxlen=_AUDIT_STREAM_MAX_LEN,
                 approximate=True,
             )
