@@ -193,7 +193,7 @@ async def get_blocklist(
         params: dict[str, Any] = {"min_score": score_threshold, "limit": 500}
         if since:
             params["since"] = since
-        data = await core_client.get("/api/v1/threats/feed", params=params, ttl=600)
+        data = await core_client.get("/api/v1/threats/feed", params=params)
         if isinstance(data, list):
             core_ips = [str(e["ip"]) for e in data if e.get("ip")]
         elif isinstance(data, dict):
@@ -655,7 +655,9 @@ def _node_to_dict(n: EdgeNode) -> dict[str, Any]:
         "plugin_version": n.plugin_version,
         "state": n.state,
         "plan": n.plan,
+        "protection_mode": getattr(n, "protection_mode", None),
         "registered_at": n.registered_at.isoformat() if n.registered_at else None,
+        "last_seen": n.last_seen_at.isoformat() if n.last_seen_at else None,
         "last_seen_at": n.last_seen_at.isoformat() if n.last_seen_at else None,
         "registration_count": n.registration_count,
     }
@@ -668,5 +670,7 @@ def _tenant_to_dict(t: EdgeTenant) -> dict[str, Any]:
         "domain": t.domain,
         "plan": t.plan,
         "is_active": t.is_active,
+        "registration_state": getattr(t, "registration_state", "active"),
+        "contact_email": getattr(t, "contact_email", None),
         "created_at": t.created_at.isoformat() if t.created_at else None,
     }
