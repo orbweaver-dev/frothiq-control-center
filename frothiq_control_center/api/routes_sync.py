@@ -246,6 +246,7 @@ def _edge_tenant_to_license(t: dict) -> dict:
             pass
     return {
         "tenant_id":        t.get("tenant_id"),
+        "domain":           t.get("domain"),
         "license_valid":    license_valid,
         "license_status":   license_status,
         "effective_plan":   t.get("plan", "free"),
