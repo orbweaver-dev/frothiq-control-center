@@ -15,6 +15,7 @@ from .policy_service import (
     rollback_policy,
 )
 from .license_service import (
+    deregister_license,
     force_sync,
     get_all_license_states,
     get_sync_health,
@@ -59,7 +60,7 @@ __all__ = [
     "get_propagation_graph", "get_suggested_actions",
     "get_active_policies", "get_distribution_status", "get_policy_detail", "get_policy_mesh_overview",
     "get_policy_version_history", "rollback_policy",
-    "force_sync", "get_all_license_states", "get_sync_health",
+    "deregister_license", "force_sync", "get_all_license_states", "get_sync_health",
     "get_tenant_license", "restore_license", "revoke_license",
     "get_envelope_diff", "get_envelope_history", "get_tenant_envelope", "verify_all_envelopes",
     "get_monetization_overview", "get_paywall_analytics",

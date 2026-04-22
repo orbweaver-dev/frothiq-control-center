@@ -54,6 +54,7 @@ class EdgeRegisterRequest(BaseModel):
     edge_id: str = Field(..., min_length=8, max_length=128, description="Unique edge node identifier")
     plugin_version: str = Field(..., max_length=32)
     platform: str = Field(..., max_length=64, description="wordpress|frappe|joomla|custom")
+    contact_email: str | None = Field(None, max_length=254, description="Admin email — required when re-registering a deregistered domain")
 
     @field_validator("platform")
     @classmethod
@@ -121,6 +122,7 @@ async def register_edge(body: EdgeRegisterRequest, request: Request) -> dict[str
         edge_id=body.edge_id,
         plugin_version=body.plugin_version,
         platform=body.platform,
+        contact_email=body.contact_email,
     )
     return {
         "ok": True,

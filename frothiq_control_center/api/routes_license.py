@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from frothiq_control_center.auth import TokenPayload, require_read_only, require_super_admin
 from frothiq_control_center.services import (
+    deregister_license,
     force_sync,
     get_all_license_states,
     get_sync_health,
@@ -115,6 +116,45 @@ async def restore_tenant_license(
 
     if not result.get("success"):
         raise HTTPException(status_code=502, detail=result.get("error", "Restore failed"))
+
+    return result
+
+
+@router.post("/{tenant_id}/deregister")
+async def deregister_tenant_license(
+    tenant_id: str,
+    request: Request,
+    current_user: TokenPayload = Depends(require_super_admin),
+):
+    """
+    Deregister a tenant — archives current state and allows future re-registration.
+
+    Unlike revoke, deregistration does NOT permanently block the domain.
+    The site may re-register by supplying a contact_email that matches
+    the archived record. On match, plan and settings are restored (resync).
+
+    Requires super_admin. Fully audited.
+    """
+    db = request.state.db
+    redis = request.state.redis
+    client_ip = request.client.host if request.client else None
+
+    result = await deregister_license(tenant_id, current_user.sub)
+
+    await log_action(
+        action="license.deregister",
+        user_id=current_user.sub,
+        user_email=current_user.sub,
+        resource=tenant_id,
+        detail="Tenant deregistered — data archived, re-registration allowed with email match",
+        ip_address=client_ip,
+        status="success" if result.get("success") else "failure",
+        db=db,
+        redis=redis,
+    )
+
+    if not result.get("success"):
+        raise HTTPException(status_code=502, detail=result.get("error", "Deregistration failed"))
 
     return result
 

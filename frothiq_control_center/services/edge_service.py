@@ -25,6 +25,8 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from fastapi import HTTPException
+
 from frothiq_control_center.config import get_settings
 from frothiq_control_center.integrations.database import get_session_factory
 from frothiq_control_center.models.edge import EdgeNode, EdgeTenant, FeatureFlag, ThreatReport
@@ -40,6 +42,7 @@ async def register_edge_node(
     edge_id: str,
     plugin_version: str,
     platform: str,
+    contact_email: str | None = None,
 ) -> dict[str, Any]:
     """
     Idempotent: safe to call multiple times (e.g. on every plugin boot).
@@ -47,7 +50,9 @@ async def register_edge_node(
     """
     factory = get_session_factory()
     async with factory() as session:
-        tenant = await _get_or_create_tenant(session, domain)
+        tenant = await _get_or_create_tenant(
+            session, domain, contact_email=contact_email
+        )
         node = await _upsert_node(session, tenant, edge_id, plugin_version, platform)
         await session.commit()
 
@@ -431,20 +436,91 @@ async def get_registration_stats() -> dict[str, Any]:
 # Internal helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _get_or_create_tenant(session: AsyncSession, domain: str) -> EdgeTenant:
+async def _get_or_create_tenant(
+    session: AsyncSession,
+    domain: str,
+    contact_email: str | None = None,
+) -> EdgeTenant:
     result = await session.execute(
         select(EdgeTenant).where(EdgeTenant.domain == domain)
     )
     tenant = result.scalar_one_or_none()
-    if tenant is None:
-        tenant = EdgeTenant(
-            id=str(uuid.uuid4()),
-            domain=domain,
-            tenant_id=str(uuid.uuid4()),
-            plan="free",
-        )
-        session.add(tenant)
-        logger.info("edge_service: new tenant created for domain=%s", domain)
+
+    if tenant is not None:
+        # --- Gate: revoked domains may never re-register ---
+        if tenant.registration_state == "revoked":
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "domain_revoked",
+                    "message": (
+                        "This domain has been permanently revoked. "
+                        "Contact support if you believe this is an error."
+                    ),
+                },
+            )
+
+        # --- Gate: deregistered domains require email verification ---
+        if tenant.registration_state == "deregistered":
+            if not contact_email:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "email_required",
+                        "message": (
+                            "This domain was previously deregistered. "
+                            "Provide the original contact email to restore your data."
+                        ),
+                        "archived": True,
+                    },
+                )
+            if tenant.contact_email and tenant.contact_email.lower() != contact_email.lower():
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "email_mismatch",
+                        "message": "Email does not match the archived registration record.",
+                    },
+                )
+
+            # Email matched — restore archived data and reactive tenant
+            archived = {}
+            if tenant.archived_data:
+                try:
+                    archived = json.loads(tenant.archived_data)
+                except Exception:
+                    pass
+
+            tenant.registration_state = "active"
+            tenant.is_active = True
+            tenant.deregistered_at = None
+            tenant.archived_data = None
+            if archived.get("plan"):
+                tenant.plan = archived["plan"]
+            if archived.get("notes"):
+                tenant.notes = archived["notes"]
+
+            logger.info(
+                "edge_service: deregistered tenant RESTORED for domain=%s via email match", domain
+            )
+        else:
+            # Active tenant — update contact_email if newly provided
+            if contact_email and not tenant.contact_email:
+                tenant.contact_email = contact_email
+
+        return tenant
+
+    # New tenant
+    tenant = EdgeTenant(
+        id=str(uuid.uuid4()),
+        domain=domain,
+        tenant_id=str(uuid.uuid4()),
+        plan="free",
+        registration_state="active",
+        contact_email=contact_email,
+    )
+    session.add(tenant)
+    logger.info("edge_service: new tenant created for domain=%s", domain)
     return tenant
 
 

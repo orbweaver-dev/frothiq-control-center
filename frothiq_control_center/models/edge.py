@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import Boolean, DateTime, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
+import json as _json
 
 from .user import Base, _utcnow
 
@@ -38,6 +39,14 @@ class EdgeTenant(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Registration gate: 'active' | 'revoked' | 'deregistered'
+    # revoked      — domain permanently blocked from re-registering
+    # deregistered — archived; re-registration allowed with matching contact_email
+    registration_state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    contact_email: Mapped[str | None] = mapped_column(String(254), nullable=True)
+    deregistered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # JSON snapshot of plan/notes/flags at deregistration time, used on re-registration resync
+    archived_data: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class EdgeNode(Base):

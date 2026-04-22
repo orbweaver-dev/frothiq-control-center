@@ -8,6 +8,7 @@ only contains plan templates, not individual site registrations.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -94,16 +95,18 @@ async def get_all_license_states() -> dict[str, Any]:
             summary[status] += 1
 
         summary["tenants"].append({
-            "tenant_id":   t.tenant_id,
-            "domain":      t.domain,
-            "plan":        t.plan,
-            "status":      status,
-            "max_sites":   _MAX_SITES_BY_PLAN.get(t.plan, 1),
-            "active_sites": len(active_nodes),
-            "last_sync":   last_sync.isoformat() if last_sync else None,
-            "sync_healthy": sync_healthy,
-            "platform":    nodes[0].platform if nodes else None,
-            "plugin_version": nodes[0].plugin_version if nodes else None,
+            "tenant_id":          t.tenant_id,
+            "domain":             t.domain,
+            "plan":               t.plan,
+            "status":             status,
+            "registration_state": getattr(t, "registration_state", "active"),
+            "max_sites":          _MAX_SITES_BY_PLAN.get(t.plan, 1),
+            "active_sites":       len(active_nodes),
+            "last_sync":          last_sync.isoformat() if last_sync else None,
+            "sync_healthy":       sync_healthy,
+            "platform":           nodes[0].platform if nodes else None,
+            "plugin_version":     nodes[0].plugin_version if nodes else None,
+            "deregistered_at":    t.deregistered_at.isoformat() if t.deregistered_at else None,
         })
 
     return {"success": True, "source": "edge_db", **summary}
@@ -186,8 +189,8 @@ async def get_tenant_license(tenant_id: str) -> dict[str, Any]:
 
 async def revoke_license(tenant_id: str, reason: str, admin_user: str) -> dict[str, Any]:
     """
-    Revoke a tenant's license — sets is_active=False on the tenant and
-    REVOKED on all its edge nodes.
+    Revoke a tenant's license — permanently blocks re-registration for this domain.
+    Sets is_active=False, registration_state='revoked', nodes→REVOKED.
     """
     factory = get_session_factory()
     async with factory() as session:
@@ -199,6 +202,7 @@ async def revoke_license(tenant_id: str, reason: str, admin_user: str) -> dict[s
             return {"success": False, "error": f"Tenant {tenant_id} not found"}
 
         tenant.is_active = False
+        tenant.registration_state = "revoked"
         await session.execute(
             update(EdgeNode)
             .where(EdgeNode.tenant_id == tenant_id)
@@ -213,6 +217,55 @@ async def revoke_license(tenant_id: str, reason: str, admin_user: str) -> dict[s
     return {"success": True, "tenant_id": tenant_id, "status": "suspended"}
 
 
+async def deregister_license(tenant_id: str, admin_user: str) -> dict[str, Any]:
+    """
+    Deregister a tenant — archives data and allows future re-registration.
+
+    Unlike revoke, deregistration does NOT permanently block the domain.
+    The site can re-register by providing the matching contact_email.
+    On email match, archived plan/notes are restored (resync).
+    """
+    factory = get_session_factory()
+    async with factory() as session:
+        tenant_result = await session.execute(
+            select(EdgeTenant).where(EdgeTenant.tenant_id == tenant_id)
+        )
+        tenant = tenant_result.scalar_one_or_none()
+        if tenant is None:
+            return {"success": False, "error": f"Tenant {tenant_id} not found"}
+
+        # Archive current state before deregistering
+        archive = {
+            "plan":    tenant.plan,
+            "notes":   tenant.notes,
+            "is_active": tenant.is_active,
+            "archived_at": datetime.now(UTC).isoformat(),
+        }
+        tenant.registration_state = "deregistered"
+        tenant.is_active = False
+        tenant.deregistered_at = datetime.now(UTC).replace(tzinfo=None)
+        tenant.archived_data = json.dumps(archive)
+
+        await session.execute(
+            update(EdgeNode)
+            .where(EdgeNode.tenant_id == tenant_id)
+            .values(state="DEREGISTERED")
+        )
+        await session.commit()
+
+    logger.info(
+        "Tenant DEREGISTERED: %s (domain=%s) by admin %s — data archived, re-registration allowed with email match",
+        tenant_id, tenant.domain, admin_user,
+    )
+    return {
+        "success": True,
+        "tenant_id": tenant_id,
+        "domain": tenant.domain,
+        "status": "deregistered",
+        "contact_email_required": bool(tenant.contact_email),
+    }
+
+
 async def restore_license(tenant_id: str, admin_user: str) -> dict[str, Any]:
     """Restore a revoked tenant — sets is_active=True and ACTIVE on all nodes."""
     factory = get_session_factory()
@@ -225,6 +278,7 @@ async def restore_license(tenant_id: str, admin_user: str) -> dict[str, Any]:
             return {"success": False, "error": f"Tenant {tenant_id} not found"}
 
         tenant.is_active = True
+        tenant.registration_state = "active"
         await session.execute(
             update(EdgeNode)
             .where(EdgeNode.tenant_id == tenant_id)
