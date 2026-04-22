@@ -71,6 +71,8 @@ class EdgeNode(Base):
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     registration_count: Mapped[int] = mapped_column(Integer, default=1)
+    # Protection mode reported by the plugin on each heartbeat: monitor | protect | block
+    protection_mode: Mapped[str | None] = mapped_column(String(32), nullable=True, default="monitor")
 
 
 class FeatureFlag(Base):

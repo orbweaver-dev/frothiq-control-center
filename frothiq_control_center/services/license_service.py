@@ -94,6 +94,15 @@ async def get_all_license_states() -> dict[str, Any]:
         if status in summary:
             summary[status] += 1
 
+        # Derive protection mode — use worst (most restrictive) mode across active nodes
+        mode_rank = {"monitor": 0, "protect": 1, "block": 2}
+        active_modes = [
+            n.protection_mode for n in active_nodes
+            if getattr(n, "protection_mode", None)
+        ]
+        protection_mode = max(active_modes, key=lambda m: mode_rank.get(m, 0), default=None) \
+            if active_modes else (getattr(nodes[0], "protection_mode", None) if nodes else None)
+
         summary["tenants"].append({
             "tenant_id":          t.tenant_id,
             "domain":             t.domain,
@@ -106,6 +115,7 @@ async def get_all_license_states() -> dict[str, Any]:
             "sync_healthy":       sync_healthy,
             "platform":           nodes[0].platform if nodes else None,
             "plugin_version":     nodes[0].plugin_version if nodes else None,
+            "protection_mode":    protection_mode,
             "deregistered_at":    t.deregistered_at.isoformat() if t.deregistered_at else None,
         })
 

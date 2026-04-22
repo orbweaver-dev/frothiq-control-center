@@ -91,12 +91,13 @@ class EdgeDeregisterRequest(BaseModel):
 
 
 class EdgeHeartbeatRequest(BaseModel):
-    edge_id:       str = Field(..., min_length=8, max_length=128)
-    tenant_id:     str = Field(..., min_length=8, max_length=36)
-    license_token: str = Field(..., min_length=10)
-    requests_1m:   int = Field(0, ge=0)
-    blocks_1m:     int = Field(0, ge=0)
-    errors_1m:     int = Field(0, ge=0)
+    edge_id:         str      = Field(..., min_length=8, max_length=128)
+    tenant_id:       str      = Field(..., min_length=8, max_length=36)
+    license_token:   str      = Field(..., min_length=10)
+    requests_1m:     int      = Field(0, ge=0)
+    blocks_1m:       int      = Field(0, ge=0)
+    errors_1m:       int      = Field(0, ge=0)
+    protection_mode: str | None = Field(None, description="monitor|protect|block")
 
 
 @public_router.post("/register")
@@ -185,6 +186,7 @@ async def edge_heartbeat(body: EdgeHeartbeatRequest) -> dict[str, Any]:
         requests_1m=body.requests_1m,
         blocks_1m=body.blocks_1m,
         errors_1m=body.errors_1m,
+        protection_mode=body.protection_mode,
     )
     if not result:
         raise HTTPException(status_code=404, detail="Edge node not found")
