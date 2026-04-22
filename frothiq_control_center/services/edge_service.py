@@ -13,6 +13,7 @@ All new tenants receive plan="free" and PLAN_ENFORCEMENT_ENABLED is respected.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -304,6 +305,11 @@ async def report_edge_event(
         "threat_report: ip=%s tenants=%d score=%d event=%s edge=%s",
         ip, distinct_tenants, row.threat_score, event_type, edge_id[:16],
     )
+
+    # Forward to frothiq-core intelligence pipeline (fire-and-forget).
+    # This seeds the campaign correlator so Defense Mesh shows real data.
+    asyncio.create_task(_forward_threat_to_core(ip, event_type, severity))
+
     return {
         "ip": ip,
         "threat_score": row.threat_score,
@@ -674,3 +680,15 @@ def _tenant_to_dict(t: EdgeTenant) -> dict[str, Any]:
         "contact_email": getattr(t, "contact_email", None),
         "created_at": t.created_at.isoformat() if t.created_at else None,
     }
+
+
+async def _forward_threat_to_core(ip: str, event_type: str, severity: str) -> None:
+    """Fire-and-forget: push edge threat event into frothiq-core's campaign correlator."""
+    try:
+        from frothiq_control_center.services.core_client import core_client
+        await core_client.post(
+            "/api/v2/internal/ingest-threat",
+            body={"ip": ip, "severity": severity, "event_type": event_type, "attack_vectors": []},
+        )
+    except Exception as exc:
+        logger.debug("_forward_threat_to_core: %s ip=%s: %s", event_type, ip, exc)
