@@ -1,148 +1,251 @@
 """
 License Authority service — tenant license state, revocation, sync health.
 
-The Control Center is the operator authority for license management.
-It communicates with frothiq-core to sync license state and can initiate
-revocations that propagate to all edge plugins.
-
-BOUNDARY CONTRACT: All status derivation and sync health evaluation
-is delegated to frothiq-core. This service is a pass-through proxy only.
+Data source: CC's own edge_tenants + edge_nodes tables (MariaDB).
+frothiq-core is NOT the source of truth for license state — that registry
+only contains plan templates, not individual site registrations.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .core_client import CoreClientError, core_client
+from sqlalchemy import func, select, update
+
+from frothiq_control_center.integrations.database import get_session_factory
+from frothiq_control_center.models.edge import EdgeNode, EdgeTenant
 
 logger = logging.getLogger(__name__)
+
+_ACTIVE_STATES = {"REGISTERED", "ACTIVE", "SYNCED"}
+_SYNC_HEALTHY_WINDOW = timedelta(minutes=15)
+_MAX_SITES_BY_PLAN: dict[str, int] = {
+    "free": 1,
+    "pro": 5,
+    "business": 25,
+    "enterprise": 1000,
+}
+
+
+def _state_to_status(is_active: bool, state: str) -> str:
+    if not is_active:
+        return "suspended"
+    if state == "REVOKED":
+        return "suspended"
+    if state == "REMOVED":
+        return "expired"
+    return "active"
 
 
 async def get_all_license_states() -> dict[str, Any]:
     """
-    Fetch license states for all tenants from frothiq-core.
-
-    frothiq-core is the source of truth; we pass its response through
-    without any local status derivation or validation logic.
+    Return license overview derived from edge_tenants + edge_nodes.
+    One row per tenant; aggregates node count and sync health per tenant.
     """
-    try:
-        data = await core_client.get("/api/v2/internal/registry")
-        tenants = data.get("tenants", [])
+    factory = get_session_factory()
+    async with factory() as session:
+        tenants_result = await session.execute(
+            select(EdgeTenant).order_by(EdgeTenant.created_at.desc())
+        )
+        tenants = tenants_result.scalars().all()
 
-        # Aggregate counts from core-provided status fields — no local derivation
-        summary: dict[str, Any] = {
-            "total": len(tenants),
-            "active": 0,
-            "suspended": 0,
-            "expired": 0,
-            "trial": 0,
-            "tenants": [],
-        }
+        nodes_result = await session.execute(select(EdgeNode))
+        all_nodes = nodes_result.scalars().all()
 
-        for t in tenants:
-            # Trust the `status` field from core; never derive it here
-            status = t.get("license_status") or t.get("status", "active")
-            if status in summary:
-                summary[status] += 1
+    # Group nodes by tenant_id
+    nodes_by_tenant: dict[str, list[EdgeNode]] = {}
+    for node in all_nodes:
+        nodes_by_tenant.setdefault(node.tenant_id, []).append(node)
 
-            summary["tenants"].append({
-                "tenant_id": t.get("tenant_id"),
-                "plan": t.get("plan", "free"),
-                "status": status,
-                "max_sites": t.get("max_sites", 1),
-                "active_sites": t.get("active_sites", 0),
-                "last_sync": t.get("last_sync"),
-                # core provides sync_healthy; never compute it here
-                "sync_healthy": t.get("sync_healthy", False),
-            })
+    now = datetime.now(UTC)
+    summary: dict[str, Any] = {
+        "total": len(tenants),
+        "active": 0,
+        "suspended": 0,
+        "expired": 0,
+        "tenants": [],
+    }
 
-        return {
-            "success": True,
-            "source": "frothiq-core",
-            **summary,
-        }
+    for t in tenants:
+        nodes = nodes_by_tenant.get(t.tenant_id, [])
+        active_nodes = [n for n in nodes if n.state in _ACTIVE_STATES]
 
-    except CoreClientError as exc:
-        logger.error("License state fetch failed: %s", exc.detail)
-        return {"success": False, "total": 0, "tenants": [], "error": exc.detail}
+        # Derive last sync from most recent node activity
+        last_sync_candidates = [
+            n.last_sync_at or n.last_seen_at for n in nodes if n.last_sync_at or n.last_seen_at
+        ]
+        last_sync = max(last_sync_candidates) if last_sync_candidates else None
+
+        # Sync health: any node SYNCED and seen within the health window
+        sync_healthy = any(
+            n.state == "SYNCED"
+            and n.last_seen_at is not None
+            and (now - n.last_seen_at.replace(tzinfo=UTC)) < _SYNC_HEALTHY_WINDOW
+            for n in nodes
+        )
+
+        # Derive status from tenant active flag + highest-priority node state
+        dominant_state = nodes[0].state if nodes else "REGISTERED"
+        status = _state_to_status(t.is_active, dominant_state)
+
+        if status in summary:
+            summary[status] += 1
+
+        summary["tenants"].append({
+            "tenant_id":   t.tenant_id,
+            "domain":      t.domain,
+            "plan":        t.plan,
+            "status":      status,
+            "max_sites":   _MAX_SITES_BY_PLAN.get(t.plan, 1),
+            "active_sites": len(active_nodes),
+            "last_sync":   last_sync.isoformat() if last_sync else None,
+            "sync_healthy": sync_healthy,
+            "platform":    nodes[0].platform if nodes else None,
+            "plugin_version": nodes[0].plugin_version if nodes else None,
+        })
+
+    return {"success": True, "source": "edge_db", **summary}
+
+
+async def get_sync_health() -> dict[str, Any]:
+    """Aggregate sync health across all tenants from edge_nodes data."""
+    data = await get_all_license_states()
+    tenants = data.get("tenants", [])
+    healthy = sum(1 for t in tenants if t.get("sync_healthy"))
+    degraded = len(tenants) - healthy
+    return {
+        "total": len(tenants),
+        "sync_healthy": healthy,
+        "sync_degraded": degraded,
+        "health_pct": round((healthy / max(len(tenants), 1)) * 100, 1),
+        "source": "edge_db",
+    }
 
 
 async def get_tenant_license(tenant_id: str) -> dict[str, Any]:
-    """Fetch license state for a specific tenant from frothiq-core."""
-    try:
-        return await core_client.get(f"/api/v2/internal/tenant/{tenant_id}")
-    except CoreClientError as exc:
-        logger.error("Tenant license fetch failed for %s: %s", tenant_id, exc.detail)
-        raise
+    """Fetch license state for a specific tenant from the CC database."""
+    factory = get_session_factory()
+    async with factory() as session:
+        tenant_result = await session.execute(
+            select(EdgeTenant).where(EdgeTenant.tenant_id == tenant_id)
+        )
+        tenant = tenant_result.scalar_one_or_none()
+        if tenant is None:
+            from frothiq_control_center.services.core_client import CoreClientError
+            raise CoreClientError(404, f"Tenant {tenant_id} not found")
+
+        nodes_result = await session.execute(
+            select(EdgeNode).where(EdgeNode.tenant_id == tenant_id)
+        )
+        nodes = nodes_result.scalars().all()
+
+    now = datetime.now(UTC)
+    active_nodes = [n for n in nodes if n.state in _ACTIVE_STATES]
+    dominant_state = nodes[0].state if nodes else "REGISTERED"
+    status = _state_to_status(tenant.is_active, dominant_state)
+
+    sync_healthy = any(
+        n.state == "SYNCED"
+        and n.last_seen_at is not None
+        and (now - n.last_seen_at.replace(tzinfo=UTC)) < _SYNC_HEALTHY_WINDOW
+        for n in nodes
+    )
+
+    last_sync_candidates = [
+        n.last_sync_at or n.last_seen_at for n in nodes if n.last_sync_at or n.last_seen_at
+    ]
+    last_sync = max(last_sync_candidates) if last_sync_candidates else None
+
+    return {
+        "tenant_id":      tenant.tenant_id,
+        "domain":         tenant.domain,
+        "plan":           tenant.plan,
+        "status":         status,
+        "is_active":      tenant.is_active,
+        "max_sites":      _MAX_SITES_BY_PLAN.get(tenant.plan, 1),
+        "active_sites":   len(active_nodes),
+        "last_sync":      last_sync.isoformat() if last_sync else None,
+        "sync_healthy":   sync_healthy,
+        "nodes":          [
+            {
+                "edge_id":        n.edge_id,
+                "domain":         n.domain,
+                "platform":       n.platform,
+                "plugin_version": n.plugin_version,
+                "state":          n.state,
+                "registered_at":  n.registered_at.isoformat() if n.registered_at else None,
+                "last_seen_at":   n.last_seen_at.isoformat() if n.last_seen_at else None,
+            }
+            for n in nodes
+        ],
+        "created_at": tenant.created_at.isoformat() if tenant.created_at else None,
+    }
 
 
 async def revoke_license(tenant_id: str, reason: str, admin_user: str) -> dict[str, Any]:
     """
-    Revoke a tenant's license via frothiq-core.
-    Critical action — requires super_admin role (enforced at route level).
+    Revoke a tenant's license — sets is_active=False on the tenant and
+    REVOKED on all its edge nodes.
     """
-    try:
-        result = await core_client.post(
-            f"/api/v2/internal/tenant/{tenant_id}/revoke",
-            body={
-                "reason": reason,
-                "revoked_by": admin_user,
-                "revoked_at": datetime.now(UTC).isoformat(),
-            },
+    factory = get_session_factory()
+    async with factory() as session:
+        tenant_result = await session.execute(
+            select(EdgeTenant).where(EdgeTenant.tenant_id == tenant_id)
         )
-        logger.warning(
-            "License REVOKED for tenant %s by admin %s — reason: %s",
-            tenant_id, admin_user, reason,
+        tenant = tenant_result.scalar_one_or_none()
+        if tenant is None:
+            return {"success": False, "error": f"Tenant {tenant_id} not found"}
+
+        tenant.is_active = False
+        await session.execute(
+            update(EdgeNode)
+            .where(EdgeNode.tenant_id == tenant_id)
+            .values(state="REVOKED")
         )
-        return {"success": True, "tenant_id": tenant_id, **result}
-    except CoreClientError as exc:
-        logger.error("License revocation failed for %s: %s", tenant_id, exc.detail)
-        return {"success": False, "tenant_id": tenant_id, "error": exc.detail}
+        await session.commit()
+
+    logger.warning(
+        "License REVOKED for tenant %s (domain=%s) by admin %s — reason: %s",
+        tenant_id, tenant.domain, admin_user, reason,
+    )
+    return {"success": True, "tenant_id": tenant_id, "status": "suspended"}
 
 
 async def restore_license(tenant_id: str, admin_user: str) -> dict[str, Any]:
-    """Restore a previously revoked license via frothiq-core."""
-    try:
-        result = await core_client.post(
-            f"/api/v2/internal/tenant/{tenant_id}/restore",
-            body={"restored_by": admin_user, "restored_at": datetime.now(UTC).isoformat()},
+    """Restore a revoked tenant — sets is_active=True and ACTIVE on all nodes."""
+    factory = get_session_factory()
+    async with factory() as session:
+        tenant_result = await session.execute(
+            select(EdgeTenant).where(EdgeTenant.tenant_id == tenant_id)
         )
-        logger.info("License restored for tenant %s by admin %s", tenant_id, admin_user)
-        return {"success": True, "tenant_id": tenant_id, **result}
-    except CoreClientError as exc:
-        logger.error("License restore failed for %s: %s", tenant_id, exc.detail)
-        return {"success": False, "tenant_id": tenant_id, "error": exc.detail}
+        tenant = tenant_result.scalar_one_or_none()
+        if tenant is None:
+            return {"success": False, "error": f"Tenant {tenant_id} not found"}
+
+        tenant.is_active = True
+        await session.execute(
+            update(EdgeNode)
+            .where(EdgeNode.tenant_id == tenant_id)
+            .values(state="ACTIVE")
+        )
+        await session.commit()
+
+    logger.info("License restored for tenant %s (domain=%s) by admin %s", tenant_id, tenant.domain, admin_user)
+    return {"success": True, "tenant_id": tenant_id, "status": "active"}
 
 
 async def force_sync(tenant_id: str) -> dict[str, Any]:
-    """Force an immediate license sync for a tenant via frothiq-core."""
-    try:
-        return await core_client.post(f"/api/v2/internal/tenant/{tenant_id}/sync")
-    except CoreClientError as exc:
-        return {"success": False, "error": exc.detail}
+    """Mark a tenant's nodes as pending re-sync by resetting to ACTIVE state."""
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(
+            update(EdgeNode)
+            .where(EdgeNode.tenant_id == tenant_id, EdgeNode.state == "SYNCED")
+            .values(state="ACTIVE")
+        )
+        await session.commit()
+        affected = result.rowcount
 
-
-async def get_sync_health() -> dict[str, Any]:
-    """
-    Fetch sync health summary from frothiq-core.
-
-    Prefers core's /api/v2/internal/sync-health endpoint.
-    Falls back to aggregating tenant sync_healthy fields (still from core).
-    """
-    try:
-        return await core_client.get("/api/v2/internal/sync-health")
-    except CoreClientError:
-        # Fallback: derive from tenant list (core-provided sync_healthy field)
-        data = await get_all_license_states()
-        tenants = data.get("tenants", [])
-        healthy = sum(1 for t in tenants if t.get("sync_healthy"))
-        degraded = len(tenants) - healthy
-        return {
-            "total": len(tenants),
-            "sync_healthy": healthy,
-            "sync_degraded": degraded,
-            "health_pct": round((healthy / max(len(tenants), 1)) * 100, 1),
-            "source": "frothiq-core",
-        }
+    return {"success": True, "tenant_id": tenant_id, "nodes_reset": affected}
