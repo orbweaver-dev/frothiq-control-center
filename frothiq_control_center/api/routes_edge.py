@@ -125,6 +125,7 @@ async def register_edge(body: EdgeRegisterRequest, request: Request) -> dict[str
     return {
         "ok": True,
         "tenant_id": result["tenant_id"],
+        "domain": result.get("domain", body.domain),
         "license_token": result["license_token"],
         "plan": result["plan"],
         "edge_id": result["edge_id"],

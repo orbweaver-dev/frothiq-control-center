@@ -72,6 +72,7 @@ async def register_edge_node(
 
     return {
         "tenant_id": tenant.tenant_id,
+        "domain": tenant.domain,
         "license_token": license_token,
         "plan": tenant.plan,
         "edge_id": edge_id,
