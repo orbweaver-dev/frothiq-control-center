@@ -50,6 +50,7 @@ _PUBLIC_PREFIXES = (
     "/api/v1/cc/auth/approve-ip",   # admin approval link
     "/api/v1/cc/auth/ip-status",    # Next.js middleware IP check
     "/api/v1/cc/settings/portal",   # portal branding
+    "/api/v1/edge/",                # edge plugin endpoints — called from any WP site
     "/health",
 )
 
