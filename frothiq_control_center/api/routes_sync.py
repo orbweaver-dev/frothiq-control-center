@@ -227,34 +227,66 @@ def _derive_license_status(sub_state: dict) -> dict:
     }
 
 
+def _edge_tenant_to_license(t: dict) -> dict:
+    """
+    Derive a LicenseStatus-shaped dict from an edge_tenants record.
+    Status comes from the CC's own database — no Frappe billing bridge dependency.
+    """
+    status = t.get("status", "expired")
+    license_valid = status == "active"
+    license_status = "valid" if license_valid else ("suspended" if status == "suspended" else "expired")
+    import time
+    last_sync = t.get("last_sync")
+    last_synced = time.time()
+    if last_sync:
+        try:
+            from datetime import datetime
+            last_synced = datetime.fromisoformat(last_sync).timestamp()
+        except Exception:
+            pass
+    return {
+        "tenant_id":        t.get("tenant_id"),
+        "license_valid":    license_valid,
+        "license_status":   license_status,
+        "effective_plan":   t.get("plan", "free"),
+        "enforcement_mode": "alert_only",
+        "features":         {},
+        "limits":           {},
+        "expiry":           None,
+        "grace_until":      None,
+        "last_synced":      last_synced,
+        "sync_source":      "edge_db",
+    }
+
+
 @router.get("/license-state/bulk")
 async def license_state_bulk(
     _: TokenPayload = Depends(require_super_admin),
 ):
     """
     Bulk license status for all tenants.
-    Derived from subscription state — admin only.
+    Derived from CC's own edge_tenants database — no Frappe billing bridge dependency.
     """
-    summary = await _frappe_get(f"{_SUB_STATE_API}.subscription_state_summary")
-    tenants_sub = summary.get("tenants", [])
+    from frothiq_control_center.services.license_service import get_all_license_states
+    data = await get_all_license_states()
+    tenants_edge = data.get("tenants", [])
 
-    # For bulk we use the summary data (lighter than per-tenant calls)
     license_tenants = []
-    counts = {"valid": 0, "grace_period": 0, "suspended": 0, "expired": 0}
+    counts: dict[str, int] = {"valid": 0, "grace_period": 0, "suspended": 0, "expired": 0}
 
-    for t in tenants_sub:
-        lic = _derive_license_status(t)
+    for t in tenants_edge:
+        lic = _edge_tenant_to_license(t)
         license_tenants.append(lic)
         ls = lic["license_status"]
         counts[ls] = counts.get(ls, 0) + 1
 
     return {
-        "total":         len(license_tenants),
-        "valid":         counts["valid"],
-        "grace_period":  counts["grace_period"],
-        "suspended":     counts["suspended"],
-        "expired":       counts["expired"],
-        "tenants":       license_tenants,
+        "total":        len(license_tenants),
+        "valid":        counts["valid"],
+        "grace_period": counts["grace_period"],
+        "suspended":    counts["suspended"],
+        "expired":      counts["expired"],
+        "tenants":      license_tenants,
     }
 
 
@@ -265,10 +297,8 @@ async def get_license_state(
 ):
     """
     License status for a single tenant.
-    Read-only, derived from ERPNext subscription state via billing bridge.
+    Derived from CC's own edge_tenants database.
     """
-    sub_state = await _frappe_get(
-        f"{_SUB_STATE_API}.get_subscription_state",
-        params={"tenant_id": tenant_id},
-    )
-    return _derive_license_status(sub_state)
+    from frothiq_control_center.services.license_service import get_tenant_license
+    t = await get_tenant_license(tenant_id)
+    return _edge_tenant_to_license(t)
