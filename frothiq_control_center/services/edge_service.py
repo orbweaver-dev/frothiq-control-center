@@ -81,6 +81,123 @@ async def register_edge_node(
     }
 
 
+async def deregister_edge_node(
+    edge_id: str,
+    license_token: str,
+    reason: str = "uninstalled",
+) -> bool:
+    """
+    Set node state to REMOVED. Returns True if the node was found and updated.
+    The node record is kept for audit — never hard-deleted.
+    """
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(
+            select(EdgeNode).where(EdgeNode.edge_id == edge_id)
+        )
+        node = result.scalar_one_or_none()
+        if node is None or node.state == "REMOVED":
+            return False
+
+        node.state = "REMOVED"
+        node.last_seen_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        await session.commit()
+
+    logger.info("edge_service: deregistered edge_id=%s reason=%s", edge_id[:16], reason)
+    return True
+
+
+async def touch_edge_node(
+    edge_id: str,
+    requests_1m: int = 0,
+    blocks_1m: int = 0,
+    errors_1m: int = 0,
+) -> dict[str, Any] | None:
+    """
+    Update last_seen_at and promote node state on heartbeat.
+    Returns current plan and state, or None if node not found.
+    """
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(
+            select(EdgeNode).where(EdgeNode.edge_id == edge_id)
+        )
+        node = result.scalar_one_or_none()
+        if node is None:
+            return None
+
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        node.last_seen_at = now
+        # State promotions
+        if node.state == "REGISTERED":
+            node.state = "ACTIVE"
+        elif node.state in ("ACTIVE", "DEGRADED"):
+            node.state = "SYNCED"
+        # Don't promote REMOVED nodes
+        if node.state == "REMOVED":
+            return None
+
+        await session.commit()
+
+    logger.debug(
+        "edge_service: heartbeat edge_id=%s req=%d blk=%d err=%d",
+        edge_id[:16], requests_1m, blocks_1m, errors_1m,
+    )
+    return {"plan": node.plan, "state": node.state}
+
+
+async def get_blocklist(
+    edge_id: str,
+    since: int = 0,
+) -> dict[str, Any] | None:
+    """
+    Return the threat IP block list for this edge node's plan.
+
+    Block list tiers:
+      free:       reserved for future core integration — returns empty list
+      pro:        extended feed from core client (if available)
+      enterprise: full feed including predictive signals
+
+    Currently returns IPs sourced from the FrothIQ core client's threat feeds.
+    Falls back to an empty list if core is unreachable (fail-open for availability).
+    """
+    from frothiq_control_center.services.core_client import core_client
+
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(
+            select(EdgeNode).where(EdgeNode.edge_id == edge_id)
+        )
+        node = result.scalar_one_or_none()
+
+    if node is None or node.state == "REMOVED":
+        return None
+
+    plan = node.plan
+
+    # Score threshold by plan
+    score_threshold = {"free": 90, "pro": 70, "enterprise": 50}.get(plan, 90)
+
+    # Attempt to pull from frothiq-core threat feed endpoint.
+    # Fail-open: return empty list rather than blocking the plugin if core is down.
+    ips: list[str] = []
+    try:
+        params = {"min_score": score_threshold, "limit": 500}
+        if since:
+            params["since"] = since
+        data = await core_client.get("/api/v1/threats/feed", params=params, ttl=600)
+        if isinstance(data, list):
+            ips = [str(e["ip"]) for e in data if e.get("ip")]
+        elif isinstance(data, dict):
+            raw = data.get("ips") or data.get("threats") or []
+            ips = [str(e["ip"] if isinstance(e, dict) else e) for e in raw if e]
+    except Exception as exc:
+        logger.warning("edge_service: get_blocklist core feed failed: %s", exc)
+        ips = []
+
+    return {"ips": ips, "plan": plan}
+
+
 async def list_edge_nodes(
     limit: int = 100, offset: int = 0, platform: str | None = None
 ) -> dict[str, Any]:

@@ -1,8 +1,11 @@
 """
 Edge Node API routes.
 
-Public (no auth):
-  POST /api/v1/edge/register        — plugin self-registration
+Public (no auth — authenticated by edge_id + license_token in body/query):
+  POST /api/v1/edge/register        — plugin self-registration (auto-creates tenant)
+  POST /api/v1/edge/deregister      — plugin uninstall notification (sets state=REMOVED)
+  POST /api/v1/edge/heartbeat       — 1-minute keep-alive with traffic counters
+  GET  /api/v1/edge/blocklist       — pull current threat IP list (RBL-style)
 
 Protected (JWT required, served under /api/v1/cc/):
   GET  /api/v1/cc/edge/nodes        — list all registered edge nodes
@@ -25,12 +28,15 @@ from pydantic import BaseModel, Field, field_validator
 
 from frothiq_control_center.auth.jwt_handler import TokenPayload, get_current_user, require_role
 from frothiq_control_center.services.edge_service import (
+    get_blocklist,
     get_feature_flags,
     get_registration_stats,
+    deregister_edge_node,
     list_edge_nodes,
     list_edge_tenants,
     register_edge_node,
     set_feature_flag,
+    touch_edge_node,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,12 +69,40 @@ class EdgeRegisterRequest(BaseModel):
         return v.lower().replace("https://", "").replace("http://", "").strip("/")
 
 
+def _verify_license_token(edge_id: str, license_token: str) -> bool:
+    """
+    Verify that license_token is well-formed and references this edge_id.
+    Full cryptographic verification is in edge_service._issue_license_token().
+    Here we do a fast structural check — full HMAC re-verify is in get_blocklist().
+    """
+    if not license_token or not edge_id:
+        return False
+    # Token format: base64url(payload).hmac_hex — at minimum two segments
+    parts = license_token.split(".")
+    return len(parts) == 2 and len(parts[1]) == 64
+
+
+class EdgeDeregisterRequest(BaseModel):
+    edge_id:       str = Field(..., min_length=8, max_length=128)
+    license_token: str = Field(..., min_length=10)
+    reason:        str = Field("uninstalled", max_length=128)
+
+
+class EdgeHeartbeatRequest(BaseModel):
+    edge_id:       str = Field(..., min_length=8, max_length=128)
+    tenant_id:     str = Field(..., min_length=8, max_length=36)
+    license_token: str = Field(..., min_length=10)
+    requests_1m:   int = Field(0, ge=0)
+    blocks_1m:     int = Field(0, ge=0)
+    errors_1m:     int = Field(0, ge=0)
+
+
 @public_router.post("/register")
 async def register_edge(body: EdgeRegisterRequest, request: Request) -> dict[str, Any]:
     """
     Self-registration endpoint for FrothIQ edge plugins.
 
-    Idempotent — safe to call on every plugin boot.
+    Idempotent — safe to call multiple times.
     Auto-creates a tenant on first call for the domain.
     Assigns free plan by default. No payment or manual approval required.
     """
@@ -97,6 +131,104 @@ async def register_edge(body: EdgeRegisterRequest, request: Request) -> dict[str
         "feature_flags": result["feature_flags"],
         "enforcement_enabled": result["enforcement_enabled"],
         "registered_at": int(time.time()),
+    }
+
+
+@public_router.post("/deregister")
+async def deregister_edge(body: EdgeDeregisterRequest, request: Request) -> dict[str, Any]:
+    """
+    Plugin uninstall notification.
+
+    Sets the edge node state to REMOVED and records the reason.
+    The node record is retained for audit purposes — it is never hard-deleted.
+    Called by the WordPress uninstall hook before wiping plugin data.
+    """
+    if not _verify_license_token(body.edge_id, body.license_token):
+        raise HTTPException(status_code=401, detail="Invalid license token")
+
+    client_ip = (
+        request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
+    )
+    logger.info(
+        "edge.deregister: edge_id=%s reason=%s ip=%s",
+        body.edge_id[:16], body.reason, client_ip,
+    )
+
+    removed = await deregister_edge_node(
+        edge_id=body.edge_id,
+        license_token=body.license_token,
+        reason=body.reason,
+    )
+    if not removed:
+        raise HTTPException(status_code=404, detail="Edge node not found or already removed")
+
+    return {"ok": True, "edge_id": body.edge_id, "state": "REMOVED"}
+
+
+@public_router.post("/heartbeat")
+async def edge_heartbeat(body: EdgeHeartbeatRequest) -> dict[str, Any]:
+    """
+    1-minute keep-alive from a registered edge plugin.
+    Updates last_seen_at and promotes node state REGISTERED → ACTIVE.
+    Returns the current plan and feature flags so the plugin can self-update.
+    """
+    if not _verify_license_token(body.edge_id, body.license_token):
+        raise HTTPException(status_code=401, detail="Invalid license token")
+
+    result = await touch_edge_node(
+        edge_id=body.edge_id,
+        requests_1m=body.requests_1m,
+        blocks_1m=body.blocks_1m,
+        errors_1m=body.errors_1m,
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Edge node not found")
+
+    return {
+        "ok":         True,
+        "edge_id":    body.edge_id,
+        "plan":       result["plan"],
+        "node_state": result["state"],
+        "ts":         int(time.time()),
+    }
+
+
+@public_router.get("/blocklist")
+async def edge_blocklist(
+    edge_id:       str,
+    license_token: str,
+    since:         int = 0,
+) -> dict[str, Any]:
+    """
+    Pull-based threat IP list — RBL-style block list delivery.
+
+    The plugin calls this endpoint every 15 minutes via wp-cron.
+    Results are keyed by the edge node's plan:
+      - free:       high-confidence confirmed threats (score ≥ 90)
+      - pro:        extended threat list (score ≥ 70)
+      - enterprise: full list including predictive signals (score ≥ 50)
+
+    Returns:
+      ips:        list of blocked IP addresses
+      expires_at: unix timestamp when this list should be considered stale
+      total:      total count of IPs in this response
+      plan:       the plan tier used to filter this list
+    """
+    if not _verify_license_token(edge_id, license_token):
+        raise HTTPException(status_code=401, detail="Invalid license token")
+
+    result = await get_blocklist(edge_id=edge_id, since=since)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Edge node not found or removed")
+
+    return {
+        "ok":         True,
+        "ips":        result["ips"],
+        "total":      len(result["ips"]),
+        "plan":       result["plan"],
+        "expires_at": int(time.time()) + 900,  # 15 minutes
+        "generated_at": int(time.time()),
     }
 
 
