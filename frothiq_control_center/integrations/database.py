@@ -55,6 +55,7 @@ async def create_tables() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(lambda c: Base.metadata.create_all(c, checkfirst=True))
     await _migrate_totp_columns()
+    await _migrate_threat_reports()
     await _seed_admin_ip()
     logger.info("Database tables ready")
 
@@ -71,6 +72,35 @@ async def _migrate_totp_columns() -> None:
             )
         )
     logger.info("TOTP columns ensured on cc_users")
+
+
+async def _migrate_threat_reports() -> None:
+    """Ensure threat_reports table exists (idempotent — create_all covers it, this is belt+suspenders)."""
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await conn.execute(
+            __import__("sqlalchemy").text(
+                "CREATE TABLE IF NOT EXISTS threat_reports ("
+                "  id VARCHAR(36) PRIMARY KEY,"
+                "  ip VARCHAR(45) NOT NULL,"
+                "  tenant_id VARCHAR(36) NOT NULL,"
+                "  edge_id VARCHAR(128) NOT NULL,"
+                "  event_type VARCHAR(64) NOT NULL DEFAULT 'blocked_local',"
+                "  severity VARCHAR(16) NOT NULL DEFAULT 'high',"
+                "  reason VARCHAR(512) NOT NULL DEFAULT '',"
+                "  report_count INT NOT NULL DEFAULT 1,"
+                "  tenant_count INT NOT NULL DEFAULT 1,"
+                "  threat_score INT NOT NULL DEFAULT 0,"
+                "  first_seen DATETIME NOT NULL,"
+                "  last_seen DATETIME NOT NULL,"
+                "  UNIQUE KEY uq_threat_ip_tenant (ip, tenant_id),"
+                "  INDEX idx_threat_ip (ip),"
+                "  INDEX idx_threat_tenant (tenant_id),"
+                "  INDEX idx_threat_score (threat_score)"
+                ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+            )
+        )
+    logger.info("threat_reports table ensured")
 
 
 async def _seed_admin_ip() -> None:

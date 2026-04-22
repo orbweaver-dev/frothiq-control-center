@@ -1,9 +1,10 @@
 """
-Edge Node + Tenant + Feature Flag ORM models.
+Edge Node + Tenant + Feature Flag + Threat Intelligence ORM models.
 
 EdgeNode      — a self-registering plugin installation on a customer site
 EdgeTenant    — auto-created tenant record for each unique registrant domain
 FeatureFlag   — global platform control flags (e.g. PLAN_ENFORCEMENT_ENABLED)
+ThreatReport  — community threat pool: IPs reported as blocked by edge nodes
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .user import Base, _utcnow
@@ -78,3 +79,43 @@ class FeatureFlag(Base):
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     last_changed_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     last_changed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+
+class ThreatReport(Base):
+    """
+    Community threat intelligence pool.
+
+    Every time an edge node blocks an IP it reports the event here.
+    IPs reported by multiple distinct tenants accumulate threat_score and
+    are included in the /api/v1/edge/blocklist feed for all nodes.
+
+    One row per (ip, tenant_id) pair — reports from the same tenant are
+    consolidated (report_count incremented, last_seen updated).
+    Cross-tenant reports raise tenant_count and boost threat_score.
+
+    Score thresholds that qualify an IP for the community blocklist:
+      threat_score >= 50   — enterprise tier
+      threat_score >= 70   — pro tier
+      threat_score >= 90   — free tier
+    """
+    __tablename__ = "threat_reports"
+    __table_args__ = (
+        UniqueConstraint("ip", "tenant_id", name="uq_threat_ip_tenant"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    ip: Mapped[str] = mapped_column(String(45), nullable=False, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    edge_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False, default="blocked_local")
+    severity: Mapped[str] = mapped_column(String(16), nullable=False, default="high")
+    reason: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    report_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # Computed on write — count of distinct tenants that have reported this IP
+    tenant_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # threat_score: raised as more tenants confirm the IP (0–100)
+    threat_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    first_seen: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    last_seen: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)

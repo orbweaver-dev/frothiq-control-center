@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from frothiq_control_center.config import get_settings
 from frothiq_control_center.integrations.database import get_session_factory
-from frothiq_control_center.models.edge import EdgeNode, EdgeTenant, FeatureFlag
+from frothiq_control_center.models.edge import EdgeNode, EdgeTenant, FeatureFlag, ThreatReport
 
 logger = logging.getLogger(__name__)
 
@@ -178,24 +178,129 @@ async def get_blocklist(
     # Score threshold by plan
     score_threshold = {"free": 90, "pro": 70, "enterprise": 50}.get(plan, 90)
 
-    # Attempt to pull from frothiq-core threat feed endpoint.
-    # Fail-open: return empty list rather than blocking the plugin if core is down.
-    ips: list[str] = []
+    # Source 1 — frothiq-core threat feed (fail-open)
+    core_ips: list[str] = []
     try:
-        params = {"min_score": score_threshold, "limit": 500}
+        params: dict[str, Any] = {"min_score": score_threshold, "limit": 500}
         if since:
             params["since"] = since
         data = await core_client.get("/api/v1/threats/feed", params=params, ttl=600)
         if isinstance(data, list):
-            ips = [str(e["ip"]) for e in data if e.get("ip")]
+            core_ips = [str(e["ip"]) for e in data if e.get("ip")]
         elif isinstance(data, dict):
             raw = data.get("ips") or data.get("threats") or []
-            ips = [str(e["ip"] if isinstance(e, dict) else e) for e in raw if e]
+            core_ips = [str(e["ip"] if isinstance(e, dict) else e) for e in raw if e]
     except Exception as exc:
         logger.warning("edge_service: get_blocklist core feed failed: %s", exc)
-        ips = []
 
+    # Source 2 — community threat pool (IPs reported as blocked by edge nodes)
+    community_ips: list[str] = []
+    try:
+        async with get_session_factory()() as session:
+            stmt = (
+                select(ThreatReport.ip)
+                .where(ThreatReport.threat_score >= score_threshold)
+                .distinct()
+            )
+            if since:
+                since_dt = datetime.fromtimestamp(since, tz=timezone.utc).replace(tzinfo=None)
+                stmt = stmt.where(ThreatReport.last_seen >= since_dt)
+            result = await session.execute(stmt)
+            community_ips = [row[0] for row in result.fetchall()]
+    except Exception as exc:
+        logger.warning("edge_service: get_blocklist community query failed: %s", exc)
+
+    # Merge and deduplicate both sources
+    ips = list(dict.fromkeys(core_ips + community_ips))
+
+    logger.debug(
+        "edge_service: blocklist plan=%s threshold=%d core=%d community=%d total=%d",
+        plan, score_threshold, len(core_ips), len(community_ips), len(ips),
+    )
     return {"ips": ips, "plan": plan}
+
+
+async def report_edge_event(
+    edge_id: str,
+    tenant_id: str,
+    ip: str,
+    event_type: str,
+    severity: str = "high",
+    reason: str = "",
+) -> dict[str, Any]:
+    """
+    Ingest a threat event reported by an edge node.
+
+    Upserts into ThreatReport (one row per ip+tenant). Recalculates
+    threat_score based on cross-tenant confirmation count:
+      1 tenant  → score 40   (single-source, low confidence)
+      2 tenants → score 65   (corroborated)
+      3 tenants → score 80   (multi-site confirmed)
+      5+ tenants → score 95  (high confidence, enters free-tier blocklist)
+
+    The updated IP becomes eligible for the global blocklist on the next pull.
+    """
+    factory = get_session_factory()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    async with factory() as session:
+        # Load or create the per-(ip, tenant) row
+        result = await session.execute(
+            select(ThreatReport).where(
+                ThreatReport.ip == ip,
+                ThreatReport.tenant_id == tenant_id,
+            )
+        )
+        row = result.scalar_one_or_none()
+
+        if row is None:
+            row = ThreatReport(
+                id=str(uuid.uuid4()),
+                ip=ip,
+                tenant_id=tenant_id,
+                edge_id=edge_id,
+                event_type=event_type,
+                severity=severity,
+                reason=reason[:512],
+                report_count=1,
+                tenant_count=1,
+                threat_score=0,
+                first_seen=now,
+                last_seen=now,
+            )
+            session.add(row)
+        else:
+            row.report_count += 1
+            row.last_seen = now
+            if severity in ("high", "critical") and row.severity not in ("high", "critical"):
+                row.severity = severity
+
+        await session.flush()
+
+        # Count distinct tenants that have reported this IP
+        from sqlalchemy import func
+        count_result = await session.execute(
+            select(func.count(ThreatReport.id)).where(ThreatReport.ip == ip)
+        )
+        distinct_tenants = count_result.scalar_one() or 1
+
+        # Update tenant_count and recalculate threat_score on the current row
+        row.tenant_count = distinct_tenants
+        score_map = {1: 40, 2: 65, 3: 80, 4: 88}
+        row.threat_score = score_map.get(distinct_tenants, 95 if distinct_tenants >= 5 else 40)
+
+        await session.commit()
+
+    logger.info(
+        "threat_report: ip=%s tenants=%d score=%d event=%s edge=%s",
+        ip, distinct_tenants, row.threat_score, event_type, edge_id[:16],
+    )
+    return {
+        "ip": ip,
+        "threat_score": row.threat_score,
+        "tenant_count": distinct_tenants,
+        "ingested": True,
+    }
 
 
 async def list_edge_nodes(

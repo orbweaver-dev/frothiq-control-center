@@ -35,6 +35,7 @@ from frothiq_control_center.services.edge_service import (
     list_edge_nodes,
     list_edge_tenants,
     register_edge_node,
+    report_edge_event,
     set_feature_flag,
     touch_edge_node,
 )
@@ -192,6 +193,64 @@ async def edge_heartbeat(body: EdgeHeartbeatRequest) -> dict[str, Any]:
         "node_state": result["state"],
         "ts":         int(time.time()),
     }
+
+
+class EdgeEventRequest(BaseModel):
+    edge_id:       str = Field(..., min_length=8,  max_length=128)
+    tenant_id:     str = Field(..., min_length=8,  max_length=36)
+    license_token: str = Field(..., min_length=10)
+    ip:            str = Field(..., min_length=7,  max_length=45, description="IPv4 or IPv6")
+    event_type:    str = Field(..., max_length=64,
+                               description="blocked_local|blocked_rbl|failed_login|threat_detected")
+    severity:      str = Field("high", max_length=16)
+    reason:        str = Field("",     max_length=512)
+
+    @field_validator("ip")
+    @classmethod
+    def valid_ip(cls, v: str) -> str:
+        import ipaddress
+        try:
+            ipaddress.ip_address(v)
+        except ValueError:
+            raise ValueError("Invalid IP address")
+        return v
+
+    @field_validator("event_type")
+    @classmethod
+    def event_type_allowed(cls, v: str) -> str:
+        allowed = {"blocked_local", "blocked_rbl", "failed_login", "threat_detected"}
+        if v not in allowed:
+            raise ValueError(f"event_type must be one of: {', '.join(sorted(allowed))}")
+        return v
+
+
+@public_router.post("/event")
+async def report_event(body: EdgeEventRequest) -> dict[str, Any]:
+    """
+    Receive a threat event from an edge plugin.
+
+    Called fire-and-forget (non-blocking) when the plugin blocks or detects
+    a threat. Ingested into the community threat pool and redistributed via
+    the /blocklist feed to all edge nodes at their next 15-minute sync.
+
+    Threat score escalation:
+      1 tenant reports → score 40  (low confidence)
+      2 tenants        → score 65  (corroborated)
+      3 tenants        → score 80  (multi-site confirmed)
+      5+ tenants       → score 95  (high confidence — enters free-tier blocklist)
+    """
+    if not _verify_license_token(body.edge_id, body.license_token):
+        raise HTTPException(status_code=401, detail="Invalid license token")
+
+    result = await report_edge_event(
+        edge_id=body.edge_id,
+        tenant_id=body.tenant_id,
+        ip=body.ip,
+        event_type=body.event_type,
+        severity=body.severity,
+        reason=body.reason,
+    )
+    return {"ok": True, **result}
 
 
 @public_router.get("/blocklist")
