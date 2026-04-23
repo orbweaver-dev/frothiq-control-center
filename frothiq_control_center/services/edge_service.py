@@ -147,6 +147,10 @@ async def touch_edge_node(
         if node.state == "REMOVED":
             return None
 
+        # Close any open heartbeat-miss outage windows — node is alive again.
+        from frothiq_control_center.services.edge_outage_service import close_open_windows_for_node
+        await close_open_windows_for_node(session, edge_id)
+
         await session.commit()
 
     logger.debug(

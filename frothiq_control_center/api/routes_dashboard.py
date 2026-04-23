@@ -31,8 +31,11 @@ async def system_health(
 ):
     """
     Full system health snapshot — core status, cluster counts,
-    license health, threat level, and key indices.
+    license health, threat level, key indices, and recent outages.
     """
+    from frothiq_control_center.integrations.database import get_session_factory as _gsf
+    from frothiq_control_center.services.edge_outage_service import get_recent_outages
+
     (
         core_health,
         clusters_data,
@@ -49,6 +52,15 @@ async def system_health(
         get_simulation_status(),
         return_exceptions=True,
     )
+
+    # Fetch recent outages (separate gather; non-critical)
+    try:
+        async with _gsf()() as _sess:
+            recent_outages = await get_recent_outages(_sess, limit=5)
+        open_outages = sum(1 for o in recent_outages if o["is_open"])
+    except Exception:
+        recent_outages = []
+        open_outages = 0
 
     # Safely extract values (may be exceptions)
     def safe(val, default):
@@ -82,6 +94,8 @@ async def system_health(
         "instability_index": instability,
         "revenue_pressure_index": monetization_data.get("revenue_pressure_index", 0.0),
         "simulation_engine_healthy": sim_status.get("healthy", False) if isinstance(sim_status, dict) else False,
+        "open_outages": open_outages,
+        "recent_outages": recent_outages,
         "checked_at": datetime.now(UTC).isoformat(),
     }
 

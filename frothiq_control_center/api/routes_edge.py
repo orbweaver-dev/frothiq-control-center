@@ -6,11 +6,13 @@ Public (no auth — authenticated by edge_id + license_token in body/query):
   POST /api/v1/edge/deregister      — plugin uninstall notification (sets state=REMOVED)
   POST /api/v1/edge/heartbeat       — 1-minute keep-alive with traffic counters
   GET  /api/v1/edge/blocklist       — pull current threat IP list (RBL-style)
+  POST /api/v1/edge/outage          — plugin-reported outage event (self-healed or ongoing)
 
 Protected (JWT required, served under /api/v1/cc/):
   GET  /api/v1/cc/edge/nodes        — list all registered edge nodes
   GET  /api/v1/cc/edge/tenants      — list all edge tenants
   GET  /api/v1/cc/edge/stats        — registration statistics
+  GET  /api/v1/cc/edge/outages      — recent outage events
   GET  /api/v1/cc/system/flags      — get all feature flags
   POST /api/v1/cc/system/flags/{key} — set a feature flag (super_admin only)
 """
@@ -371,3 +373,73 @@ async def update_flag(
         )
     user_email = current_user.sub  # sub = user_id
     return await set_feature_flag(flag_key, body.value, user_email)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Outage reporting (public — authenticated by edge_id + license_token)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EdgeOutageRequest(BaseModel):
+    edge_id:       str = Field(..., min_length=8, max_length=128)
+    tenant_id:     str = Field(..., min_length=8, max_length=36)
+    license_token: str = Field(..., min_length=10)
+    outage_type:   str = Field(..., max_length=64)
+    cause:         str = Field("", max_length=128)
+    cause_detail:  str = Field("", max_length=2000)
+    auto_resolved: bool = False
+    duration_sec:  int  = Field(0, ge=0)
+    site_url:      str  = Field("", max_length=512)
+
+
+@public_router.post("/outage")
+async def report_outage(body: EdgeOutageRequest) -> dict[str, Any]:
+    """
+    Plugin-reported outage event.
+    Called immediately after the plugin detects (and optionally self-heals) an outage.
+    Authenticated by edge_id + license_token; no JWT required.
+    """
+    if not _verify_license_token(body.edge_id, body.license_token):
+        raise HTTPException(status_code=401, detail="Invalid license token")
+
+    from frothiq_control_center.integrations.database import get_session_factory as _gsf
+    from frothiq_control_center.services.edge_outage_service import receive_plugin_outage
+
+    factory = _gsf()
+    async with factory() as session:
+        event = await receive_plugin_outage(
+            session      = session,
+            edge_id      = body.edge_id,
+            tenant_id    = body.tenant_id,
+            outage_type  = body.outage_type,
+            cause        = body.cause,
+            cause_detail = body.cause_detail,
+            auto_resolved = body.auto_resolved,
+            duration_sec = body.duration_sec,
+            site_url     = body.site_url,
+        )
+
+    logger.warning(
+        "edge.outage: edge_id=%s type=%s auto_resolved=%s",
+        body.edge_id[:16], body.outage_type, body.auto_resolved,
+    )
+    return {"ok": True, "outage_id": event.id, "is_open": event.is_open}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Outage history (protected — JWT required)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@protected_router.get("/edge/outages")
+async def list_outages(
+    limit: int = 20,
+    current_user: TokenPayload = Depends(require_role("read_only")),
+) -> dict[str, Any]:
+    """Return recent outage events across all edge nodes. read_only+ required."""
+    from frothiq_control_center.integrations.database import get_session_factory as _gsf
+    from frothiq_control_center.services.edge_outage_service import get_recent_outages
+
+    factory = _gsf()
+    async with factory() as session:
+        outages = await get_recent_outages(session, min(limit, 100))
+
+    return {"outages": outages, "count": len(outages)}

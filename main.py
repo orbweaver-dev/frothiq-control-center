@@ -43,6 +43,8 @@ from frothiq_control_center.services.core_client import core_client
 from frothiq_control_center.websocket import start_event_dispatcher, ws_router
 from frothiq_control_center.reconciliation.reconciliation_scheduler import ReconciliationScheduler
 from frothiq_control_center.predictive_sync.predictive_sync_orchestrator import PredictiveSyncScheduler
+from frothiq_control_center.services.enforcement_engine import run_enforcement_loop
+from frothiq_control_center.services.edge_outage_service import detect_offline_nodes
 
 logging.basicConfig(
     level=logging.INFO,
@@ -97,6 +99,18 @@ async def lifespan(app: FastAPI):
         name="cidr_analyzer",
     )
 
+    # Start HTTP policy enforcement engine (runs every 60 seconds)
+    enforcement_task = asyncio.create_task(
+        run_enforcement_loop(cache),
+        name="enforcement_engine",
+    )
+
+    # Start outage detector (runs every 5 minutes — checks for silent edge nodes)
+    outage_task = asyncio.create_task(
+        _run_outage_detector_loop(),
+        name="outage_detector",
+    )
+
     logger.info(
         "Control Center ready — core: %s | port: %d",
         settings.core_base_url,
@@ -107,13 +121,16 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down FrothIQ Control Center")
+    outage_task.cancel()
+    enforcement_task.cancel()
     cidr_task.cancel()
     predictive_task.cancel()
     recon_task.cancel()
     dispatcher_task.cancel()
     try:
         await asyncio.gather(
-            cidr_task, predictive_task, recon_task, dispatcher_task, return_exceptions=True
+            outage_task, enforcement_task, cidr_task, predictive_task, recon_task, dispatcher_task,
+            return_exceptions=True,
         )
     except asyncio.CancelledError:
         pass
@@ -122,6 +139,27 @@ async def lifespan(app: FastAPI):
     await dispose_engine()
     await close_redis()
     logger.info("Shutdown complete")
+
+
+async def _run_outage_detector_loop() -> None:
+    """
+    Background loop: scan edge nodes for missed heartbeats and open outage windows.
+    Also closes windows for nodes that have since recovered.
+    Runs every 5 minutes starting 90 seconds after startup.
+    """
+    from frothiq_control_center.integrations.database import get_session_factory as _gsf
+
+    await asyncio.sleep(90)  # let nodes send their first heartbeat before checking
+    interval = 300  # 5 minutes
+    while True:
+        try:
+            factory = _gsf()
+            await detect_offline_nodes(factory)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error("outage_detector: loop error: %s", exc)
+        await asyncio.sleep(interval)
 
 
 async def _run_cidr_analyzer_loop() -> None:
