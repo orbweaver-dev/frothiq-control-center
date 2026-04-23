@@ -443,3 +443,66 @@ async def list_outages(
         outages = await get_recent_outages(session, min(limit, 100))
 
     return {"outages": outages, "count": len(outages)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Support ticket proxy (public — authenticated by edge_id + license_token)
+# Allows the plugin to submit/query Frappe Issues without holding credentials.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EdgeTicketRequest(BaseModel):
+    edge_id:       str = Field(..., min_length=8, max_length=128)
+    tenant_id:     str = Field(..., min_length=8, max_length=36)
+    license_token: str = Field(..., min_length=10)
+    subject:       str = Field(..., min_length=5, max_length=120)
+    description:   str = Field(..., min_length=10, max_length=5000)
+    priority:      str = Field("Medium", pattern="^(Low|Medium|High|Urgent)$")
+
+
+@public_router.post("/ticket")
+async def submit_ticket(body: EdgeTicketRequest) -> dict[str, Any]:
+    """
+    Plugin submits a support ticket through MC3.
+    MC3 proxies the request to the Frappe ERPNext Issue DocType.
+    Deduplication: checks for an existing open Issue for this edge_id first.
+    """
+    if not _verify_license_token(body.edge_id, body.license_token):
+        raise HTTPException(status_code=401, detail="Invalid license token")
+
+    from frothiq_control_center.services import frappe_ticket_client as _ftc
+
+    ref_tag = f"edge:{body.edge_id[:24]}"
+    existing = await _ftc.find_open_issue(ref_tag)
+    if existing:
+        return {
+            "ok": True,
+            "ticket_name": existing,
+            "duplicate": True,
+            "message": "An open ticket already exists for this site.",
+        }
+
+    ticket_name = await _ftc.create_issue(
+        subject=f"{body.subject} ({ref_tag})",
+        description=body.description,
+        priority=body.priority,
+    )
+    if not ticket_name:
+        raise HTTPException(status_code=502, detail="Could not create support ticket — try again later.")
+
+    logger.info("ticket_proxy.create edge=%s ticket=%s", body.edge_id[:16], ticket_name)
+    return {"ok": True, "ticket_name": ticket_name, "duplicate": False}
+
+
+@public_router.get("/tickets")
+async def list_tickets(
+    edge_id:       str,
+    license_token: str,
+) -> dict[str, Any]:
+    """Return recent Frappe Issues for this edge node."""
+    if not _verify_license_token(edge_id, license_token):
+        raise HTTPException(status_code=401, detail="Invalid license token")
+
+    from frothiq_control_center.services import frappe_ticket_client as _ftc
+
+    tickets = await _ftc.get_issues_for_edge(edge_id, limit=20)
+    return {"ok": True, "tickets": tickets, "count": len(tickets)}

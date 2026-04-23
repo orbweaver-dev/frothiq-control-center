@@ -57,6 +57,7 @@ async def create_tables() -> None:
         await conn.run_sync(lambda c: Base.metadata.create_all(c, checkfirst=True))
     await _migrate_totp_columns()
     await _migrate_threat_reports()
+    await _migrate_outage_ticket_column()
     await _seed_admin_ip()
     logger.info("Database tables ready")
 
@@ -102,6 +103,19 @@ async def _migrate_threat_reports() -> None:
             )
         )
     logger.info("threat_reports table ensured")
+
+
+async def _migrate_outage_ticket_column() -> None:
+    """Add frappe_ticket_id column to edge_outage_events if missing (idempotent)."""
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await conn.execute(
+            __import__("sqlalchemy").text(
+                "ALTER TABLE edge_outage_events "
+                "ADD COLUMN IF NOT EXISTS frappe_ticket_id VARCHAR(64) NULL"
+            )
+        )
+    logger.info("frappe_ticket_id column ensured on edge_outage_events")
 
 
 async def _seed_admin_ip() -> None:

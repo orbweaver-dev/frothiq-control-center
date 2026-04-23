@@ -46,3 +46,5 @@ class EdgeOutageEvent(Base):
     # True while no resolved_at exists
     is_open: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
     alert_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # ERPNext Issue name created for this outage (e.g. "ISS-2026-00042")
+    frappe_ticket_id: Mapped[str | None] = mapped_column(String(64), nullable=True)

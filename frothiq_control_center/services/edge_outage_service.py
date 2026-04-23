@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from frothiq_control_center.config import get_settings
 from frothiq_control_center.models.edge import EdgeNode, EdgeTenant
 from frothiq_control_center.models.outage import EdgeOutageEvent
+from frothiq_control_center.services import frappe_ticket_client as _ftc
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,34 @@ async def receive_plugin_outage(
 
     # Send alert email regardless of auto_resolved — the site had an outage.
     await _send_outage_alert(session, event, tenant_id, domain, recovered=auto_resolved)
+
+    # Open a Frappe support ticket (dedup: check for an existing open issue first)
+    ref_tag = f"edge:{edge_id[:24]}"
+    existing_ticket = await _ftc.find_open_issue(ref_tag)
+    if not existing_ticket:
+        ticket_name = await _ftc.create_issue(
+            subject=f"Site outage on {domain} ({ref_tag})",
+            description=(
+                f"**Type:** {outage_type}\n"
+                f"**Cause:** {cause}\n"
+                f"**Detail:** {cause_detail}\n"
+                f"**Auto-resolved:** {auto_resolved}\n"
+                f"**Duration:** {duration_sec}s\n"
+                f"**Edge ID:** {edge_id}"
+            ),
+            priority="Urgent" if not auto_resolved else "High",
+        )
+        if ticket_name:
+            event.frappe_ticket_id = ticket_name
+    else:
+        event.frappe_ticket_id = existing_ticket
+
+    if auto_resolved and event.frappe_ticket_id:
+        await _ftc.resolve_issue(
+            event.frappe_ticket_id,
+            resolution_note=f"Automatically resolved by plugin self-healing after {duration_sec}s.",
+        )
+
     await session.commit()
 
     logger.warning(
@@ -168,6 +197,26 @@ async def detect_offline_nodes(factory: async_sessionmaker[AsyncSession]) -> Non
                 session.add(event)
                 await session.flush()
                 await _send_outage_alert(session, event, node.tenant_id, domain, recovered=False)
+
+                # Open Frappe ticket (dedup check)
+                ref_tag = f"edge:{node.edge_id[:24]}"
+                existing_ticket = await _ftc.find_open_issue(ref_tag)
+                if not existing_ticket:
+                    ticket_name = await _ftc.create_issue(
+                        subject=f"Site offline: {domain} ({ref_tag})",
+                        description=(
+                            f"**Type:** {outage_type}\n"
+                            f"**Domain:** {domain}\n"
+                            f"**Last seen:** {int((now - last_seen).total_seconds() // 60)} minutes ago\n"
+                            f"**Edge ID:** {node.edge_id}"
+                        ),
+                        priority="Urgent",
+                    )
+                    if ticket_name:
+                        event.frappe_ticket_id = ticket_name
+                else:
+                    event.frappe_ticket_id = existing_ticket
+
                 logger.warning(
                     "outage_opened edge=%s domain=%s type=%s last_seen_min_ago=%d",
                     node.edge_id[:16], domain, outage_type,
@@ -216,6 +265,11 @@ async def _close_window(session: AsyncSession, window: EdgeOutageEvent, auto_res
     window.is_open      = False
     await session.flush()
     await _send_recovery_alert(session, window)
+    if window.frappe_ticket_id:
+        await _ftc.resolve_issue(
+            window.frappe_ticket_id,
+            resolution_note=f"Site recovered. Outage duration: {window.duration_sec}s.",
+        )
 
 
 def _severity_for_type(outage_type: str) -> str:
@@ -342,7 +396,8 @@ async def get_recent_outages(session: AsyncSession, limit: int = 20) -> list[dic
             "auto_resolved": r.auto_resolved,
             "started_at":   r.started_at.isoformat(),
             "resolved_at":  r.resolved_at.isoformat() if r.resolved_at else None,
-            "duration_sec": r.duration_sec,
+            "duration_sec":    r.duration_sec,
+            "frappe_ticket_id": r.frappe_ticket_id,
         }
         for r in rows
     ]

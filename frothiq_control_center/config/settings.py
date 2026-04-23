@@ -128,6 +128,14 @@ class Settings(BaseSettings):
     audit_log_to_db: bool = True
     audit_log_to_redis: bool = True
 
+    # -----------------------------------------------------------------
+    # Frappe / ERPNext ticket integration
+    # -----------------------------------------------------------------
+    frappe_site_url: str = ""          # e.g. https://orbweaver.dev
+    frappe_api_key: str = ""
+    frappe_api_secret: str = ""
+    frappe_issue_type: str = "FrothIQ"   # Issue Type value in ERPNext
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
