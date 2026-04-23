@@ -1,9 +1,13 @@
 """
 Frappe / ERPNext ticket integration.
 
-Creates, queries, and resolves Issues in orbweaver.dev's ERPNext instance.
-All calls are idempotent-safe: callers must call find_open_issue() first to
-avoid duplicates before calling create_issue().
+Creates, queries, amends, and resolves Issues in orbweaver.dev's ERPNext instance.
+
+Deduplication pattern:
+  1. find_open_issue(ref_tag)  → existing name, or None
+  2a. None     → create_issue()      (new failure)
+  2b. existing → append_to_issue()   (recurring failure — amend, don't duplicate)
+  3. On recovery → resolve_issue()
 """
 
 from __future__ import annotations
@@ -105,6 +109,37 @@ async def create_issue(
     except Exception as exc:
         logger.error("frappe_ticket: create_issue failed: %s", exc)
     return None
+
+
+async def append_to_issue(issue_name: str, note: str) -> bool:
+    """
+    Add a Comment to an existing ERPNext Issue with updated failure information.
+    Called when find_open_issue() returns an existing ticket so each new
+    occurrence of the failure is recorded without creating a duplicate ticket.
+    Returns True on success.
+    """
+    if not _enabled() or not issue_name:
+        return False
+    payload = {
+        "comment_type": "Comment",
+        "reference_doctype": "Issue",
+        "reference_name": issue_name,
+        "content": note[:2000],
+        "comment_by": "frothiq-system@orbweaver.dev",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{_base()}/api/resource/Comment",
+                json=payload,
+                headers=_headers(),
+            )
+            resp.raise_for_status()
+            logger.info("frappe_ticket: appended comment to Issue %s", issue_name)
+            return True
+    except Exception as exc:
+        logger.error("frappe_ticket: append_to_issue %s failed: %s", issue_name, exc)
+    return False
 
 
 async def resolve_issue(issue_name: str, resolution_note: str = "") -> bool:

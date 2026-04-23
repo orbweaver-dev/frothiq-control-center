@@ -473,24 +473,46 @@ async def submit_ticket(body: EdgeTicketRequest) -> dict[str, Any]:
 
     ref_tag = f"edge:{body.edge_id[:24]}"
     existing = await _ftc.find_open_issue(ref_tag)
+
     if existing:
+        # Amend the existing ticket with the new submission details
+        note = (
+            f"**Additional report from site admin**\n"
+            f"Subject: {body.subject}\n"
+            f"Priority: {body.priority}\n"
+            f"Details: {body.description[:800]}"
+        )
+        amended = await _ftc.append_to_issue(existing, note)
+        logger.warning(
+            "ticket_proxy.amended edge=%s ticket=%s amended=%s subject=%s",
+            body.edge_id[:16], existing, amended, body.subject[:60],
+        )
         return {
             "ok": True,
             "ticket_name": existing,
             "duplicate": True,
-            "message": "An open ticket already exists for this site.",
+            "amended": amended,
+            "message": "An open ticket already exists for this site — your report has been added to it.",
         }
 
     ticket_name = await _ftc.create_issue(
         subject=f"{body.subject} ({ref_tag})",
-        description=body.description,
+        description=(
+            f"{body.description}\n\n"
+            f"---\n*Submitted by site admin via FrothIQ plugin*\n"
+            f"*Edge: {body.edge_id[:24]}*"
+        ),
         priority=body.priority,
     )
     if not ticket_name:
+        logger.error(
+            "ticket_proxy.create_failed edge=%s subject=%s",
+            body.edge_id[:16], body.subject[:60],
+        )
         raise HTTPException(status_code=502, detail="Could not create support ticket — try again later.")
 
-    logger.info("ticket_proxy.create edge=%s ticket=%s", body.edge_id[:16], ticket_name)
-    return {"ok": True, "ticket_name": ticket_name, "duplicate": False}
+    logger.info("ticket_proxy.created edge=%s ticket=%s subject=%s", body.edge_id[:16], ticket_name, body.subject[:60])
+    return {"ok": True, "ticket_name": ticket_name, "duplicate": False, "amended": False}
 
 
 @public_router.get("/tickets")

@@ -81,9 +81,11 @@ async def receive_plugin_outage(
     # Send alert email regardless of auto_resolved — the site had an outage.
     await _send_outage_alert(session, event, tenant_id, domain, recovered=auto_resolved)
 
-    # Open a Frappe support ticket (dedup: check for an existing open issue first)
-    ref_tag = f"edge:{edge_id[:24]}"
+    # Frappe ticket: create new or amend existing (dedup by ref_tag)
+    ref_tag   = f"edge:{edge_id[:24]}"
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     existing_ticket = await _ftc.find_open_issue(ref_tag)
+
     if not existing_ticket:
         ticket_name = await _ftc.create_issue(
             subject=f"Site outage on {domain} ({ref_tag})",
@@ -93,14 +95,36 @@ async def receive_plugin_outage(
                 f"**Detail:** {cause_detail}\n"
                 f"**Auto-resolved:** {auto_resolved}\n"
                 f"**Duration:** {duration_sec}s\n"
-                f"**Edge ID:** {edge_id}"
+                f"**Edge ID:** {edge_id}\n"
+                f"**Reported at:** {timestamp}"
             ),
             priority="Urgent" if not auto_resolved else "High",
         )
         if ticket_name:
             event.frappe_ticket_id = ticket_name
+            logger.info(
+                "outage_ticket_created edge=%s ticket=%s type=%s",
+                edge_id[:16], ticket_name, outage_type,
+            )
+        else:
+            logger.error(
+                "outage_ticket_create_failed edge=%s domain=%s type=%s",
+                edge_id[:16], domain, outage_type,
+            )
     else:
+        # Amend the existing ticket with details of this new occurrence
         event.frappe_ticket_id = existing_ticket
+        note = (
+            f"**Recurring failure — {timestamp}**\n"
+            f"Type: {outage_type} | Cause: {cause}\n"
+            f"Detail: {cause_detail}\n"
+            f"Auto-resolved: {auto_resolved} | Duration: {duration_sec}s"
+        )
+        amended = await _ftc.append_to_issue(existing_ticket, note)
+        logger.warning(
+            "outage_ticket_amended edge=%s ticket=%s amended=%s type=%s",
+            edge_id[:16], existing_ticket, amended, outage_type,
+        )
 
     if auto_resolved and event.frappe_ticket_id:
         await _ftc.resolve_issue(
@@ -172,34 +196,53 @@ async def detect_offline_nodes(factory: async_sessionmaker[AsyncSession]) -> Non
                 continue
 
             # Node is offline/degraded
+            min_silent = int((now - last_seen).total_seconds() // 60)
             if open_window:
                 # Already tracking this outage; update severity if it worsened
                 if severity == "critical" and open_window.severity != "critical":
                     open_window.severity = "critical"
                     await session.flush()
+                    logger.warning(
+                        "outage_escalated edge=%s ticket=%s severity=critical min_silent=%d",
+                        node.edge_id[:16], open_window.frappe_ticket_id or "none", min_silent,
+                    )
+                # Amend the existing Frappe ticket with a status update
+                if open_window.frappe_ticket_id:
+                    timestamp = now.strftime("%Y-%m-%d %H:%M UTC")
+                    note = (
+                        f"**Still offline — {timestamp}**\n"
+                        f"Type: {outage_type} | Severity: {severity}\n"
+                        f"Last seen: {min_silent} minutes ago | Domain: {node.domain}"
+                    )
+                    amended = await _ftc.append_to_issue(open_window.frappe_ticket_id, note)
+                    logger.warning(
+                        "outage_ticket_updated edge=%s ticket=%s amended=%s min_silent=%d",
+                        node.edge_id[:16], open_window.frappe_ticket_id, amended, min_silent,
+                    )
             else:
                 # Open a new window
                 domain = node.domain
+                cause_detail = (
+                    f"Node {node.edge_id[:16]} last seen {min_silent} minutes ago."
+                )
                 event = EdgeOutageEvent(
-                    edge_id     = node.edge_id,
-                    tenant_id   = node.tenant_id,
-                    domain      = domain,
-                    outage_type = outage_type,
-                    cause       = "heartbeat_miss",
-                    cause_detail = (
-                        f"Node {node.edge_id[:16]} last seen "
-                        f"{int((now - last_seen).total_seconds() // 60)} minutes ago."
-                    ),
-                    severity    = severity,
-                    is_open     = True,
-                    alert_sent  = False,
+                    edge_id      = node.edge_id,
+                    tenant_id    = node.tenant_id,
+                    domain       = domain,
+                    outage_type  = outage_type,
+                    cause        = "heartbeat_miss",
+                    cause_detail = cause_detail,
+                    severity     = severity,
+                    is_open      = True,
+                    alert_sent   = False,
                 )
                 session.add(event)
                 await session.flush()
                 await _send_outage_alert(session, event, node.tenant_id, domain, recovered=False)
 
-                # Open Frappe ticket (dedup check)
-                ref_tag = f"edge:{node.edge_id[:24]}"
+                # Frappe ticket: create or amend
+                ref_tag   = f"edge:{node.edge_id[:24]}"
+                timestamp = now.strftime("%Y-%m-%d %H:%M UTC")
                 existing_ticket = await _ftc.find_open_issue(ref_tag)
                 if not existing_ticket:
                     ticket_name = await _ftc.create_issue(
@@ -207,20 +250,41 @@ async def detect_offline_nodes(factory: async_sessionmaker[AsyncSession]) -> Non
                         description=(
                             f"**Type:** {outage_type}\n"
                             f"**Domain:** {domain}\n"
-                            f"**Last seen:** {int((now - last_seen).total_seconds() // 60)} minutes ago\n"
-                            f"**Edge ID:** {node.edge_id}"
+                            f"**Last seen:** {min_silent} minutes ago\n"
+                            f"**Edge ID:** {node.edge_id}\n"
+                            f"**Detected at:** {timestamp}"
                         ),
                         priority="Urgent",
                     )
                     if ticket_name:
                         event.frappe_ticket_id = ticket_name
+                        logger.warning(
+                            "outage_ticket_created edge=%s ticket=%s type=%s min_silent=%d",
+                            node.edge_id[:16], ticket_name, outage_type, min_silent,
+                        )
+                    else:
+                        logger.error(
+                            "outage_ticket_create_failed edge=%s domain=%s type=%s",
+                            node.edge_id[:16], domain, outage_type,
+                        )
                 else:
+                    # Amend: existing ticket from a prior outage window still open in Frappe
                     event.frappe_ticket_id = existing_ticket
+                    note = (
+                        f"**New outage window — {timestamp}**\n"
+                        f"Type: {outage_type} | Last seen: {min_silent} minutes ago\n"
+                        f"Domain: {domain} | Edge: {node.edge_id[:16]}"
+                    )
+                    amended = await _ftc.append_to_issue(existing_ticket, note)
+                    logger.warning(
+                        "outage_ticket_amended edge=%s ticket=%s amended=%s type=%s",
+                        node.edge_id[:16], existing_ticket, amended, outage_type,
+                    )
 
                 logger.warning(
-                    "outage_opened edge=%s domain=%s type=%s last_seen_min_ago=%d",
-                    node.edge_id[:16], domain, outage_type,
-                    int((now - last_seen).total_seconds() // 60),
+                    "outage_opened edge=%s domain=%s type=%s min_silent=%d ticket=%s",
+                    node.edge_id[:16], domain, outage_type, min_silent,
+                    event.frappe_ticket_id or "none",
                 )
 
         await session.commit()
