@@ -284,6 +284,67 @@ async def report_event(body: EdgeEventRequest) -> dict[str, Any]:
     return {"ok": True, **result}
 
 
+class TracerouteRequest(BaseModel):
+    edge_id:       str = Field(..., min_length=8, max_length=128)
+    license_token: str = Field(..., min_length=10)
+    ip:            str = Field(..., min_length=7, max_length=45)
+
+    @field_validator("ip")
+    @classmethod
+    def valid_ip(cls, v: str) -> str:
+        import ipaddress
+        try:
+            ipaddress.ip_address(v)
+        except ValueError:
+            raise ValueError("Invalid IP address")
+        return v
+
+
+@public_router.post("/traceroute")
+async def edge_traceroute(body: TracerouteRequest) -> dict[str, Any]:
+    """
+    Run a traceroute from the MC3 server to the requested IP and return hop data.
+
+    Called by edge nodes when building an attack report — the traceroute runs
+    here so the WordPress plugin never needs exec().
+
+    Returns: { hops: [{hop, ip, rtt_ms}, ...] }
+    """
+    import asyncio
+    import re
+
+    if not _verify_license_token(body.edge_id, body.license_token):
+        raise HTTPException(status_code=401, detail="Invalid license token")
+
+    hops: list[dict] = []
+    try:
+        cmd = ["traceroute", "-n", "-q", "1", "-w", "2", "-m", "20", body.ip]
+        proc = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            ),
+            timeout=60,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        for line in (stdout or b"").decode("utf-8", errors="replace").splitlines():
+            m = re.match(
+                r"^\s*(\d+)\s+(\*|\d{1,3}(?:\.\d{1,3}){3}|[0-9a-f:]+)\s+(?:([\d.]+)\s+ms)?",
+                line,
+            )
+            if m:
+                hops.append({
+                    "hop":    int(m.group(1)),
+                    "ip":     None if m.group(2) == "*" else m.group(2),
+                    "rtt_ms": float(m.group(3)) if m.group(3) else None,
+                })
+    except Exception as exc:
+        logger.warning("edge_traceroute: failed for %s — %s", body.ip, exc)
+
+    return {"hops": hops}
+
+
 @public_router.post("/report/attack")
 async def report_attack(body: AttackReportRequest) -> dict[str, Any]:
     """
