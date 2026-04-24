@@ -31,6 +31,7 @@ from fastapi import HTTPException
 from frothiq_control_center.config import get_settings
 from frothiq_control_center.integrations.database import get_session_factory
 from frothiq_control_center.models.edge import AttackReport, EdgeNode, EdgeTenant, FeatureFlag, ThreatReport
+from frothiq_control_center.services import frappe_billing_client
 
 logger = logging.getLogger(__name__)
 
@@ -70,11 +71,22 @@ async def register_edge_node(
             plan=tenant.plan,
         )
 
+    is_new_tenant = node.registration_count == 1
     logger.info(
         "edge_service: %s node=%s tenant=%s plan=%s state=%s",
-        "new" if node.registration_count == 1 else "re-register",
+        "new" if is_new_tenant else "re-register",
         edge_id[:16], tenant.tenant_id[:8], tenant.plan, node.state,
     )
+
+    # Fire-and-forget: sync new tenants to ERPNext for GAAP accounting.
+    # Never blocks the registration response; failures are logged, not raised.
+    if is_new_tenant:
+        asyncio.create_task(frappe_billing_client.sync_new_tenant(
+            tenant_id=tenant.tenant_id,
+            domain=tenant.domain,
+            contact_email=tenant.contact_email,
+            plan=tenant.plan,
+        ))
 
     return {
         "tenant_id": tenant.tenant_id,

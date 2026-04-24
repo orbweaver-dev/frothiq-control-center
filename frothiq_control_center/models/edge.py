@@ -47,6 +47,9 @@ class EdgeTenant(Base):
     deregistered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # JSON snapshot of plan/notes/flags at deregistration time, used on re-registration resync
     archived_data: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ERPNext / Frappe billing references — populated async after registration
+    erpnext_customer: Mapped[str | None] = mapped_column(String(140), nullable=True)
+    erpnext_subscription: Mapped[str | None] = mapped_column(String(140), nullable=True)
 
 
 class EdgeNode(Base):
