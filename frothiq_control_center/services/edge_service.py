@@ -749,6 +749,7 @@ async def store_attack_report(data: dict[str, Any]) -> dict[str, Any]:
             cidr_blocked=bool(data.get("cidr_blocked", False)),
             enum_lockdown=bool(data.get("enum_lockdown", False)),
             notes=data.get("notes", "")[:2000],
+            traceroute_hops=json.dumps(data.get("traceroute_hops", [])) if data.get("traceroute_hops") else None,
             reported_at=now,
         )
         session.add(report)
@@ -821,5 +822,6 @@ def _attack_report_to_dict(r: AttackReport) -> dict[str, Any]:
         "cidr_blocked": r.cidr_blocked,
         "enum_lockdown": r.enum_lockdown,
         "notes": r.notes,
+        "traceroute_hops": json.loads(r.traceroute_hops) if r.traceroute_hops else [],
         "reported_at": r.reported_at.isoformat() if r.reported_at else None,
     }

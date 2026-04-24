@@ -167,4 +167,6 @@ class AttackReport(Base):
     cidr_blocked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     enum_lockdown: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # JSON-encoded list of traceroute hops: [{hop, ip, rtt_ms}, ...]
+    traceroute_hops: Mapped[str | None] = mapped_column(Text, nullable=True)
     reported_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)

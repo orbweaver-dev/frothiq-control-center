@@ -223,6 +223,7 @@ class AttackReportRequest(BaseModel):
     cidr_blocked:       bool      = False
     enum_lockdown:      bool      = False
     notes:              str       = Field("", max_length=2000)
+    traceroute_hops:    list[dict] = Field(default_factory=list)
 
 
 class EdgeEventRequest(BaseModel):
