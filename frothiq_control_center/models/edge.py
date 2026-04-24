@@ -130,3 +130,38 @@ class ThreatReport(Base):
     threat_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     first_seen: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     last_seen: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class AttackReport(Base):
+    """
+    Structured attack incident submitted by an edge node.
+
+    Captures the full attack context: attacking IP/CIDR/ASN, attack type,
+    targeted usernames, rotating user agents, attempt count, and every
+    mitigation the edge node applied. Displayed in the MC3 Attack Reports
+    page; the attacking IP is also fed into the community threat pool.
+    """
+    __tablename__ = "attack_reports"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    edge_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    domain: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    attacking_ip: Mapped[str] = mapped_column(String(45), nullable=False, index=True)
+    cidr: Mapped[str] = mapped_column(String(50), nullable=False, default="")
+    asn: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    org: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    attack_type: Mapped[str] = mapped_column(String(64), nullable=False, default="credential_stuffing")
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    usernames_targeted: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    user_agents: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    attack_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    attack_ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Mitigations applied by the edge node
+    ip_blocked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    cidr_blocked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    enum_lockdown: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    reported_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)

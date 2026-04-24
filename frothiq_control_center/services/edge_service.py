@@ -30,7 +30,7 @@ from fastapi import HTTPException
 
 from frothiq_control_center.config import get_settings
 from frothiq_control_center.integrations.database import get_session_factory
-from frothiq_control_center.models.edge import EdgeNode, EdgeTenant, FeatureFlag, ThreatReport
+from frothiq_control_center.models.edge import AttackReport, EdgeNode, EdgeTenant, FeatureFlag, ThreatReport
 
 logger = logging.getLogger(__name__)
 
@@ -694,3 +694,120 @@ async def _forward_threat_to_core(ip: str, event_type: str, severity: str) -> No
         )
     except Exception as exc:
         logger.debug("_forward_threat_to_core: %s ip=%s: %s", event_type, ip, exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Attack Reports
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def store_attack_report(data: dict[str, Any]) -> dict[str, Any]:
+    """
+    Persist a structured attack report submitted by an edge node.
+
+    Also feeds the attacking IP into the community threat pool so it can
+    be distributed to other edge nodes via the /blocklist feed.
+    """
+    factory = get_session_factory()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    def _parse_ts(val: Any) -> datetime | None:
+        try:
+            return datetime.fromtimestamp(int(val), tz=timezone.utc).replace(tzinfo=None)
+        except (TypeError, ValueError, OSError):
+            return None
+
+    report_id = str(uuid.uuid4())
+    async with factory() as session:
+        report = AttackReport(
+            id=report_id,
+            edge_id=data.get("edge_id", ""),
+            tenant_id=data.get("tenant_id", ""),
+            domain=data.get("domain", "")[:255],
+            attacking_ip=data.get("attacking_ip", ""),
+            cidr=data.get("cidr", "")[:50],
+            asn=data.get("asn", "")[:32],
+            org=data.get("org", "")[:255],
+            attack_type=data.get("attack_type", "credential_stuffing")[:64],
+            attempt_count=int(data.get("attempt_count", 0)),
+            usernames_targeted=json.dumps(data.get("usernames_targeted", [])),
+            user_agents=json.dumps(data.get("user_agents", [])),
+            attack_started_at=_parse_ts(data.get("attack_started_at")),
+            attack_ended_at=_parse_ts(data.get("attack_ended_at")),
+            ip_blocked=bool(data.get("ip_blocked", False)),
+            cidr_blocked=bool(data.get("cidr_blocked", False)),
+            enum_lockdown=bool(data.get("enum_lockdown", False)),
+            notes=data.get("notes", "")[:2000],
+            reported_at=now,
+        )
+        session.add(report)
+        await session.commit()
+
+    logger.info(
+        "attack_report: id=%s ip=%s type=%s attempts=%d domain=%s",
+        report_id, data.get("attacking_ip"), data.get("attack_type"),
+        data.get("attempt_count", 0), data.get("domain"),
+    )
+
+    # Feed IP into community threat pool
+    await report_edge_event(
+        edge_id=data.get("edge_id", ""),
+        tenant_id=data.get("tenant_id", ""),
+        ip=data.get("attacking_ip", ""),
+        event_type=data.get("attack_type", "credential_stuffing"),
+        severity="high",
+        reason=(
+            f"Attack report: {data.get('attack_type','credential_stuffing')} — "
+            f"{data.get('attempt_count', 0)} attempts on {data.get('domain', '')}"
+        ),
+    )
+
+    return {"report_id": report_id}
+
+
+async def list_attack_reports(
+    limit: int = 50,
+    offset: int = 0,
+    tenant_id: str | None = None,
+) -> dict[str, Any]:
+    """Return paginated attack reports for the Control Center UI."""
+    from sqlalchemy import func
+
+    factory = get_session_factory()
+    async with factory() as session:
+        stmt = select(AttackReport).order_by(AttackReport.reported_at.desc())
+        if tenant_id:
+            stmt = stmt.where(AttackReport.tenant_id == tenant_id)
+        stmt = stmt.limit(min(limit, 200)).offset(offset)
+        result = await session.execute(stmt)
+        rows = result.scalars().all()
+
+        count_stmt = select(func.count()).select_from(AttackReport)
+        if tenant_id:
+            count_stmt = count_stmt.where(AttackReport.tenant_id == tenant_id)
+        total = (await session.execute(count_stmt)).scalar_one()
+
+    return {"reports": [_attack_report_to_dict(r) for r in rows], "total": total}
+
+
+def _attack_report_to_dict(r: AttackReport) -> dict[str, Any]:
+    return {
+        "id": r.id,
+        "edge_id": r.edge_id,
+        "tenant_id": r.tenant_id,
+        "domain": r.domain,
+        "attacking_ip": r.attacking_ip,
+        "cidr": r.cidr,
+        "asn": r.asn,
+        "org": r.org,
+        "attack_type": r.attack_type,
+        "attempt_count": r.attempt_count,
+        "usernames_targeted": json.loads(r.usernames_targeted or "[]"),
+        "user_agents": json.loads(r.user_agents or "[]"),
+        "attack_started_at": r.attack_started_at.isoformat() if r.attack_started_at else None,
+        "attack_ended_at": r.attack_ended_at.isoformat() if r.attack_ended_at else None,
+        "ip_blocked": r.ip_blocked,
+        "cidr_blocked": r.cidr_blocked,
+        "enum_lockdown": r.enum_lockdown,
+        "notes": r.notes,
+        "reported_at": r.reported_at.isoformat() if r.reported_at else None,
+    }

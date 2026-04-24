@@ -34,11 +34,13 @@ from frothiq_control_center.services.edge_service import (
     get_feature_flags,
     get_registration_stats,
     deregister_edge_node,
+    list_attack_reports,
     list_edge_nodes,
     list_edge_tenants,
     register_edge_node,
     report_edge_event,
     set_feature_flag,
+    store_attack_report,
     touch_edge_node,
 )
 
@@ -202,6 +204,27 @@ async def edge_heartbeat(body: EdgeHeartbeatRequest) -> dict[str, Any]:
     }
 
 
+class AttackReportRequest(BaseModel):
+    edge_id:            str       = Field(..., min_length=8, max_length=128)
+    license_token:      str       = Field(..., min_length=10)
+    tenant_id:          str       = Field(..., min_length=8, max_length=36)
+    domain:             str       = Field("", max_length=255)
+    attacking_ip:       str       = Field(..., min_length=7, max_length=45)
+    cidr:               str       = Field("", max_length=50)
+    asn:                str       = Field("", max_length=32)
+    org:                str       = Field("", max_length=255)
+    attack_type:        str       = Field("credential_stuffing", max_length=64)
+    attempt_count:      int       = Field(0, ge=0)
+    usernames_targeted: list[str] = Field(default_factory=list)
+    user_agents:        list[str] = Field(default_factory=list)
+    attack_started_at:  int | None = None
+    attack_ended_at:    int | None = None
+    ip_blocked:         bool      = False
+    cidr_blocked:       bool      = False
+    enum_lockdown:      bool      = False
+    notes:              str       = Field("", max_length=2000)
+
+
 class EdgeEventRequest(BaseModel):
     edge_id:       str = Field(..., min_length=8,  max_length=128)
     tenant_id:     str = Field(..., min_length=8,  max_length=36)
@@ -257,6 +280,23 @@ async def report_event(body: EdgeEventRequest) -> dict[str, Any]:
         severity=body.severity,
         reason=body.reason,
     )
+    return {"ok": True, **result}
+
+
+@public_router.post("/report/attack")
+async def report_attack(body: AttackReportRequest) -> dict[str, Any]:
+    """
+    Receive a structured attack incident report from an edge node.
+
+    Stores the full incident context (attacking IP/CIDR/ASN, attack type,
+    targeted usernames, rotating user agents, attempt count, and every
+    mitigation the edge applied). Also feeds the attacking IP into the
+    community threat pool for blocklist distribution to other nodes.
+    """
+    if not _verify_license_token(body.edge_id, body.license_token):
+        raise HTTPException(status_code=401, detail="Invalid license token")
+
+    result = await store_attack_report(body.model_dump())
     return {"ok": True, **result}
 
 
@@ -528,3 +568,18 @@ async def list_tickets(
 
     tickets = await _ftc.get_issues_for_edge(edge_id, limit=20)
     return {"ok": True, "tickets": tickets, "count": len(tickets)}
+
+
+@protected_router.get("/edge/attack-reports")
+async def get_attack_reports(
+    limit:     int       = 50,
+    offset:    int       = 0,
+    tenant_id: str | None = None,
+    _user: Any = Depends(require_role("read_only")),
+) -> dict[str, Any]:
+    """
+    Return paginated attack reports for the Control Center Attack Reports page.
+    Accessible to all authenticated CC users (read_only and above).
+    """
+    result = await list_attack_reports(limit=limit, offset=offset, tenant_id=tenant_id)
+    return {"ok": True, **result}
