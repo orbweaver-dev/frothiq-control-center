@@ -168,11 +168,10 @@ async def get_blocklist(
     Return the threat IP block list for this edge node's plan.
 
     Block list tiers:
-      free:       reserved for future core integration — returns empty list
-      pro:        extended feed from core client (if available)
-      enterprise: full feed including predictive signals
+      free:       full feed — same as enterprise while plan enforcement is off
+      pro:        extended feed (score ≥ 70)
+      enterprise: full feed (score ≥ 50)
 
-    Currently returns IPs sourced from the FrothIQ core client's threat feeds.
     Falls back to an empty list if core is unreachable (fail-open for availability).
     """
     from frothiq_control_center.services.core_client import core_client
@@ -189,8 +188,8 @@ async def get_blocklist(
 
     plan = node.plan
 
-    # Score threshold by plan
-    score_threshold = {"free": 90, "pro": 70, "enterprise": 50}.get(plan, 90)
+    # Score threshold by plan — free matches enterprise while plan enforcement is off
+    score_threshold = {"pro": 70, "enterprise": 50}.get(plan, 50)
 
     # Source 1 — frothiq-core threat feed (fail-open)
     core_ips: list[str] = []
@@ -631,15 +630,14 @@ def _build_feature_flags(plan: str, enforcement_enabled: bool) -> dict[str, bool
             "audit_logs": True,
         }
 
-    # Enforcement mode: gate by plan
-    is_free = plan == "free"
+    # Enforcement mode: all features open for now — free plan ungated
     return {
-        "paywall_active": is_free,
-        "upgrade_prompt": is_free,
-        "advanced_scanning": not is_free,
-        "real_time_events": not is_free,
-        "threat_feeds": plan in ("pro", "enterprise"),
-        "audit_logs": plan in ("pro", "enterprise"),
+        "paywall_active": False,
+        "upgrade_prompt": False,
+        "advanced_scanning": True,
+        "real_time_events": True,
+        "threat_feeds": True,
+        "audit_logs": True,
     }
 
 
