@@ -293,9 +293,12 @@ async def apply_recommendation(
     cidr = row.cidr
     covered_ips: list[str] = json.loads(row.covered_ips)
 
-    # 1. Add CIDR to blacklist
+    # 1. Add CIDR to blacklist.
+    # "interval overlaps" means the CIDR is already in the set — treat as
+    # idempotent success so retries and pre-existing entries don't block the
+    # rest of the apply flow (IP removal + DB update still run).
     rc, _, err = await _run(["nft", "add", "element", "inet", "frothiq", "blacklist", f"{{ {cidr} }}"])
-    if rc != 0:
+    if rc != 0 and "interval overlaps" not in err:
         return {"success": False, "error": f"nft add CIDR failed: {err.strip()}"}
 
     # 2. Remove individual IPs from nftables (best-effort — they're now covered by CIDR)
