@@ -172,6 +172,41 @@ async def touch_edge_node(
     return {"plan": node.plan, "state": node.state}
 
 
+async def _read_nft_blacklist(set_name: str = "blacklist") -> list[str]:
+    """
+    Read the live nftables `inet frothiq <set_name>` set and return all IP/CIDR entries.
+
+    This is the canonical MC3 blacklist — the same IPs the firewall enforces.
+    Runs as a non-blocking asyncio subprocess (no event loop blocking).
+    Returns empty list on any failure.
+    """
+    import re
+    try:
+        proc = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
+                "sudo", "nft", "list", "set", "inet", "frothiq", set_name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            ),
+            timeout=5,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        text = (stdout or b"").decode("utf-8", errors="replace")
+        elements_match = re.search(r"elements\s*=\s*\{([^}]+)\}", text, re.DOTALL)
+        if not elements_match:
+            return []
+        entries: list[str] = []
+        for token in re.split(r",", elements_match.group(1)):
+            token = token.strip()
+            ip_part = token.split()[0] if token else ""
+            if ip_part and re.match(r"^[\d./a-fA-F:]+$", ip_part):
+                entries.append(ip_part)
+        return entries
+    except Exception as exc:
+        logger.debug("edge_service: _read_nft_blacklist(%s) failed: %s", set_name, exc)
+        return []
+
+
 async def get_blocklist(
     edge_id: str,
     since: int = 0,
@@ -179,12 +214,15 @@ async def get_blocklist(
     """
     Return the threat IP block list for this edge node's plan.
 
+    Sources (merged and deduplicated in priority order):
+      1. Live nftables `inet frothiq blacklist` — the canonical MC3-enforced list
+      2. Community threat pool (ThreatReport table, score-filtered per plan)
+      3. frothiq-core external threat feed (fail-open fallback)
+
     Block list tiers:
       free:       full feed — same as enterprise while plan enforcement is off
       pro:        extended feed (score ≥ 70)
       enterprise: full feed (score ≥ 50)
-
-    Falls back to an empty list if core is unreachable (fail-open for availability).
     """
     from frothiq_control_center.services.core_client import core_client
 
@@ -203,20 +241,8 @@ async def get_blocklist(
     # Score threshold by plan — free matches enterprise while plan enforcement is off
     score_threshold = {"pro": 70, "enterprise": 50}.get(plan, 50)
 
-    # Source 1 — frothiq-core threat feed (fail-open)
-    core_ips: list[str] = []
-    try:
-        params: dict[str, Any] = {"min_score": score_threshold, "limit": 500}
-        if since:
-            params["since"] = since
-        data = await core_client.get("/api/v1/threats/feed", params=params)
-        if isinstance(data, list):
-            core_ips = [str(e["ip"]) for e in data if e.get("ip")]
-        elif isinstance(data, dict):
-            raw = data.get("ips") or data.get("threats") or []
-            core_ips = [str(e["ip"] if isinstance(e, dict) else e) for e in raw if e]
-    except Exception as exc:
-        logger.warning("edge_service: get_blocklist core feed failed: %s", exc)
+    # Source 1 — live nftables blacklist (canonical MC3 firewall list)
+    nft_ips = await _read_nft_blacklist("blacklist")
 
     # Source 2 — community threat pool (IPs reported as blocked by edge nodes)
     community_ips: list[str] = []
@@ -235,12 +261,27 @@ async def get_blocklist(
     except Exception as exc:
         logger.warning("edge_service: get_blocklist community query failed: %s", exc)
 
-    # Merge and deduplicate both sources
-    ips = list(dict.fromkeys(core_ips + community_ips))
+    # Source 3 — frothiq-core external threat feed (fail-open)
+    core_ips: list[str] = []
+    try:
+        params: dict[str, Any] = {"min_score": score_threshold, "limit": 5000}
+        if since:
+            params["since"] = since
+        data = await core_client.get("/api/v1/threats/feed", params=params)
+        if isinstance(data, list):
+            core_ips = [str(e["ip"]) for e in data if e.get("ip")]
+        elif isinstance(data, dict):
+            raw = data.get("ips") or data.get("threats") or []
+            core_ips = [str(e["ip"] if isinstance(e, dict) else e) for e in raw if e]
+    except Exception as exc:
+        logger.debug("edge_service: get_blocklist core feed unavailable: %s", exc)
 
-    logger.debug(
-        "edge_service: blocklist plan=%s threshold=%d core=%d community=%d total=%d",
-        plan, score_threshold, len(core_ips), len(community_ips), len(ips),
+    # Merge: nft (canonical) first so it's never filtered out, then community, then core
+    ips = list(dict.fromkeys(nft_ips + community_ips + core_ips))
+
+    logger.info(
+        "edge_service: blocklist plan=%s threshold=%d nft=%d community=%d core=%d total=%d",
+        plan, score_threshold, len(nft_ips), len(community_ips), len(core_ips), len(ips),
     )
     return {"ips": ips, "plan": plan}
 
