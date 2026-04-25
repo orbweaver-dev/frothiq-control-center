@@ -687,6 +687,22 @@ async def list_tickets(
     return {"ok": True, "tickets": tickets, "count": len(tickets)}
 
 
+@public_router.get("/attack-reports")
+async def list_edge_attack_reports(
+    edge_id:       str,
+    license_token: str,
+    limit:         int = 50,
+    offset:        int = 0,
+) -> dict[str, Any]:
+    """Return attack reports for this edge node (plugin-facing, no CC auth required)."""
+    if not _verify_license_token(edge_id, license_token):
+        raise HTTPException(status_code=401, detail="Invalid license token")
+
+    from frothiq_control_center.services.edge_service import list_attack_reports
+    result = await list_attack_reports(limit=min(limit, 100), offset=offset, edge_id=edge_id)
+    return {"ok": True, **result}
+
+
 @protected_router.get("/edge/attack-reports")
 async def get_attack_reports(
     limit:     int       = 50,

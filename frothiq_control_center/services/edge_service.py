@@ -1087,8 +1087,9 @@ async def list_attack_reports(
     limit: int = 50,
     offset: int = 0,
     tenant_id: str | None = None,
+    edge_id: str | None = None,
 ) -> dict[str, Any]:
-    """Return paginated attack reports for the Control Center UI."""
+    """Return paginated attack reports for the Control Center UI or edge plugin."""
     from sqlalchemy import func
 
     factory = get_session_factory()
@@ -1096,6 +1097,8 @@ async def list_attack_reports(
         stmt = select(AttackReport).order_by(AttackReport.reported_at.desc())
         if tenant_id:
             stmt = stmt.where(AttackReport.tenant_id == tenant_id)
+        if edge_id:
+            stmt = stmt.where(AttackReport.edge_id == edge_id)
         stmt = stmt.limit(min(limit, 200)).offset(offset)
         result = await session.execute(stmt)
         rows = result.scalars().all()
@@ -1103,6 +1106,8 @@ async def list_attack_reports(
         count_stmt = select(func.count()).select_from(AttackReport)
         if tenant_id:
             count_stmt = count_stmt.where(AttackReport.tenant_id == tenant_id)
+        if edge_id:
+            count_stmt = count_stmt.where(AttackReport.edge_id == edge_id)
         total = (await session.execute(count_stmt)).scalar_one()
 
     return {"reports": [_attack_report_to_dict(r) for r in rows], "total": total}
