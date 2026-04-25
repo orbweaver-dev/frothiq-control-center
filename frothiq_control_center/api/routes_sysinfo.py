@@ -174,8 +174,16 @@ _ipacct6_ips: set[str] = set()
 _ipacct_lock  = threading.Lock()
 _ipacct6_lock = threading.Lock()
 
+# Cache ipacct reads — dashboard polls every 2 s; cap nft reads at 1/10 s to avoid
+# generating dozens of kernel netlink calls per minute.
+_IPACCT_TTL = 10.0
+_ipacct_cache:  dict = {"data": {}, "ts": 0.0}
+_ipacct6_cache: dict = {"data": {}, "ts": 0.0}
+
 def _nft(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["sudo", "nft"] + list(args), capture_output=True, text=True)
+    # Run nft directly — the service unit grants CAP_NET_ADMIN via AmbientCapabilities,
+    # so no sudo is needed for nftables operations.
+    return subprocess.run(["/usr/sbin/nft"] + list(args), capture_output=True, text=True)
 
 def _parse_nft_counters(table: str, family: str, proto_fields: tuple[str, ...]) -> dict[str, dict[str, int]]:
     """Generic parser for nftables counter rules. Works for both ip and ip6 families."""
@@ -232,7 +240,13 @@ def _get_ipacct(current_ips: set[str]) -> dict[str, dict[str, int]]:
         if current_ips != _ipacct_ips:
             _setup_ipacct(current_ips)
             _ipacct_ips = current_ips.copy()
-    return _parse_nft_counters("cc_ipacct", "ip", ("ip",))
+        now = time.monotonic()
+        if now - _ipacct_cache["ts"] < _IPACCT_TTL:
+            return dict(_ipacct_cache["data"])
+        result = _parse_nft_counters("cc_ipacct", "ip", ("ip",))
+        _ipacct_cache["data"] = result
+        _ipacct_cache["ts"] = now
+    return result
 
 # --- IPv6 ---
 
@@ -253,7 +267,13 @@ def _get_ipacct6(current_ips: set[str]) -> dict[str, dict[str, int]]:
         if current_ips != _ipacct6_ips:
             _setup_ipacct6(current_ips)
             _ipacct6_ips = current_ips.copy()
-    return _parse_nft_counters("cc_ipacct6", "ip6", ("ip6",))
+        now = time.monotonic()
+        if now - _ipacct6_cache["ts"] < _IPACCT_TTL:
+            return dict(_ipacct6_cache["data"])
+        result = _parse_nft_counters("cc_ipacct6", "ip6", ("ip6",))
+        _ipacct6_cache["data"] = result
+        _ipacct6_cache["ts"] = now
+    return result
 
 # ---------------------------------------------------------------------------
 # Helpers

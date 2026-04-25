@@ -177,7 +177,7 @@ async def _nft_add_element(ip: str) -> bool:
     try:
         proc = await asyncio.wait_for(
             asyncio.create_subprocess_exec(
-                "sudo", "nft", "add", "element", "inet", "frothiq", "blacklist", f"{{ {ip} }}",
+                "/usr/sbin/nft", "add", "element", "inet", "frothiq", "blacklist", f"{{ {ip} }}",
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             ),
@@ -317,7 +317,7 @@ async def _read_nft_blacklist(set_name: str = "blacklist") -> list[str]:
     try:
         proc = await asyncio.wait_for(
             asyncio.create_subprocess_exec(
-                "sudo", "nft", "list", "set", "inet", "frothiq", set_name,
+                "/usr/sbin/nft", "list", "set", "inet", "frothiq", set_name,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             ),

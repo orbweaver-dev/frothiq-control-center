@@ -106,8 +106,9 @@ VALIDATION_DEFAULTS = {
 # ---------------------------------------------------------------------------
 
 async def _run(cmd: list[str], sudo: bool = True) -> tuple[int, str, str]:
-    """Run a shell command, optionally with sudo. Returns (returncode, stdout, stderr)."""
-    if sudo:
+    """Run a shell command, optionally with sudo. Returns (returncode, stdout, stderr).
+    nft commands never use sudo — the service unit grants CAP_NET_ADMIN via AmbientCapabilities."""
+    if sudo and (not cmd or cmd[0] not in ("nft", "/usr/sbin/nft")):
         cmd = ["sudo"] + cmd
     try:
         proc = await asyncio.create_subprocess_exec(

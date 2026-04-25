@@ -14,6 +14,8 @@ import re
 import subprocess
 import time
 from collections import Counter, defaultdict
+from datetime import datetime
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, Query, Request
 
@@ -24,6 +26,31 @@ router = APIRouter(prefix="/traffic", tags=["traffic"])
 _GW_AUDIT_STREAM = "gw:audit"
 _PROC_NET_DEV = "/proc/net/dev"
 _NFT_TABLE = "inet frothiq"
+_APACHE_LOG_DIR = Path("/var/log/virtualmin")
+
+# ---------------------------------------------------------------------------
+# Apache log cache — shared across all endpoints; refreshed at most every
+# _APACHE_CACHE_TTL seconds to prevent subprocess explosion under fast polls.
+# ---------------------------------------------------------------------------
+_APACHE_CACHE_TTL = 10.0          # seconds before re-reading logs
+_APACHE_MAX_CONCURRENT = 6        # max simultaneous sudo tail subprocesses
+_apache_cache: dict = {"data": [], "ts": 0.0}
+_apache_cache_lock: asyncio.Lock | None = None
+_apache_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_apache_lock() -> asyncio.Lock:
+    global _apache_cache_lock
+    if _apache_cache_lock is None:
+        _apache_cache_lock = asyncio.Lock()
+    return _apache_cache_lock
+
+
+def _get_apache_semaphore() -> asyncio.Semaphore:
+    global _apache_semaphore
+    if _apache_semaphore is None:
+        _apache_semaphore = asyncio.Semaphore(_APACHE_MAX_CONCURRENT)
+    return _apache_semaphore
 
 
 # ---------------------------------------------------------------------------
@@ -34,7 +61,7 @@ def _nft_list_set(set_name: str) -> list[str]:
     """Return the list of IPs/CIDRs in a named nftables set."""
     try:
         result = subprocess.run(
-            ["nft", "list", "set", "inet", "frothiq", set_name],
+            ["/usr/sbin/nft", "list", "set", "inet", "frothiq", set_name],
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode != 0:
@@ -180,6 +207,178 @@ def _security_action(
 
 
 # ---------------------------------------------------------------------------
+# Nginx log parser (whole-server traffic)
+# ---------------------------------------------------------------------------
+
+_NGINX_LOG = "/var/log/nginx/access.log"
+
+# Regex for new format: $host $remote_addr ... (host prepended after our change)
+_RE_NEW = re.compile(
+    r'^(\S+) (\S+) - \S+ \[([^\]]+)\] "(\w+) (\S+) [^"]+" (\d+) \d+ "[^"]*" "([^"]*)"'
+)
+# Regex for old format: $remote_addr ... (no host)
+_RE_OLD = re.compile(
+    r'^(\S+) - \S+ \[([^\]]+)\] "(\w+) (\S+) [^"]+" (\d+) \d+ "[^"]*" "([^"]*)"'
+)
+
+_NGINX_TS_FMT = "%d/%b/%Y:%H:%M:%S %z"
+
+
+def _parse_nginx_log(n_lines: int = 500) -> list[dict]:
+    """Tail the nginx access log and return structured entries, newest first."""
+    try:
+        with open(_NGINX_LOG, "rb") as fh:
+            # Efficient tail: seek from end
+            fh.seek(0, 2)
+            size = fh.tell()
+            chunk = min(size, 256 * 1024)  # read up to 256 KB
+            fh.seek(max(0, size - chunk))
+            raw_lines = fh.read().decode("utf-8", errors="replace").splitlines()
+    except Exception:
+        return []
+
+    entries = []
+    for line in reversed(raw_lines[-n_lines:]):
+        line = line.strip()
+        if not line:
+            continue
+        m = _RE_NEW.match(line)
+        if m:
+            host, ip, ts_str, method, path, status, ua = m.groups()
+        else:
+            m = _RE_OLD.match(line)
+            if m:
+                ip, ts_str, method, path, status, ua = m.groups()
+                host = "unknown"
+            else:
+                continue
+        try:
+            ts = int(datetime.strptime(ts_str, _NGINX_TS_FMT).timestamp())
+        except Exception:
+            ts = 0
+        entries.append({
+            "_id": f"nginx-{hash(line) & 0xFFFFFFFF:08x}",
+            "ts": ts,
+            "method": method,
+            "path": path,
+            "upstream": "nginx",
+            "host": host,
+            "status": int(status),
+            "latency_ms": 0,
+            "client_ip": ip,
+            "user_agent": ua,
+            "tenant_id": "",
+            "cc_role": "",
+        })
+        if len(entries) >= n_lines:
+            break
+
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# Apache / Virtualmin log parser (second IP stack — .77.105)
+# ---------------------------------------------------------------------------
+
+# Apache "combined" format: IP - - [DD/Mon/YYYY:HH:MM:SS -TZ] "METHOD path HTTP/ver" status bytes "ref" "ua"
+_RE_APACHE = re.compile(
+    r'^(\S+) - \S+ \[([^\]]+)\] "(\w+) (\S+) [^"]+" (\d+) \d+ "[^"]*" "([^"]*)"'
+)
+_APACHE_TS_FMT = "%d/%b/%Y:%H:%M:%S %z"
+
+
+def _parse_single_apache_log(domain: str, log_path: str, max_bytes: int = 32768) -> list[dict]:
+    """Parse one Apache combined-format access log. Returns entries newest first."""
+    try:
+        result = subprocess.run(
+            ["sudo", "tail", "-c", str(max_bytes), log_path],
+            capture_output=True, text=True, timeout=6,
+        )
+        text = result.stdout
+    except Exception:
+        return []
+
+    entries = []
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        m = _RE_APACHE.match(line)
+        if not m:
+            continue
+        ip, ts_str, method, path, status, ua = m.groups()
+        try:
+            ts = int(datetime.strptime(ts_str, _APACHE_TS_FMT).timestamp())
+        except ValueError:
+            ts = 0
+        entries.append({
+            "_id": f"apache-{hash(line) & 0xFFFFFFFF:08x}",
+            "ts": ts,
+            "method": method,
+            "path": path,
+            "upstream": "apache",
+            "host": domain,
+            "status": int(status),
+            "latency_ms": 0,
+            "client_ip": ip,
+            "user_agent": ua,
+            "tenant_id": "",
+            "cc_role": "",
+        })
+    return entries
+
+
+async def _parse_single_apache_log_throttled(domain: str, log_path: str) -> list[dict]:
+    """Parse one Apache log, rate-limited by the shared semaphore."""
+    async with _get_apache_semaphore():
+        return await asyncio.to_thread(_parse_single_apache_log, domain, log_path)
+
+
+async def _parse_apache_logs_async(n_per_file: int = 200) -> list[dict]:
+    """
+    Read all Virtualmin access logs in parallel and return parsed entries.
+    Results are cached for _APACHE_CACHE_TTL seconds to prevent subprocess
+    explosion when multiple endpoints poll simultaneously.
+    """
+    now = time.monotonic()
+    lock = _get_apache_lock()
+
+    async with lock:
+        if now - _apache_cache["ts"] < _APACHE_CACHE_TTL:
+            return list(_apache_cache["data"])
+
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ["sudo", "ls", str(_APACHE_LOG_DIR)],
+                capture_output=True, text=True, timeout=5,
+            )
+            filenames = [
+                f for f in result.stdout.strip().splitlines()
+                if f.endswith("_access_log") and not f.endswith(".gz")
+            ]
+        except Exception:
+            return []
+
+        tasks = [
+            _parse_single_apache_log_throttled(
+                fname.replace("_access_log", ""),
+                str(_APACHE_LOG_DIR / fname),
+            )
+            for fname in filenames
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        all_entries: list[dict] = []
+        for r in results:
+            if isinstance(r, list):
+                all_entries.extend(r)
+
+        _apache_cache["data"] = all_entries
+        _apache_cache["ts"] = time.monotonic()
+        return list(all_entries)
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -221,6 +420,54 @@ async def get_live_traffic(
     return {"entries": entries, "count": len(entries), "stream": _GW_AUDIT_STREAM}
 
 
+@router.get("/server-feed")
+async def get_server_feed(
+    request: Request,
+    limit: int = Query(200, ge=50, le=1000),
+    _: TokenPayload = Depends(require_security_analyst),
+):
+    """
+    Combined whole-server traffic feed: gateway audit stream (mc3) + nginx access log
+    (all Frappe sites). Entries sorted newest first. Annotated with security_action.
+    """
+    redis = request.state.redis
+    gw_entries, nginx_entries, apache_entries, (bl_exact, bl_nets, temp_ban) = await asyncio.gather(
+        _read_audit_entries(redis, count=limit),
+        asyncio.to_thread(_parse_nginx_log, limit),
+        _parse_apache_logs_async(),
+        asyncio.to_thread(_build_block_sets),
+    )
+
+    # Compute per-IP error rates across all sources
+    ip_total: Counter = Counter()
+    ip_errors: Counter = Counter()
+    for e in [*gw_entries, *nginx_entries, *apache_entries]:
+        ip = e.get("client_ip", "")
+        st = e.get("status", 0)
+        ip_total[ip] += 1
+        if 400 <= st < 600:
+            ip_errors[ip] += 1
+
+    ip_error_rates: dict[str, float] = {
+        ip: ip_errors[ip] / ip_total[ip] for ip in ip_total
+    }
+    for ip in ip_total:
+        ip_error_rates[ip + ":n"] = ip_total[ip]
+
+    all_entries = [*gw_entries, *nginx_entries, *apache_entries]
+    for e in all_entries:
+        ip = e.get("client_ip", "")
+        e["security_action"] = _security_action(
+            ip, e.get("status", 0), bl_exact, bl_nets, temp_ban, ip_error_rates
+        )
+
+    # Sort newest first, cap at limit
+    all_entries.sort(key=lambda e: e.get("ts", 0), reverse=True)
+    all_entries = all_entries[:limit]
+
+    return {"entries": all_entries, "count": len(all_entries), "sources": ["gateway", "nginx", "apache"]}
+
+
 @router.get("/ip-sessions")
 async def get_ip_sessions(
     request: Request,
@@ -233,10 +480,13 @@ async def get_ip_sessions(
     This is the WordFence-style live view — aggregated, not per-request.
     """
     redis = request.state.redis
-    entries, (bl_exact, bl_nets, temp_ban) = await asyncio.gather(
+    gw_entries, nginx_entries, apache_entries, (bl_exact, bl_nets, temp_ban) = await asyncio.gather(
         _read_audit_entries(redis, count=limit),
+        asyncio.to_thread(_parse_nginx_log, limit),
+        _parse_apache_logs_async(),
         asyncio.to_thread(_build_block_sets),
     )
+    entries = [*gw_entries, *nginx_entries, *apache_entries]
 
     # First pass: per-IP totals for suspicious detection
     ip_total: Counter = Counter()
@@ -268,6 +518,7 @@ async def get_ip_sessions(
                 "last_path": e.get("path", ""),
                 "last_status": st,
                 "paths_seen": [],
+                "upstreams_seen": [],
                 "is_blocked": ip_blocked,
                 "is_temp_banned": ip in temp_ban,
                 "security_action": "allowed",
@@ -287,6 +538,9 @@ async def get_ip_sessions(
         path = e.get("path", "")
         if path and path not in s["paths_seen"] and len(s["paths_seen"]) < 5:
             s["paths_seen"].append(path)
+        upstream = e.get("upstream", "")
+        if upstream and upstream not in s["upstreams_seen"] and len(s["upstreams_seen"]) < 10:
+            s["upstreams_seen"].append(upstream)
 
     # Third pass: assign worst-case security_action (CIDR-aware)
     _ACTION_RANK = {"blocked": 3, "temp_banned": 2, "suspicious": 1, "allowed": 0}
@@ -316,7 +570,10 @@ async def get_active_blocks(
     Return currently active nftables blocks: permanent blacklist + active temp bans.
     Reads live nft sets — reflects real enforcement state.
     """
-    bl_exact, bl_nets, temp_ban = await asyncio.to_thread(_build_block_sets)
+    (bl_exact, bl_nets, temp_ban), whitelist_raw = await asyncio.gather(
+        asyncio.to_thread(_build_block_sets),
+        asyncio.to_thread(lambda: _nft_list_set("whitelist")),
+    )
     all_bl = list(bl_exact) + [str(n) for n in bl_nets]
     return {
         "blacklist": sorted(all_bl),
@@ -324,6 +581,8 @@ async def get_active_blocks(
         "temp_ban": sorted(temp_ban),
         "temp_ban_count": len(temp_ban),
         "total_blocked": len(all_bl) + len(temp_ban),
+        "whitelist": sorted(whitelist_raw),
+        "whitelist_count": len(whitelist_raw),
     }
 
 
@@ -335,10 +594,13 @@ async def get_traffic_stats(
 ):
     """Aggregated traffic statistics over a rolling time window, including block counts."""
     redis = request.state.redis
-    entries, (bl_exact, bl_nets, temp_ban) = await asyncio.gather(
+    gw_entries, nginx_entries, apache_entries, (bl_exact, bl_nets, temp_ban) = await asyncio.gather(
         _read_audit_entries(redis, count=2000),
+        asyncio.to_thread(_parse_nginx_log, 500),
+        _parse_apache_logs_async(),
         asyncio.to_thread(_build_block_sets),
     )
+    entries = [*gw_entries, *nginx_entries, *apache_entries]
 
     now = int(time.time())
     cutoff = now - window_seconds
@@ -399,3 +661,95 @@ async def get_traffic_stats(
         "total_blocked": len(bl_exact) + len(bl_nets) + len(temp_ban),
         "ts": now,
     }
+
+
+@router.get("/enforcement-log")
+async def get_enforcement_log(
+    request: Request,
+    limit: int = Query(100, ge=10, le=500),
+    _: TokenPayload = Depends(require_security_analyst),
+):
+    """
+    Recent automatic enforcement actions taken by the policy enforcement engine.
+    Returns newest-first list of temp-ban events with IP, reason, and timestamp.
+    """
+    from frothiq_control_center.services.enforcement_engine import (
+        LOG_STREAM, SCAN_INTERVAL, WINDOW_SECONDS, RATE_THRESHOLD, ERROR_RATE_THRESHOLD,
+    )
+    redis = request.state.redis
+    try:
+        raw = await redis.xrevrange(LOG_STREAM, count=limit)
+    except Exception:
+        raw = []
+
+    entries = []
+    for stream_id, fields in raw:
+        try:
+            ts = int(fields.get("ts", 0))
+        except (ValueError, TypeError):
+            ts = 0
+        entries.append({
+            "id":     stream_id,
+            "ts":     ts,
+            "ip":     fields.get("ip", ""),
+            "action": fields.get("action", ""),
+            "reason": fields.get("reason", ""),
+            "reqs":   int(fields.get("reqs", 0) or 0),
+            "errors": int(fields.get("errors", 0) or 0),
+        })
+
+    return {
+        "entries": entries,
+        "count":   len(entries),
+        "engine": {
+            "scan_interval_s":       SCAN_INTERVAL,
+            "window_s":              WINDOW_SECONDS,
+            "rate_threshold":        RATE_THRESHOLD,
+            "error_rate_threshold":  ERROR_RATE_THRESHOLD,
+        },
+    }
+
+
+@router.get("/my-ip")
+async def get_my_ip(
+    request: Request,
+    _: TokenPayload = Depends(require_security_analyst),
+):
+    """
+    Return the caller's IP address(es) as seen by the backend.
+    Returns both the observed IP and its dual-stack counterpart so that
+    traffic logged under either IPv4 or IPv6 can be matched.
+    """
+    import ipaddress
+    ip = (
+        request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
+    )
+    ips: set[str] = {ip}
+    try:
+        addr = ipaddress.ip_address(ip)
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+            ips.add(str(addr.ipv4_mapped))
+        elif isinstance(addr, ipaddress.IPv4Address):
+            ips.add(f"::ffff:{ip}")
+    except ValueError:
+        pass
+    return {"ip": ip, "ips": sorted(ips)}
+
+
+@router.get("/ip-info")
+async def get_ip_info(
+    request: Request,
+    ips: str = Query(..., description="Comma-separated list of IPs (max 50)"),
+    _: TokenPayload = Depends(require_security_analyst),
+):
+    """
+    Return geolocation, hostname, ISP, and bot/human classification for a list of IPs.
+    Results are cached in Redis for 24 hours to minimise external API calls.
+    """
+    from frothiq_control_center.services.ip_enrichment import enrich_ips
+    ip_list = [ip.strip() for ip in ips.split(",") if ip.strip()][:50]
+    if not ip_list:
+        return {}
+    redis = request.state.redis
+    return await enrich_ips(ip_list, redis)

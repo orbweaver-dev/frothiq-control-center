@@ -59,7 +59,7 @@ def _read_blacklist_raw() -> list[str]:
     try:
         import re
         result = subprocess.run(
-            ["sudo", "nft", "list", "set", "inet", "frothiq", "blacklist"],
+            ["/usr/sbin/nft", "list", "set", "inet", "frothiq", "blacklist"],
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode != 0:

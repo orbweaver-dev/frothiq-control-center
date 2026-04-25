@@ -7,6 +7,9 @@ All system changes go through managed interfaces — never direct rule editing.
 
 from __future__ import annotations
 
+import asyncio
+import subprocess
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -112,6 +115,37 @@ async def remove_ip(
     if not result.get("success"):
         raise HTTPException(status_code=404, detail=result.get("error"))
     return result
+
+
+class RemoveNftElementBody(BaseModel):
+    ip: str
+    set_name: str  # "whitelist" | "blacklist"
+
+
+@router.delete("/nft-element")
+async def remove_nft_element(
+    body: RemoveNftElementBody,
+    _: TokenPayload = Depends(require_super_admin),
+):
+    """Remove an IP directly from a live nftables set (for entries not tracked in DB)."""
+    if body.set_name not in ("whitelist", "blacklist"):
+        raise HTTPException(status_code=400, detail="set_name must be whitelist or blacklist")
+
+    def _do_remove() -> bool:
+        try:
+            r = subprocess.run(
+                ["/usr/sbin/nft", "delete", "element", "inet", "frothiq",
+                 body.set_name, f"{{ {body.ip} }}"],
+                capture_output=True, timeout=5,
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    success = await asyncio.to_thread(_do_remove)
+    if not success:
+        raise HTTPException(status_code=400, detail=f"Failed to remove {body.ip} from {body.set_name}")
+    return {"success": True, "ip": body.ip, "set_name": body.set_name}
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +282,54 @@ async def update_alert_settings(
     session: AsyncSession = Depends(_db),
 ):
     return await svc.update_category_settings(session, "alerts", body, svc.ALERT_DEFAULTS.keys(), token.email, _ip(request))
+
+
+@router.post("/settings/alerts/test")
+async def test_alert_email(
+    token: TokenPayload = Depends(require_super_admin),
+    session: AsyncSession = Depends(_db),
+):
+    """Send a test email using the current alert settings."""
+    import smtplib
+    import socket
+    from email.message import EmailMessage
+
+    settings = await svc.get_category_settings(session, "alerts", svc.ALERT_DEFAULTS)
+    to_addr = settings.get("LF_ALERT_TO", "").strip()
+    from_name = settings.get("LF_ALERT_FROM", "FrothIQ Defense").strip() or "FrothIQ Defense"
+    smtp_host = settings.get("LF_ALERT_SMTP", "").strip()
+
+    if not to_addr:
+        raise HTTPException(status_code=400, detail="No alert destination address configured (LF_ALERT_TO is empty)")
+
+    hostname = socket.gethostname()
+    fqdn = socket.getfqdn()
+    from_addr = f"frothiq-alerts@{fqdn}"
+
+    msg = EmailMessage()
+    msg["Subject"] = f"[FrothIQ Defense] Test Alert — {hostname}"
+    msg["From"] = f"{from_name} <{from_addr}>"
+    msg["To"] = to_addr
+    msg.set_content(
+        f"This is a test alert from FrothIQ Defense.\n\n"
+        f"Host:      {hostname}\n"
+        f"Sent by:   {token.email or token.sub}\n"
+        f"Timestamp: {__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')}\n\n"
+        f"If you received this email, alert delivery is working correctly."
+    )
+
+    def _send() -> None:
+        host = smtp_host or "localhost"
+        port = 25
+        with smtplib.SMTP(host, port, timeout=10) as s:
+            s.sendmail(from_addr, [to_addr], msg.as_string())
+
+    try:
+        await asyncio.to_thread(_send)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Email delivery failed: {exc}")
+
+    return {"success": True, "to": to_addr, "from": from_addr, "smtp": smtp_host or "localhost"}
 
 
 # ---------------------------------------------------------------------------
