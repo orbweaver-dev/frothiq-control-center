@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from frothiq_control_center.auth.jwt_handler import TokenPayload, get_current_user, require_role
 from frothiq_control_center.services.edge_service import (
+    auto_compile_attack_report,
     get_blocklist,
     get_feature_flags,
     get_registration_stats,
@@ -360,6 +361,60 @@ async def report_attack(body: AttackReportRequest) -> dict[str, Any]:
 
     result = await store_attack_report(body.model_dump())
     return {"ok": True, **result}
+
+
+class AutoAttackTrigger(BaseModel):
+    edge_id:       str  = Field(..., min_length=8, max_length=128)
+    license_token: str  = Field(..., min_length=10)
+    ip:            str  = Field(..., min_length=7, max_length=45, description="Attacking IP")
+    score:         int  = Field(..., ge=0, le=100, description="Threat score assigned by the edge")
+    reason:        str  = Field("", max_length=512, description="Short reason string from the block phase")
+    path:          str  = Field("", max_length=1024, description="Request path that triggered the block")
+    ip_blocked:    bool = Field(False, description="True if the edge actually blocked this IP")
+
+    @field_validator("ip")
+    @classmethod
+    def valid_ip(cls, v: str) -> str:
+        import ipaddress
+        try:
+            ipaddress.ip_address(v)
+        except ValueError:
+            raise ValueError("Invalid IP address")
+        return v
+
+
+@public_router.post("/report/attack/auto")
+async def auto_report_attack(body: AutoAttackTrigger) -> dict[str, Any]:
+    """
+    Thin trigger — plugin sends minimal context; MC3 compiles the full report.
+
+    Called fire-and-forget (non-blocking=false on the plugin side is OK — the
+    plugin uses wp_remote_post with blocking=false so this runs independently).
+
+    MC3 handles:
+      - EdgeNode lookup (tenant_id, domain)
+      - 24-hour per-IP deduplication
+      - Attempt count from ThreatReport history
+      - Attack type inference from reason string
+      - Async traceroute
+      - Storing the AttackReport record
+
+    Returns:
+      { ok: true, report_id: "..." }           — report created
+      { ok: false, skipped: true, ... }         — rate-limited (already reported within 24h)
+    """
+    if not _verify_license_token(body.edge_id, body.license_token):
+        raise HTTPException(status_code=401, detail="Invalid license token")
+
+    result = await auto_compile_attack_report(
+        edge_id=body.edge_id,
+        ip=body.ip,
+        score=body.score,
+        reason=body.reason,
+        path=body.path,
+        ip_blocked=body.ip_blocked,
+    )
+    return result
 
 
 @public_router.get("/blocklist")

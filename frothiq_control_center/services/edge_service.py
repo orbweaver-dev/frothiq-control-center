@@ -777,6 +777,133 @@ async def store_attack_report(data: dict[str, Any]) -> dict[str, Any]:
     return {"report_id": report_id}
 
 
+async def auto_compile_attack_report(
+    edge_id: str,
+    ip: str,
+    score: int,
+    reason: str,
+    path: str,
+    ip_blocked: bool,
+) -> dict[str, Any]:
+    """
+    Compile a full AttackReport from a thin plugin trigger.
+
+    The plugin supplies only the raw block context (IP, score, reason, path).
+    MC3 handles everything else: tenant lookup, attempt count from stored threat
+    reports, attack type inference, traceroute, deduplication, and storage.
+
+    Rate-limited to one compiled report per (edge_id, IP) per 24 hours.
+    """
+    import asyncio
+    import re as _re
+
+    factory = get_session_factory()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    cutoff_24h = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=24)
+
+    async with factory() as session:
+        # Resolve edge node → tenant_id, domain
+        node_result = await session.execute(
+            select(EdgeNode).where(EdgeNode.edge_id == edge_id)
+        )
+        node = node_result.scalar_one_or_none()
+        if node is None:
+            return {"ok": False, "error": "unknown edge node"}
+
+        tenant_id = node.tenant_id
+        domain    = node.site_url or ""
+
+        # Deduplication: skip if already reported this IP in the last 24 hours
+        dup = await session.execute(
+            select(AttackReport.id).where(
+                AttackReport.edge_id      == edge_id,
+                AttackReport.attacking_ip == ip,
+                AttackReport.reported_at  >= cutoff_24h,
+            ).limit(1)
+        )
+        if dup.scalar_one_or_none():
+            return {"ok": False, "skipped": True, "reason": "rate_limited"}
+
+        # Attempt count: total threat reports received from this edge for this IP
+        count_result = await session.execute(
+            select(ThreatReport).where(
+                ThreatReport.edge_id == edge_id,
+                ThreatReport.ip      == ip,
+            )
+        )
+        tr = count_result.scalar_one_or_none()
+        attempt_count = tr.report_count if tr else 1
+
+    # Infer attack type from reason string
+    reason_lc = reason.lower()
+    if any(k in reason_lc for k in ("brute", "login", "credential")):
+        attack_type = "brute_force"
+    elif any(k in reason_lc for k in ("sql", "injection", "select", "union")):
+        attack_type = "sql_injection"
+    elif any(k in reason_lc for k in ("xss", "script", "javascript")):
+        attack_type = "xss"
+    elif any(k in reason_lc for k in ("traversal", "../", "%2e")):
+        attack_type = "path_traversal"
+    elif any(k in reason_lc for k in ("sensitive file", "file access")):
+        attack_type = "file_access_attempt"
+    elif any(k in reason_lc for k in ("scanner", "user agent", "nikto", "sqlmap")):
+        attack_type = "scanner"
+    else:
+        attack_type = "suspicious_request"
+
+    # Traceroute (runs on MC3 — no exec() on the WordPress server)
+    hops: list[dict] = []
+    try:
+        proc = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
+                "traceroute", "-n", "-q", "1", "-w", "2", "-m", "20", ip,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            ),
+            timeout=5,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=65)
+        for line in stdout.decode().splitlines():
+            m = _re.match(
+                r"^\s*(\d+)\s+(\*|\d{1,3}(?:\.\d{1,3}){3}|[0-9a-f:]+)\s+(?:([\d.]+)\s+ms)?",
+                line,
+            )
+            if m:
+                hops.append({
+                    "hop":    int(m.group(1)),
+                    "ip":     None if m.group(2) == "*" else m.group(2),
+                    "rtt_ms": float(m.group(3)) if m.group(3) else None,
+                })
+    except Exception:
+        pass  # traceroute unavailable or timed out — report still stored without hops
+
+    notes = (
+        f"Auto-compiled by MC3. Block score: {score}. "
+        f"Reason: {reason}. Path: {path}. "
+        f"Attempt count from threat pool: {attempt_count}."
+    )
+
+    result = await store_attack_report({
+        "edge_id":            edge_id,
+        "tenant_id":          tenant_id,
+        "domain":             domain,
+        "attacking_ip":       ip,
+        "cidr":               "",
+        "asn":                "",
+        "org":                "",
+        "attack_type":        attack_type,
+        "attempt_count":      attempt_count,
+        "usernames_targeted": [],
+        "user_agents":        [],
+        "ip_blocked":         ip_blocked,
+        "cidr_blocked":       False,
+        "enum_lockdown":      True,
+        "notes":              notes,
+        "traceroute_hops":    hops,
+    })
+    return {"ok": True, **result}
+
+
 async def list_attack_reports(
     limit: int = 50,
     offset: int = 0,
