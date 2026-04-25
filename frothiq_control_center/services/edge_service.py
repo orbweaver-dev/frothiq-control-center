@@ -172,6 +172,139 @@ async def touch_edge_node(
     return {"plan": node.plan, "state": node.state}
 
 
+async def _nft_add_element(ip: str) -> bool:
+    """Run `nft add element inet frothiq blacklist { ip }`. Returns True on success."""
+    try:
+        proc = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
+                "sudo", "nft", "add", "element", "inet", "frothiq", "blacklist", f"{{ {ip} }}",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            ),
+            timeout=4,
+        )
+        rc = await asyncio.wait_for(proc.wait(), timeout=4)
+        return rc == 0
+    except Exception as exc:
+        logger.debug("_nft_add_element: failed for %s: %s", ip, exc)
+        return False
+
+
+async def _auto_promote_to_blacklist(ip: str, reason: str) -> None:
+    """
+    Promote a community-corroborated IP to the frothiq_ip_list DB and live nft blacklist.
+
+    Called fire-and-forget from report_edge_event() when threat_score crosses >= 65
+    (2+ independent tenants have reported the same IP). This ensures the Defense Mesh
+    grows the shared blocklist automatically — not just on manual admin action.
+
+    Persistence: DB record survives reboots; sync_community_ips_to_nft() re-applies
+    all DB entries to the live nft set on MC3 startup.
+    """
+    import ipaddress as _ipmod
+    from frothiq_control_center.models.defense_settings import FrothiqIPEntry
+
+    try:
+        normalized = str(_ipmod.ip_address(ip))
+    except ValueError:
+        return
+
+    factory = get_session_factory()
+    async with factory() as session:
+        existing = await session.execute(
+            select(FrothiqIPEntry).where(
+                FrothiqIPEntry.ip == normalized,
+                FrothiqIPEntry.list_type == "blacklist",
+            )
+        )
+        if existing.scalar_one_or_none() is None:
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            entry = FrothiqIPEntry(
+                id=str(uuid.uuid4()),
+                ip=normalized,
+                label=f"Defense Mesh: {reason[:100]}" if reason else "Defense Mesh: community report",
+                list_type="blacklist",
+                notes=f"Auto-promoted: 2+ edge nodes corroborated this IP. Reason: {reason}",
+                created_at=now,
+                created_by="system",
+            )
+            session.add(entry)
+            await session.commit()
+
+    ok = await _nft_add_element(normalized)
+    logger.info(
+        "community_promote: ip=%s reason=%s nft_applied=%s",
+        normalized, reason[:60] if reason else "", ok,
+    )
+
+
+async def sync_community_ips_to_nft() -> None:
+    """
+    Re-apply all DB-tracked blacklist entries to the live nft set, and backfill
+    any ThreatReport IPs with score >= 65 that haven't been promoted yet.
+
+    Called at MC3 startup so community-promoted IPs survive service restarts.
+    nft add element is idempotent for IPs already in the set from frothiq.nft;
+    errors (duplicate elements) are silently ignored.
+    """
+    from frothiq_control_center.models.defense_settings import FrothiqIPEntry
+
+    factory = get_session_factory()
+
+    # Step 1: backfill ThreatReport IPs that crossed the threshold before this
+    # feature was deployed but were never added to frothiq_ip_list.
+    try:
+        async with factory() as session:
+            # IPs in ThreatReport with score >= 65 that are NOT yet in frothiq_ip_list
+            already_stmt = select(FrothiqIPEntry.ip).where(FrothiqIPEntry.list_type == "blacklist")
+            already_result = await session.execute(already_stmt)
+            already_tracked = {row[0] for row in already_result.fetchall()}
+
+            backfill_stmt = (
+                select(ThreatReport.ip, ThreatReport.reason)
+                .where(ThreatReport.threat_score >= 65)
+                .distinct()
+            )
+            backfill_result = await session.execute(backfill_stmt)
+            to_backfill = [
+                (row[0], row[1] or "community report")
+                for row in backfill_result.fetchall()
+                if row[0] not in already_tracked
+            ]
+
+        for ip, reason in to_backfill:
+            await _auto_promote_to_blacklist(ip, f"backfill: {reason}")
+
+        if to_backfill:
+            logger.info("sync_community_ips_to_nft: backfilled %d pre-existing IPs", len(to_backfill))
+    except Exception as exc:
+        logger.warning("sync_community_ips_to_nft: backfill step failed: %s", exc)
+
+    # Step 2: push all frothiq_ip_list blacklist entries to the live nft set
+    try:
+        async with factory() as session:
+            result = await session.execute(
+                select(FrothiqIPEntry.ip).where(FrothiqIPEntry.list_type == "blacklist")
+            )
+            ips = [row[0] for row in result.fetchall()]
+    except Exception as exc:
+        logger.warning("sync_community_ips_to_nft: DB read failed: %s", exc)
+        return
+
+    added = errors = 0
+    for ip in ips:
+        ok = await _nft_add_element(ip)
+        if ok:
+            added += 1
+        else:
+            errors += 1
+
+    logger.info(
+        "sync_community_ips_to_nft: applied=%d already_present_or_err=%d total=%d",
+        added, errors, len(ips),
+    )
+
+
 async def _read_nft_blacklist(set_name: str = "blacklist") -> list[str]:
     """
     Read the live nftables `inet frothiq <set_name>` set and return all IP/CIDR entries.
@@ -365,6 +498,11 @@ async def report_edge_event(
     # Forward to frothiq-core intelligence pipeline (fire-and-forget).
     # This seeds the campaign correlator so Defense Mesh shows real data.
     asyncio.create_task(_forward_threat_to_core(ip, event_type, severity))
+
+    # Auto-promote to live nft blacklist when corroborated by 2+ tenants.
+    # Score 65 = 2 tenants agreed → sufficient to block at firewall level.
+    if row.threat_score >= 65:
+        asyncio.create_task(_auto_promote_to_blacklist(ip, reason))
 
     return {
         "ip": ip,

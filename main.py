@@ -111,6 +111,10 @@ async def lifespan(app: FastAPI):
         name="outage_detector",
     )
 
+    # Re-apply community-promoted blacklist IPs to live nft on startup.
+    # Runs once after a short delay to let frothiq-nft finish loading.
+    asyncio.create_task(_run_community_blacklist_sync(), name="community_blacklist_sync")
+
     logger.info(
         "Control Center ready — core: %s | port: %d",
         settings.core_base_url,
@@ -139,6 +143,16 @@ async def lifespan(app: FastAPI):
     await dispose_engine()
     await close_redis()
     logger.info("Shutdown complete")
+
+
+async def _run_community_blacklist_sync() -> None:
+    """
+    One-shot startup task: re-apply all DB-tracked community blacklist IPs to the
+    live nft set after service restart. Waits 15 s for frothiq-nft to settle first.
+    """
+    from frothiq_control_center.services.edge_service import sync_community_ips_to_nft
+    await asyncio.sleep(15)
+    await sync_community_ips_to_nft()
 
 
 async def _run_outage_detector_loop() -> None:
