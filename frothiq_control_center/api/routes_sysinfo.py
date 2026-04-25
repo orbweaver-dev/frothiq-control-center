@@ -1472,61 +1472,45 @@ async def get_network_config(_: str = Depends(require_super_admin)) -> dict:
         None,
     )
 
-    # Firewall state — CSF/LFD preferred, then ufw, then nftables
+    # Firewall state — FrothIQ-nft preferred; fall back to ufw then nftables
+    # CSF/LFD is intentionally excluded: it was decommissioned when FrothIQ took over.
     firewall: dict = {"tool": "unknown", "state": "unknown", "rules": []}
 
-    import shutil as _shutil
-    csf_bin = _shutil.which("csf") or "/usr/sbin/csf"
-    if _os.path.isfile(csf_bin):
-        # --- CSF detected ---
-        # Version
-        csf_ver_out, _, _ = _run([csf_bin, "-v"])
-        csf_version = csf_ver_out.splitlines()[0].strip() if csf_ver_out else "unknown"
+    frothiq_nft_out, _, frothiq_nft_rc = _run(["systemctl", "is-active", "frothiq-nft"])
+    frothiq_nft_state = frothiq_nft_out.strip() if frothiq_nft_rc == 0 else "inactive"
 
-        # TESTING mode and allowed ports from csf.conf
-        csf_conf = "/etc/csf/csf.conf"
-        testing_mode = False
-        tcp_in = tcp_out = udp_in = udp_out = ""
-        try:
-            with open(csf_conf) as _f:
-                for _line in _f:
-                    _line = _line.strip()
-                    if _line.startswith("TESTING") and "=" in _line:
-                        testing_mode = _line.split("=", 1)[1].strip().strip('"') == "1"
-                    elif _line.startswith("TCP_IN") and "=" in _line:
-                        tcp_in = _line.split("=", 1)[1].strip().strip('"')
-                    elif _line.startswith("TCP_OUT") and "=" in _line:
-                        tcp_out = _line.split("=", 1)[1].strip().strip('"')
-                    elif _line.startswith("UDP_IN") and "=" in _line:
-                        udp_in = _line.split("=", 1)[1].strip().strip('"')
-                    elif _line.startswith("UDP_OUT") and "=" in _line:
-                        udp_out = _line.split("=", 1)[1].strip().strip('"')
-        except OSError:
-            pass
+    if frothiq_nft_state in ("active", "activating") or frothiq_nft_rc == 0:
+        # --- FrothIQ nft firewall detected ---
+        frothiq_lfd_out, _, frothiq_lfd_rc = _run(["systemctl", "is-active", "frothiq-lfd"])
+        frothiq_lfd_state = frothiq_lfd_out.strip() if frothiq_lfd_rc == 0 else "inactive"
 
-        # LFD daemon state
-        lfd_out, _, lfd_rc = _run(["systemctl", "is-active", "lfd"])
-        lfd_state = lfd_out.strip() if lfd_rc == 0 else "inactive"
+        # Count blacklisted IPs from the live nft set
+        def _count_nft_set(set_name: str) -> int:
+            try:
+                import re as _re
+                out, _, rc = _run(["nft", "list", "set", "inet", "frothiq", set_name])
+                if rc != 0:
+                    return 0
+                m = _re.search(r"elements\s*=\s*\{([^}]+)\}", out, _re.DOTALL)
+                if not m:
+                    return 0
+                return sum(1 for t in _re.split(r",", m.group(1)) if t.strip().split()[0:1] and _re.match(r"^[\d./a-fA-F:]+$", t.strip().split()[0]))
+            except Exception:
+                return 0
 
-        # CSF active = iptables has CSF chains (CC_DENY or DENYIN)
-        ipt_out, _, ipt_rc = _run(["iptables", "-L", "INPUT", "-n", "--line-numbers"])
-        csf_chains_present = ipt_rc == 0 and ("CC_DENY" in ipt_out or "DENYIN" in ipt_out or "LOCALINPUT" in ipt_out)
-        csf_state = "testing" if testing_mode else ("active" if csf_chains_present else "inactive")
+        blacklist_count = _count_nft_set("blacklist")
+        temp_ban_count  = _count_nft_set("temp_ban")
 
-        # Recent iptables INPUT summary (first 20 meaningful lines)
-        rules_lines = [l for l in (ipt_out or "").splitlines() if l.strip() and not l.startswith("Chain") and not l.startswith("num")][:20]
+        overall_state = "active" if frothiq_nft_state == "active" else "inactive"
 
         firewall = {
-            "tool": "csf",
-            "version": csf_version,
-            "state": csf_state,
-            "testing_mode": testing_mode,
-            "lfd_state": lfd_state,
-            "tcp_in": tcp_in,
-            "tcp_out": tcp_out,
-            "udp_in": udp_in,
-            "udp_out": udp_out,
-            "rules": rules_lines,
+            "tool":               "frothiq",
+            "state":              overall_state,
+            "frothiq_nft_state":  frothiq_nft_state,
+            "frothiq_lfd_state":  frothiq_lfd_state,
+            "blacklist_count":    blacklist_count,
+            "temp_ban_count":     temp_ban_count,
+            "rules":              [],
         }
     else:
         ufw_out, _, ufw_rc = _run(["ufw", "status", "verbose"])
