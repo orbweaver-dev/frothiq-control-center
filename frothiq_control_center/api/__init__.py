@@ -33,6 +33,7 @@ from .routes_frothiq_nft import router as frothiq_nft_router
 from .routes_anomaly import router as anomaly_router
 from .routes_integrity import router as integrity_router
 from .routes_recovery import router as recovery_router
+from .routes_dev_reports import router as dev_reports_router
 
 # All control center routes under /api/v1/cc/
 api_router = APIRouter(prefix="/api/v1/cc")
@@ -89,6 +90,8 @@ api_router.include_router(anomaly_router)
 api_router.include_router(integrity_router)
 # Rollback & Recovery Engine — node resets, IP demotions, stale cleanups
 api_router.include_router(recovery_router)
+# Dev Reports — Claude Code task-completion session reports
+api_router.include_router(dev_reports_router)
 
 # Public edge registration (no JWT — separate prefix /api/v1/edge/)
 # This is mounted directly on the FastAPI app in main.py

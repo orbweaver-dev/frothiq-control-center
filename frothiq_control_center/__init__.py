@@ -1,3 +1,3 @@
 """FrothIQ Control Center — standalone command authority."""
 
-__version__ = "1.28.1"
+__version__ = "1.29.0"
