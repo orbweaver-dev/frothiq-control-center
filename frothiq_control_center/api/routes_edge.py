@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 # Bump this whenever a new plugin version is released; edge nodes compare against
 # their installed version and surface an "update available" notice in WP admin.
-LATEST_PLUGIN_VERSION = "0.25.2"
+LATEST_PLUGIN_VERSION = "0.25.3"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Public registration router (no /api/v1/cc prefix — served at /api/v1/edge/)
