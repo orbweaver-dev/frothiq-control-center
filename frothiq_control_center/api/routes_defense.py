@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from frothiq_control_center.auth import TokenPayload, require_read_only, require_security_analyst
+from frothiq_control_center.auth import TokenPayload, get_current_user, require_read_only, require_security_analyst
 from frothiq_control_center.services import (
     get_all_clusters,
     get_cluster_detail,
@@ -16,6 +16,7 @@ from frothiq_control_center.services import (
 )
 from frothiq_control_center.services.core_client import CoreClientError
 from frothiq_control_center.services.audit_service import log_action
+from frothiq_control_center.services.threat_geo_service import get_threat_overview
 
 router = APIRouter(prefix="/defense", tags=["defense-mesh"])
 
@@ -63,3 +64,13 @@ async def suggested_actions(_: TokenPayload = Depends(require_security_analyst))
     Requires security_analyst role or above.
     """
     return await get_suggested_actions()
+
+
+@router.get("/threat-overview")
+async def threat_overview(_: TokenPayload = Depends(get_current_user)):
+    """
+    Fleet Threat Overview — aggregated threat intel from threat_reports,
+    anomaly_events, attack_reports, edge_nodes, and ip_geo_cache.
+    Powers the Defense page world maps and fleet breakdown table.
+    """
+    return await get_threat_overview()

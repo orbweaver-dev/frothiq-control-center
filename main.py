@@ -127,6 +127,9 @@ async def lifespan(app: FastAPI):
     # Runs once after a short delay to let frothiq-nft finish loading.
     asyncio.create_task(_run_community_blacklist_sync(), name="community_blacklist_sync")
 
+    # Geocode any uncached threat IPs in the background (rate-limited, non-blocking).
+    asyncio.create_task(_run_geo_cache_warmup(), name="geo_cache_warmup")
+
     logger.info(
         "Control Center ready — core: %s | port: %d",
         settings.core_base_url,
@@ -167,6 +170,22 @@ async def _run_community_blacklist_sync() -> None:
     from frothiq_control_center.services.edge_service import sync_community_ips_to_nft
     await asyncio.sleep(15)
     await sync_community_ips_to_nft()
+
+
+async def _run_geo_cache_warmup() -> None:
+    """
+    One-shot startup task: geocode all threat IPs not yet in ip_geo_cache.
+    Rate-limited by the service (1.5 s between batches of 100 IPs).
+    Waits 30 s to let the rest of startup complete first.
+    """
+    from frothiq_control_center.services.threat_geo_service import geocode_missing
+    await asyncio.sleep(30)
+    try:
+        n = await geocode_missing()
+        if n:
+            logger.info("Geo warmup: cached %d new IPs", n)
+    except Exception as exc:
+        logger.warning("Geo warmup failed: %s", exc)
 
 
 async def _run_outage_detector_loop() -> None:
