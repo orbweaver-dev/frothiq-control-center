@@ -117,6 +117,12 @@ async def lifespan(app: FastAPI):
         name="anomaly_scanner",
     )
 
+    # Start rollback & recovery engine (runs every 10 minutes)
+    recovery_task = asyncio.create_task(
+        _run_recovery_loop(),
+        name="recovery_engine",
+    )
+
     # Re-apply community-promoted blacklist IPs to live nft on startup.
     # Runs once after a short delay to let frothiq-nft finish loading.
     asyncio.create_task(_run_community_blacklist_sync(), name="community_blacklist_sync")
@@ -131,6 +137,7 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down FrothIQ Control Center")
+    recovery_task.cancel()
     anomaly_task.cancel()
     outage_task.cancel()
     enforcement_task.cancel()
@@ -140,7 +147,7 @@ async def lifespan(app: FastAPI):
     dispatcher_task.cancel()
     try:
         await asyncio.gather(
-            anomaly_task, outage_task, enforcement_task, cidr_task, predictive_task, recon_task, dispatcher_task,
+            recovery_task, anomaly_task, outage_task, enforcement_task, cidr_task, predictive_task, recon_task, dispatcher_task,
             return_exceptions=True,
         )
     except asyncio.CancelledError:
@@ -180,6 +187,25 @@ async def _run_outage_detector_loop() -> None:
             break
         except Exception as exc:
             logger.error("outage_detector: loop error: %s", exc)
+        await asyncio.sleep(interval)
+
+
+async def _run_recovery_loop() -> None:
+    """
+    Background loop: run all three recovery passes (node resets, IP demotions,
+    stale registration cleanup). Runs every 10 minutes starting 150s after startup.
+    """
+    from frothiq_control_center.services.rollback_recovery_engine import run_recovery as _run_recovery
+
+    await asyncio.sleep(150)
+    interval = 600  # 10 minutes
+    while True:
+        try:
+            await _run_recovery()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error("recovery_engine: loop error: %s", exc)
         await asyncio.sleep(interval)
 
 
