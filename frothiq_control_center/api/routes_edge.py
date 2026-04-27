@@ -103,6 +103,7 @@ class EdgeHeartbeatRequest(BaseModel):
     blocks_1m:       int      = Field(0, ge=0)
     errors_1m:       int      = Field(0, ge=0)
     protection_mode: str | None = Field(None, description="monitor|protect|block")
+    plugin_version:  str | None = Field(None, max_length=32)
 
 
 @public_router.post("/register")
@@ -192,6 +193,7 @@ async def edge_heartbeat(body: EdgeHeartbeatRequest) -> dict[str, Any]:
         blocks_1m=body.blocks_1m,
         errors_1m=body.errors_1m,
         protection_mode=body.protection_mode,
+        plugin_version=body.plugin_version,
     )
     if not result:
         raise HTTPException(status_code=404, detail="Edge node not found")

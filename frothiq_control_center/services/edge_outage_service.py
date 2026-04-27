@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from typing import Sequence
 
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from frothiq_control_center.config import get_settings
@@ -150,12 +150,25 @@ async def detect_offline_nodes(factory: async_sessionmaker[AsyncSession]) -> Non
     Scan for edge nodes that have missed heartbeats beyond threshold.
     Opens a new outage window if none is already open for the node.
     Closes open windows for nodes that have since recovered.
+
+    Uses a MariaDB advisory lock so that only one uvicorn worker executes
+    the detection cycle at a time (prevents duplicate outage events when
+    running with --workers > 1).
     """
     now = datetime.now(timezone.utc)
     degraded_cutoff = now - timedelta(minutes=_DEGRADED_MINUTES)
     offline_cutoff  = now - timedelta(minutes=_OFFLINE_MINUTES)
 
     async with factory() as session:
+        # Acquire advisory lock — non-blocking (timeout=0).  If another worker
+        # is already running this cycle, we skip rather than race.
+        lock_result = await session.execute(
+            text("SELECT GET_LOCK('frothiq_outage_detector', 0)")
+        )
+        got_lock = lock_result.scalar() == 1
+        if not got_lock:
+            logger.debug("outage_detector: skipping cycle — another worker holds the lock")
+            return
         # Find all active nodes
         result = await session.execute(
             select(EdgeNode).where(
@@ -288,6 +301,7 @@ async def detect_offline_nodes(factory: async_sessionmaker[AsyncSession]) -> Non
                 )
 
         await session.commit()
+        await session.execute(text("SELECT RELEASE_LOCK('frothiq_outage_detector')"))
 
 
 async def close_open_windows_for_node(session: AsyncSession, edge_id: str) -> None:

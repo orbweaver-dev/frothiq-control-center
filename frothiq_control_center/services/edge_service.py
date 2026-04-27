@@ -132,6 +132,7 @@ async def touch_edge_node(
     blocks_1m: int = 0,
     errors_1m: int = 0,
     protection_mode: str | None = None,
+    plugin_version: str | None = None,
 ) -> dict[str, Any] | None:
     """
     Update last_seen_at and promote node state on heartbeat.
@@ -148,6 +149,8 @@ async def touch_edge_node(
 
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         node.last_seen_at = now
+        if plugin_version:
+            node.plugin_version = plugin_version
         if protection_mode in ("monitor", "protect", "block"):
             node.protection_mode = protection_mode
         # State promotions
