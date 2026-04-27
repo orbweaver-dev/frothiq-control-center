@@ -43,6 +43,7 @@ from frothiq_control_center.services.edge_service import (
     set_feature_flag,
     store_attack_report,
     touch_edge_node,
+    record_eula_acceptance,
 )
 
 logger = logging.getLogger(__name__)
@@ -210,6 +211,43 @@ async def edge_heartbeat(body: EdgeHeartbeatRequest) -> dict[str, Any]:
         "latest_plugin_version": LATEST_PLUGIN_VERSION,
         "ts":                    int(time.time()),
     }
+
+
+class EulaAcceptRequest(BaseModel):
+    edge_id:           str = Field(..., min_length=8, max_length=128)
+    license_token:     str = Field(..., min_length=10)
+    eula_version:      str = Field(..., max_length=16)
+    plugin_version:    str = Field("", max_length=32)
+    eula_hash:         str = Field("", max_length=64)
+    site_url:          str = Field("", max_length=255)
+    accepted_by_email: str = Field("", max_length=254)
+    accepted_from_ip:  str = Field("", max_length=45)
+
+
+@public_router.post("/eula/accept")
+async def edge_eula_accept(body: EulaAcceptRequest, request: Request) -> dict[str, Any]:
+    """
+    Record that a site administrator has accepted the FrothIQ EULA.
+
+    Called immediately after the admin clicks "I Accept" in the plugin.
+    Idempotent — re-posting the same (edge_id, eula_version) is a no-op.
+    The accepted_from_ip falls back to the HTTP client IP when the plugin
+    does not supply one.
+    """
+    if not _verify_license_token(body.edge_id, body.license_token):
+        raise HTTPException(status_code=401, detail="Invalid license token")
+
+    client_ip = body.accepted_from_ip or request.client.host or ""
+    result = await record_eula_acceptance(
+        edge_id=body.edge_id,
+        eula_version=body.eula_version,
+        plugin_version=body.plugin_version,
+        eula_hash=body.eula_hash,
+        site_url=body.site_url,
+        accepted_by_email=body.accepted_by_email,
+        accepted_from_ip=client_ip,
+    )
+    return {"ok": True, **result}
 
 
 class AttackReportRequest(BaseModel):

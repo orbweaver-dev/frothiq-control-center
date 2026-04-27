@@ -170,3 +170,34 @@ class AttackReport(Base):
     # JSON-encoded list of traceroute hops: [{hop, ip, rtt_ms}, ...]
     traceroute_hops: Mapped[str | None] = mapped_column(Text, nullable=True)
     reported_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+
+
+class EdgeEulaRecord(Base):
+    """
+    Immutable record of a site administrator accepting the FrothIQ EULA.
+
+    One row per (edge_id, eula_version) pair — re-acceptance of the same
+    version is a no-op (upsert ignores duplicates). A new row is inserted
+    each time the EULA version advances and the admin accepts the updated
+    agreement.
+    """
+    __tablename__ = "edge_eula_records"
+    __table_args__ = (
+        UniqueConstraint("edge_id", "eula_version", name="uq_eula_edge_version"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    edge_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    eula_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    # Plugin version the admin was running at the time of acceptance
+    plugin_version: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    # SHA-256 of the canonical English EULA text for that version
+    eula_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    site_url: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    # WP admin email address at the time of acceptance
+    accepted_by_email: Mapped[str] = mapped_column(String(254), nullable=False, default="")
+    accepted_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_utcnow)
+    # IP address of the WP admin browser at the time of acceptance
+    accepted_from_ip: Mapped[str] = mapped_column(String(45), nullable=False, default="")

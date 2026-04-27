@@ -30,7 +30,7 @@ from fastapi import HTTPException
 
 from frothiq_control_center.config import get_settings
 from frothiq_control_center.integrations.database import get_session_factory
-from frothiq_control_center.models.edge import AttackReport, EdgeNode, EdgeTenant, FeatureFlag, ThreatReport
+from frothiq_control_center.models.edge import AttackReport, EdgeEulaRecord, EdgeNode, EdgeTenant, FeatureFlag, ThreatReport
 from frothiq_control_center.services import frappe_billing_client
 
 logger = logging.getLogger(__name__)
@@ -1139,3 +1139,52 @@ def _attack_report_to_dict(r: AttackReport) -> dict[str, Any]:
         "traceroute_hops": json.loads(r.traceroute_hops) if r.traceroute_hops else [],
         "reported_at": r.reported_at.isoformat() if r.reported_at else None,
     }
+
+
+async def record_eula_acceptance(
+    edge_id: str,
+    eula_version: str,
+    plugin_version: str = "",
+    eula_hash: str = "",
+    site_url: str = "",
+    accepted_by_email: str = "",
+    accepted_from_ip: str = "",
+) -> dict[str, Any]:
+    """
+    Upsert a EULA acceptance record for this edge node + EULA version pair.
+
+    Idempotent: if the same (edge_id, eula_version) already exists the call
+    is a no-op and returns {"created": False}.  A new row is written only
+    when the EULA version advances or when a node accepts for the first time.
+    """
+    from datetime import datetime, timezone
+
+    factory = get_session_factory()
+    async with factory() as session:
+        existing = await session.execute(
+            select(EdgeEulaRecord).where(
+                EdgeEulaRecord.edge_id      == edge_id,
+                EdgeEulaRecord.eula_version == eula_version,
+            ).limit(1)
+        )
+        if existing.scalar_one_or_none():
+            return {"created": False, "eula_version": eula_version}
+
+        record = EdgeEulaRecord(
+            edge_id=edge_id,
+            eula_version=eula_version,
+            plugin_version=plugin_version,
+            eula_hash=eula_hash,
+            site_url=site_url,
+            accepted_by_email=accepted_by_email,
+            accepted_from_ip=accepted_from_ip,
+            accepted_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        )
+        session.add(record)
+        await session.commit()
+
+    logger.info(
+        "eula_acceptance: edge=%s version=%s email=%s ip=%s",
+        edge_id, eula_version, accepted_by_email, accepted_from_ip,
+    )
+    return {"created": True, "eula_version": eula_version}
