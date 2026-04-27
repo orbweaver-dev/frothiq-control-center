@@ -30,10 +30,116 @@ from fastapi import HTTPException
 
 from frothiq_control_center.config import get_settings
 from frothiq_control_center.integrations.database import get_session_factory
-from frothiq_control_center.models.edge import AttackReport, EdgeEulaRecord, EdgeNode, EdgeTenant, FeatureFlag, ThreatReport
+from frothiq_control_center.models.edge import AttackReport, EdgeEulaRecord, EdgeNode, EdgeTenant, EulaVersion, FeatureFlag, ThreatReport
 from frothiq_control_center.services import frappe_billing_client
 
 logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Canonical EULA text registry
+#
+# This is the authoritative source for each published EULA version.
+# The sha256 of this text (UTF-8, stripped of leading/trailing whitespace)
+# is stored in EdgeEulaRecord.eula_hash so every acceptance record proves
+# exactly what the administrator agreed to, independent of the plugin source.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_EULA_CANONICAL: dict[str, str] = {
+    "1.1": """\
+FROTHIQ DEFENSE — LICENSE & NO-LIABILITY AGREEMENT
+Version 1.1
+
+PLEASE READ THIS AGREEMENT CAREFULLY BEFORE ACTIVATING FROTHIQ DEFENSE.
+
+1. No Warranty
+
+FrothIQ Defense is provided "AS IS" without warranty of any kind, express or implied. OrbWeaver makes no warranty that the plugin will prevent all security threats, detect all intrusions, or be free of errors or defects. Security is inherently probabilistic — no tool guarantees complete protection.
+
+2. Limitation of Liability
+
+To the maximum extent permitted by applicable law, OrbWeaver and its contributors shall not be liable for any direct, indirect, incidental, special, consequential, or exemplary damages arising from your use of this plugin, including but not limited to:
+
+- Security breaches that occur despite the plugin being active
+- Legitimate traffic incorrectly blocked (false positives)
+- Data loss, site downtime, or revenue loss
+- Changes made to .htaccess rules
+
+3. .htaccess Modifications
+
+FrothIQ Defense may modify your .htaccess file to block IP addresses at the web-server layer. You accept full responsibility for reviewing and testing these changes in your environment. OrbWeaver is not responsible for access issues or downtime that may result from .htaccess modifications. A self-check is performed after every block rule is written; if the site becomes inaccessible the rule is automatically rolled back.
+
+4. Your Responsibility
+
+You are solely responsible for configuring the plugin appropriately for your site and environment, testing its behavior before enabling active blocking, and maintaining current backups of your data and firewall rules. You should monitor the Activity Log regularly and review blocked IPs to avoid extended false-positive blocking of legitimate users.
+
+5. License
+
+FrothIQ Defense is licensed under the GNU General Public License v2.0 or later (GPL-2.0+). FrothIQ Core and associated cloud intelligence services are separate, proprietary services governed by their own terms of service. Use of cloud features requires a separate agreement with OrbWeaver.
+
+6. Governing Law
+
+This agreement is governed by the laws of the State of Texas, United States, without regard to conflict of law provisions. Any disputes arising from your use of this plugin shall be resolved in the courts of Texas.
+
+7. Data Sharing & Attack Reporting
+
+When the Auto Attack Reporting setting is enabled (on by default), FrothIQ Defense transmits the following data to FrothIQ Core upon blocking a request:
+
+- The blocked IP address
+- Threat score assigned by this site
+- Request path that triggered the block
+- HTTP user-agent string from the request
+- Server-side traceroute hops (run by FrothIQ Core, not your server)
+- Your site's registered domain and Edge ID
+
+This data is used solely to compile structured attack reports, maintain the community threat intelligence pool, and improve blocking accuracy across all FrothIQ-protected sites. Reports are deduplicated to one per attacker IP per 24 hours. You may disable Auto Attack Reporting at any time in Settings > Protection without affecting local blocking functionality.
+
+Additionally, this plugin records your acceptance of this agreement, including the accepting administrator's email address, the timestamp, and the IP address of the administrator's browser, and transmits that record to FrothIQ Core for your site's compliance history.\
+""",
+}
+
+
+def _canonical_hash(text: str) -> str:
+    """SHA-256 of the canonical EULA text (UTF-8, stripped)."""
+    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+
+
+async def get_eula_version(version: str) -> dict[str, str] | None:
+    """
+    Return the canonical EULA record for a given version string.
+
+    Looks up the in-memory registry first; if found and not yet persisted,
+    upserts the row into eula_versions so the table stays consistent.
+    Returns None when the version is unknown.
+    """
+    text = _EULA_CANONICAL.get(version)
+    if text is None:
+        return None
+
+    authoritative_hash = _canonical_hash(text)
+
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(
+            select(EulaVersion).where(EulaVersion.version == version).limit(1)
+        )
+        row = result.scalar_one_or_none()
+        if not row:
+            row = EulaVersion(
+                version=version,
+                text=text,
+                sha256_hash=authoritative_hash,
+                published_at=datetime.now(timezone.utc).replace(tzinfo=None),
+            )
+            session.add(row)
+            await session.commit()
+
+    return {
+        "version":      version,
+        "text":         text,
+        "sha256_hash":  authoritative_hash,
+        "published_at": row.published_at.isoformat() if row.published_at else None,
+    }
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Public API
@@ -1156,11 +1262,40 @@ async def record_eula_acceptance(
     Idempotent: if the same (edge_id, eula_version) already exists the call
     is a no-op and returns {"created": False}.  A new row is written only
     when the EULA version advances or when a node accepts for the first time.
+
+    eula_hash is ALWAYS set to the server-authoritative SHA-256 of the
+    canonical EULA text (from _EULA_CANONICAL), regardless of what the
+    client sends.  The record therefore proves which text was in force —
+    not merely which version string the client claimed.
+
+    hash_verified in the return value indicates whether the client-supplied
+    hash matched the authoritative one (useful for detecting modified UIs).
     """
-    from datetime import datetime, timezone
+    # Resolve authoritative hash from the canonical text registry
+    canonical_text = _EULA_CANONICAL.get(eula_version)
+    if canonical_text:
+        authoritative_hash = _canonical_hash(canonical_text)
+        hash_verified = (eula_hash == authoritative_hash)
+    else:
+        # Unknown future version — store client hash as-is, flag as unverified
+        authoritative_hash = eula_hash
+        hash_verified = False
 
     factory = get_session_factory()
     async with factory() as session:
+        # Ensure the EulaVersion row exists (auto-seeds from _EULA_CANONICAL)
+        if canonical_text:
+            ev_result = await session.execute(
+                select(EulaVersion).where(EulaVersion.version == eula_version).limit(1)
+            )
+            if not ev_result.scalar_one_or_none():
+                session.add(EulaVersion(
+                    version=eula_version,
+                    text=canonical_text,
+                    sha256_hash=authoritative_hash,
+                    published_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                ))
+
         existing = await session.execute(
             select(EdgeEulaRecord).where(
                 EdgeEulaRecord.edge_id      == edge_id,
@@ -1168,13 +1303,14 @@ async def record_eula_acceptance(
             ).limit(1)
         )
         if existing.scalar_one_or_none():
-            return {"created": False, "eula_version": eula_version}
+            await session.commit()
+            return {"created": False, "eula_version": eula_version, "hash_verified": hash_verified}
 
         record = EdgeEulaRecord(
             edge_id=edge_id,
             eula_version=eula_version,
             plugin_version=plugin_version,
-            eula_hash=eula_hash,
+            eula_hash=authoritative_hash,   # always the server-authoritative hash
             site_url=site_url,
             accepted_by_email=accepted_by_email,
             accepted_from_ip=accepted_from_ip,
@@ -1183,8 +1319,13 @@ async def record_eula_acceptance(
         session.add(record)
         await session.commit()
 
+    if not hash_verified and eula_hash:
+        logger.warning(
+            "eula_acceptance: hash mismatch edge=%s version=%s client_hash=%s authoritative=%s",
+            edge_id, eula_version, eula_hash, authoritative_hash,
+        )
     logger.info(
-        "eula_acceptance: edge=%s version=%s email=%s ip=%s",
-        edge_id, eula_version, accepted_by_email, accepted_from_ip,
+        "eula_acceptance: edge=%s version=%s email=%s ip=%s hash_verified=%s",
+        edge_id, eula_version, accepted_by_email, accepted_from_ip, hash_verified,
     )
-    return {"created": True, "eula_version": eula_version}
+    return {"created": True, "eula_version": eula_version, "hash_verified": hash_verified}

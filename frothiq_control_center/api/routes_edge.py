@@ -32,6 +32,7 @@ from frothiq_control_center.auth.jwt_handler import TokenPayload, get_current_us
 from frothiq_control_center.services.edge_service import (
     auto_compile_attack_report,
     get_blocklist,
+    get_eula_version,
     get_feature_flags,
     get_registration_stats,
     deregister_edge_node,
@@ -213,6 +214,22 @@ async def edge_heartbeat(body: EdgeHeartbeatRequest) -> dict[str, Any]:
     }
 
 
+@public_router.get("/eula/{version}")
+async def edge_eula_fetch(version: str) -> dict[str, Any]:
+    """
+    Return the canonical EULA text and its SHA-256 for a given version.
+
+    Public — no authentication required. The plugin calls this before
+    showing the EULA modal so it can display the server-authoritative text
+    and send back its hash on acceptance (proving the admin saw exactly
+    this text, not a modified local copy).
+    """
+    data = await get_eula_version(version)
+    if data is None:
+        raise HTTPException(status_code=404, detail=f"EULA version '{version}' not found")
+    return data
+
+
 class EulaAcceptRequest(BaseModel):
     edge_id:           str = Field(..., min_length=8, max_length=128)
     license_token:     str = Field(..., min_length=10)
@@ -237,7 +254,7 @@ async def edge_eula_accept(body: EulaAcceptRequest, request: Request) -> dict[st
     if not _verify_license_token(body.edge_id, body.license_token):
         raise HTTPException(status_code=401, detail="Invalid license token")
 
-    client_ip = body.accepted_from_ip or request.client.host or ""
+    client_ip = body.accepted_from_ip or (request.client.host if request.client else "") or ""
     result = await record_eula_acceptance(
         edge_id=body.edge_id,
         eula_version=body.eula_version,

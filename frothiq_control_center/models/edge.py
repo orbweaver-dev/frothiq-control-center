@@ -172,6 +172,28 @@ class AttackReport(Base):
     reported_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
 
 
+class EulaVersion(Base):
+    """
+    Canonical text for each published EULA version.
+
+    One row per version string (e.g. "1.1"). The sha256_hash field is the
+    authoritative fingerprint used in EdgeEulaRecord — it proves exactly
+    what text the administrator agreed to.  Text is stored as plain UTF-8
+    so it is human-readable and reconstructable without the plugin source.
+    """
+    __tablename__ = "eula_versions"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    version: Mapped[str] = mapped_column(String(16), unique=True, nullable=False, index=True)
+    # Canonical plain-text content of the EULA for this version
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    # SHA-256 of text (UTF-8 encoded, no trailing newline)
+    sha256_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    published_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_utcnow)
+
+
 class EdgeEulaRecord(Base):
     """
     Immutable record of a site administrator accepting the FrothIQ EULA.
