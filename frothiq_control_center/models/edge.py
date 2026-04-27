@@ -172,6 +172,41 @@ class AttackReport(Base):
     reported_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
 
 
+class AnomalyEvent(Base):
+    """
+    A detected threat-pattern anomaly across one or more edge nodes.
+
+    Written by services/anomaly_detection.py on each scan cycle (every 5 min).
+    Deduplicated: one open event per (anomaly_type, tenant_id, ip) — a new event
+    is only created when the previous one for that key is acknowledged or older
+    than 1 hour.
+
+    anomaly_type values:
+      traffic_spike        — block rate 2x+ above 7-day baseline for a tenant
+      cross_tenant_attack  — same IP attacking 3+ distinct tenants in 2 hours
+      systematic_scan      — 10+ sequential IPs from same /24 in 30 minutes
+      rapid_escalation     — IP threat_score jumped to 90+ with 5+ reports in 30 min
+    """
+    __tablename__ = "anomaly_events"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    detected_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_utcnow, index=True)
+    anomaly_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False, default="high")
+    # Scope — nullable when anomaly spans multiple tenants/nodes
+    tenant_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    edge_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    ip: Mapped[str | None] = mapped_column(String(45), nullable=True, index=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    # JSON blob with detection context (counts, baselines, affected tenants, etc.)
+    detail_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    acknowledged: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    acknowledged_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+
 class EulaVersion(Base):
     """
     Canonical text for each published EULA version.

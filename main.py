@@ -111,6 +111,12 @@ async def lifespan(app: FastAPI):
         name="outage_detector",
     )
 
+    # Start anomaly detection scanner (runs every 5 minutes)
+    anomaly_task = asyncio.create_task(
+        _run_anomaly_scan_loop(),
+        name="anomaly_scanner",
+    )
+
     # Re-apply community-promoted blacklist IPs to live nft on startup.
     # Runs once after a short delay to let frothiq-nft finish loading.
     asyncio.create_task(_run_community_blacklist_sync(), name="community_blacklist_sync")
@@ -125,6 +131,7 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down FrothIQ Control Center")
+    anomaly_task.cancel()
     outage_task.cancel()
     enforcement_task.cancel()
     cidr_task.cancel()
@@ -133,7 +140,7 @@ async def lifespan(app: FastAPI):
     dispatcher_task.cancel()
     try:
         await asyncio.gather(
-            outage_task, enforcement_task, cidr_task, predictive_task, recon_task, dispatcher_task,
+            anomaly_task, outage_task, enforcement_task, cidr_task, predictive_task, recon_task, dispatcher_task,
             return_exceptions=True,
         )
     except asyncio.CancelledError:
@@ -173,6 +180,25 @@ async def _run_outage_detector_loop() -> None:
             break
         except Exception as exc:
             logger.error("outage_detector: loop error: %s", exc)
+        await asyncio.sleep(interval)
+
+
+async def _run_anomaly_scan_loop() -> None:
+    """
+    Background loop: run all four anomaly detection passes and write new events.
+    Runs every 5 minutes starting 120 seconds after startup.
+    """
+    from frothiq_control_center.services.anomaly_detection import run_scan as _run_scan
+
+    await asyncio.sleep(120)  # let edges check in before first scan
+    interval = 300  # 5 minutes
+    while True:
+        try:
+            await _run_scan()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error("anomaly_scanner: loop error: %s", exc)
         await asyncio.sleep(interval)
 
 
