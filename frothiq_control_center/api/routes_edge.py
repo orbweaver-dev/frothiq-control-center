@@ -47,6 +47,10 @@ from frothiq_control_center.services.edge_service import (
 
 logger = logging.getLogger(__name__)
 
+# Bump this whenever a new plugin version is released; edge nodes compare against
+# their installed version and surface an "update available" notice in WP admin.
+LATEST_PLUGIN_VERSION = "0.25.2"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Public registration router (no /api/v1/cc prefix — served at /api/v1/edge/)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -199,11 +203,12 @@ async def edge_heartbeat(body: EdgeHeartbeatRequest) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Edge node not found")
 
     return {
-        "ok":         True,
-        "edge_id":    body.edge_id,
-        "plan":       result["plan"],
-        "node_state": result["state"],
-        "ts":         int(time.time()),
+        "ok":                    True,
+        "edge_id":               body.edge_id,
+        "plan":                  result["plan"],
+        "node_state":            result["state"],
+        "latest_plugin_version": LATEST_PLUGIN_VERSION,
+        "ts":                    int(time.time()),
     }
 
 
