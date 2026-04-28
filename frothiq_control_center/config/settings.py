@@ -136,6 +136,14 @@ class Settings(BaseSettings):
     frappe_api_secret: str = ""
     frappe_issue_type: str = "FrothIQ"   # Issue Type value in ERPNext
 
+    # -----------------------------------------------------------------
+    # Mailjet (transactional / bulk email API)
+    # -----------------------------------------------------------------
+    mailjet_api_key: str = ""
+    mailjet_api_secret: str = ""
+    mailjet_sender_email: str = "no-reply@orbweaver.dev"
+    mailjet_sender_name: str = "FrothIQ Control Center"
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
