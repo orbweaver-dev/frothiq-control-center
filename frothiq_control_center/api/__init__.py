@@ -37,6 +37,7 @@ from .routes_dev_reports import router as dev_reports_router
 from .routes_analytics import router as analytics_router
 from .routes_bing import router as bing_router
 from .routes_wordpress import router as wordpress_router
+from .routes_spamassassin import router as spamassassin_router
 
 # All control center routes under /api/v1/cc/
 api_router = APIRouter(prefix="/api/v1/cc")
@@ -101,6 +102,8 @@ api_router.include_router(analytics_router)
 api_router.include_router(bing_router)
 # ServOps Tools — WordPress monitor (WP-CLI based, server-local installs)
 api_router.include_router(wordpress_router)
+# ServOps Tools — SpamAssassin service control and configuration
+api_router.include_router(spamassassin_router)
 
 # Public edge registration (no JWT — separate prefix /api/v1/edge/)
 # This is mounted directly on the FastAPI app in main.py
