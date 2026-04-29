@@ -771,17 +771,23 @@ def _toggle_apache_vhost(domain: str, port: int, enable: bool) -> dict:
 
 
 def _toggle_nginx_vhost(domain: str, enable: bool) -> dict:
-    """Enable or disable an Nginx vhost by managing the sites-enabled symlink."""
+    """Enable or disable an Nginx vhost via sudo ln/rm (sites-enabled is root-owned)."""
     avail = NGINX_SITES_AVAIL / f"{domain}.conf"
     enabled_link = NGINX_SITES_ENABLED / f"{domain}.conf"
     if not avail.exists():
         raise HTTPException(status_code=404, detail=f"No Nginx config found for {domain} in sites-available")
     if enable:
-        if not enabled_link.exists():
-            enabled_link.symlink_to(avail)
+        _, stderr, rc = _run(
+            ["sudo", "/bin/ln", "-sf", str(avail), str(enabled_link)], timeout=10
+        )
+        if rc != 0:
+            raise HTTPException(status_code=500, detail=f"ln failed: {stderr.strip()}")
     else:
-        if enabled_link.exists() or enabled_link.is_symlink():
-            enabled_link.unlink()
+        _, stderr, rc = _run(
+            ["sudo", "/bin/rm", "-f", str(enabled_link)], timeout=10
+        )
+        if rc != 0:
+            raise HTTPException(status_code=500, detail=f"rm failed: {stderr.strip()}")
     _, stderr, rc = _run(["sudo", "/bin/systemctl", "reload", "nginx"], timeout=15)
     if rc != 0:
         raise HTTPException(status_code=500, detail=f"nginx reload failed: {stderr.strip()}")
@@ -906,6 +912,90 @@ def _restore_vhost(backup_file: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+_DOMAIN_RE = re.compile(r'^(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$')
+
+_APACHE_VHOST_TEMPLATE = """\
+<VirtualHost *:80>
+    ServerName {domain}
+    DocumentRoot {doc_root}
+    ErrorLog ${{APACHE_LOG_DIR}}/{domain}-error.log
+    CustomLog ${{APACHE_LOG_DIR}}/{domain}-access.log combined
+    <Directory {doc_root}>
+        Options Indexes FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+</VirtualHost>
+"""
+
+_NGINX_VHOST_TEMPLATE = """\
+server {{
+    listen 80;
+    listen [::]:80;
+    server_name {domain};
+    root {doc_root};
+    index index.html index.htm;
+
+    location / {{
+        try_files $uri $uri/ =404;
+    }}
+
+    access_log /var/log/nginx/{domain}-access.log;
+    error_log  /var/log/nginx/{domain}-error.log;
+}}
+"""
+
+
+def _deploy_vhost(domain: str, server_type: str, doc_root: str) -> dict:
+    """Create docroot, write config, enable vhost. Returns detail dict."""
+    if not _DOMAIN_RE.match(domain):
+        raise HTTPException(status_code=400, detail=f"Invalid domain name: {domain!r}")
+    if server_type not in ("apache", "nginx"):
+        raise HTTPException(status_code=400, detail="server_type must be 'apache' or 'nginx'")
+
+    # Create document root
+    _, stderr, rc = _run(["sudo", "/bin/mkdir", "-p", doc_root], timeout=10)
+    if rc != 0:
+        raise HTTPException(status_code=500, detail=f"mkdir failed: {stderr.strip()}")
+    _run(["sudo", "/bin/chown", "-R", "www-data", doc_root], timeout=10)
+
+    if server_type == "apache":
+        config = _APACHE_VHOST_TEMPLATE.format(domain=domain, doc_root=doc_root)
+        conf_path = APACHE_SITES_AVAIL / f"{domain}.conf"
+        proc = subprocess.run(
+            ["sudo", "/usr/bin/tee", str(conf_path)],
+            input=config.encode(), capture_output=True, timeout=10,
+        )
+        if proc.returncode != 0:
+            raise HTTPException(status_code=500, detail=f"Write failed: {proc.stderr.decode().strip()}")
+        _, stderr, rc = _run(["sudo", "/usr/sbin/a2ensite", f"{domain}.conf"], timeout=15)
+        if rc != 0:
+            raise HTTPException(status_code=500, detail=f"a2ensite failed: {stderr.strip()}")
+        _run(["sudo", "/bin/systemctl", "reload", "apache2"], timeout=15)
+    else:
+        config = _NGINX_VHOST_TEMPLATE.format(domain=domain, doc_root=doc_root)
+        conf_path = NGINX_SITES_AVAIL / f"{domain}.conf"
+        proc = subprocess.run(
+            ["sudo", "/usr/bin/tee", str(conf_path)],
+            input=config.encode(), capture_output=True, timeout=10,
+        )
+        if proc.returncode != 0:
+            raise HTTPException(status_code=500, detail=f"Write failed: {proc.stderr.decode().strip()}")
+        enabled_link = NGINX_SITES_ENABLED / f"{domain}.conf"
+        _run(["sudo", "/bin/ln", "-sf", str(conf_path), str(enabled_link)], timeout=10)
+        _, stderr, rc = _run(["sudo", "/bin/systemctl", "reload", "nginx"], timeout=15)
+        if rc != 0:
+            raise HTTPException(status_code=500, detail=f"nginx reload failed: {stderr.strip()}")
+
+    return {
+        "deployed": True,
+        "domain": domain,
+        "server_type": server_type,
+        "doc_root": doc_root,
+        "config_file": str(conf_path),
+    }
+
+
 # Vhost management Pydantic models
 # ---------------------------------------------------------------------------
 
@@ -931,6 +1021,12 @@ class VhostBackupRequest(BaseModel):
 
 class VhostRestoreRequest(BaseModel):
     backup_file: str
+
+
+class VhostDeployRequest(BaseModel):
+    domain: str
+    server_type: str = "apache"
+    doc_root: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -1183,4 +1279,18 @@ async def vhost_restore(
     _audit(user, "vhost_restore", "local", body.backup_file, "started")
     result = _restore_vhost(body.backup_file)
     _audit(user, "vhost_restore", "local", body.backup_file, "ok")
+    return result
+
+
+@router.post("/vhosts/deploy")
+async def vhost_deploy(
+    body: VhostDeployRequest,
+    user: str = Depends(require_super_admin),
+) -> dict:
+    """Deploy a new domain or subdomain vhost (create docroot + config + enable)."""
+    domain = body.domain.strip().lower()
+    doc_root = body.doc_root.strip() or f"/var/www/{domain}/public_html"
+    _audit(user, "vhost_deploy", "local", f"{domain} ({body.server_type})", "started")
+    result = _deploy_vhost(domain, body.server_type, doc_root)
+    _audit(user, "vhost_deploy", "local", domain, "ok")
     return result
