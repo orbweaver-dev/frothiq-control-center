@@ -684,6 +684,256 @@ class ServerActionRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Vhost management helpers (local server only)
+# ---------------------------------------------------------------------------
+
+BACKUP_DIR = Path("/var/lib/mc3/vhost-backups")
+APACHE_SITES_AVAIL = Path("/etc/apache2/sites-available")
+APACHE_SITES_ENABLED = Path("/etc/apache2/sites-enabled")
+NGINX_SITES_AVAIL = Path("/etc/nginx/sites-available")
+NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled")
+
+
+def _ssl_cert_info(domain: str) -> dict:
+    """Return SSL cert expiry and issuer for a domain using openssl."""
+    cert_paths = [
+        Path(f"/etc/letsencrypt/live/{domain}/cert.pem"),
+        Path(f"/etc/ssl/certs/{domain}.pem"),
+    ]
+    for cert_path in cert_paths:
+        if cert_path.exists():
+            try:
+                out = _run_out(
+                    ["openssl", "x509", "-in", str(cert_path), "-noout",
+                     "-enddate", "-issuer", "-subject"],
+                    timeout=5,
+                )
+                result: dict[str, Any] = {"cert_path": str(cert_path)}
+                for line in out.splitlines():
+                    if line.startswith("notAfter="):
+                        result["expires"] = line.split("=", 1)[1].strip()
+                    elif line.startswith("issuer="):
+                        result["issuer"] = line.split("=", 1)[1].strip()
+                    elif line.startswith("subject="):
+                        result["subject"] = line.split("=", 1)[1].strip()
+                return result
+            except Exception:
+                pass
+    return {}
+
+
+def _vhost_is_enabled(domain: str, port: int, server_type: str) -> bool:
+    """Return True if the vhost config is in the enabled symlinks/dir."""
+    if server_type == "apache":
+        enabled_dir = APACHE_SITES_ENABLED
+        avail_dir = APACHE_SITES_AVAIL
+        candidates = [
+            f"{domain}.conf",
+            f"{domain}-le-ssl.conf" if port == 443 else None,
+            f"{domain}-ssl.conf" if port == 443 else None,
+        ]
+    else:
+        enabled_dir = NGINX_SITES_ENABLED
+        avail_dir = NGINX_SITES_AVAIL
+        candidates = [f"{domain}.conf"]
+
+    for name in filter(None, candidates):
+        if (enabled_dir / name).exists() or (avail_dir / name).exists():
+            return (enabled_dir / name).exists()
+    # fall back: conf_file in sites-enabled means enabled
+    return False
+
+
+def _read_vhost_config(config_file: str) -> str:
+    """Read the raw config file. Readable as frothiq (world-readable)."""
+    try:
+        return Path(config_file).read_text(errors="replace")
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail=f"Config file not found: {exc}") from exc
+
+
+def _toggle_apache_vhost(domain: str, port: int, enable: bool) -> dict:
+    """Enable or disable an Apache vhost via a2ensite/a2dissite."""
+    # Determine config stem
+    candidates = [domain]
+    if port == 443:
+        candidates += [f"{domain}-le-ssl", f"{domain}-ssl"]
+    for stem in candidates:
+        conf = APACHE_SITES_AVAIL / f"{stem}.conf"
+        if conf.exists():
+            cmd = "a2ensite" if enable else "a2dissite"
+            _, stderr, rc = _run(["sudo", f"/usr/sbin/{cmd}", f"{stem}.conf"], timeout=15)
+            if rc != 0:
+                raise HTTPException(status_code=500, detail=f"{cmd} failed: {stderr.strip()}")
+            _run(["sudo", "/bin/systemctl", "reload", "apache2"], timeout=15)
+            return {"toggled": True, "stem": stem, "enabled": enable}
+    raise HTTPException(status_code=404, detail=f"No Apache config found for {domain}")
+
+
+def _toggle_nginx_vhost(domain: str, enable: bool) -> dict:
+    """Enable or disable an Nginx vhost by managing the sites-enabled symlink."""
+    avail = NGINX_SITES_AVAIL / f"{domain}.conf"
+    enabled_link = NGINX_SITES_ENABLED / f"{domain}.conf"
+    if not avail.exists():
+        raise HTTPException(status_code=404, detail=f"No Nginx config found for {domain} in sites-available")
+    if enable:
+        if not enabled_link.exists():
+            enabled_link.symlink_to(avail)
+    else:
+        if enabled_link.exists() or enabled_link.is_symlink():
+            enabled_link.unlink()
+    _, stderr, rc = _run(["sudo", "/bin/systemctl", "reload", "nginx"], timeout=15)
+    if rc != 0:
+        raise HTTPException(status_code=500, detail=f"nginx reload failed: {stderr.strip()}")
+    return {"toggled": True, "domain": domain, "enabled": enable}
+
+
+def _write_vhost_config(config_file: str, content: str, server_type: str) -> None:
+    """Write vhost config via sudo tee (frothiq can't write /etc/apache2 directly)."""
+    path = Path(config_file)
+    # Only allow writes to sites-available
+    if server_type == "apache":
+        allowed_dir = APACHE_SITES_AVAIL
+    else:
+        allowed_dir = NGINX_SITES_AVAIL
+    if path.parent.resolve() != allowed_dir.resolve():
+        raise HTTPException(status_code=400, detail="Config writes allowed only to sites-available")
+    # Write via sudo tee
+    proc = subprocess.run(
+        ["sudo", "/usr/bin/tee", str(path)],
+        input=content.encode(),
+        capture_output=True,
+        timeout=10,
+    )
+    if proc.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"tee failed: {proc.stderr.decode().strip()}")
+    # Test config
+    if server_type == "nginx":
+        _, stderr, rc = _run(["sudo", "/usr/sbin/nginx", "-t"], timeout=10)
+        if rc != 0:
+            raise HTTPException(status_code=422, detail=f"Nginx config test failed: {stderr.strip()}")
+    elif server_type == "apache":
+        _, stderr, rc = _run(["apachectl", "configtest"], timeout=10)
+        if rc != 0:
+            raise HTTPException(status_code=422, detail=f"Apache config test failed: {stderr.strip()}")
+
+
+def _backup_vhost(domain: str, port: int, server_type: str, config_file: str) -> dict:
+    """Snapshot the config file (and optionally docroot) to the backup dir."""
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stem = f"{domain}-{port}-{server_type}-{ts}"
+    dest = BACKUP_DIR / f"{stem}.conf"
+    try:
+        import shutil
+        shutil.copy2(config_file, dest)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Backup failed: {exc}") from exc
+    return {
+        "backup_file": str(dest),
+        "timestamp": ts,
+        "domain": domain,
+        "port": port,
+        "server_type": server_type,
+        "source": config_file,
+    }
+
+
+def _list_backups(domain: str | None = None) -> list[dict]:
+    """List vhost backups, optionally filtered by domain."""
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    results = []
+    for f in sorted(BACKUP_DIR.glob("*.conf"), reverse=True):
+        parts = f.stem.split("-")
+        if len(parts) < 4:
+            continue
+        # stem format: domain-port-server_type-YYYYMMDD-HHMMSS
+        # domain may contain hyphens, so parse from the right
+        ts_time = parts[-1]
+        ts_date = parts[-2]
+        stype = parts[-3]
+        port_str = parts[-4]
+        d = "-".join(parts[:-4])
+        if domain and d != domain:
+            continue
+        try:
+            port = int(port_str)
+        except ValueError:
+            port = 0
+        results.append({
+            "backup_file": str(f),
+            "domain": d,
+            "port": port,
+            "server_type": stype,
+            "timestamp": f"{ts_date}-{ts_time}",
+            "size_bytes": f.stat().st_size,
+        })
+    return results
+
+
+def _restore_vhost(backup_file: str) -> dict:
+    """Restore a vhost config from a backup file."""
+    src = Path(backup_file)
+    if not src.exists() or src.parent.resolve() != BACKUP_DIR.resolve():
+        raise HTTPException(status_code=404, detail="Backup file not found")
+    # Parse stem to determine target
+    parts = src.stem.split("-")
+    if len(parts) < 4:
+        raise HTTPException(status_code=400, detail="Cannot parse backup filename")
+    stype = parts[-3]
+    port_str = parts[-4]
+    domain = "-".join(parts[:-4])
+    try:
+        port = int(port_str)
+    except ValueError:
+        port = 0
+    if stype == "apache":
+        stem = domain if port != 443 else f"{domain}-le-ssl"
+        target = APACHE_SITES_AVAIL / f"{stem}.conf"
+    else:
+        target = NGINX_SITES_AVAIL / f"{domain}.conf"
+    # Write via sudo tee
+    content = src.read_bytes()
+    proc = subprocess.run(
+        ["sudo", "/usr/bin/tee", str(target)],
+        input=content,
+        capture_output=True,
+        timeout=10,
+    )
+    if proc.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"Restore failed: {proc.stderr.decode().strip()}")
+    return {"restored": True, "target": str(target), "from_backup": str(src)}
+
+
+# ---------------------------------------------------------------------------
+# Vhost management Pydantic models
+# ---------------------------------------------------------------------------
+
+class VhostToggleRequest(BaseModel):
+    domain: str
+    port: int
+    server_type: str
+    enable: bool
+
+
+class VhostConfigSaveRequest(BaseModel):
+    config_file: str
+    content: str
+    server_type: str
+
+
+class VhostBackupRequest(BaseModel):
+    domain: str
+    port: int
+    server_type: str
+    config_file: str
+
+
+class VhostRestoreRequest(BaseModel):
+    backup_file: str
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -836,3 +1086,101 @@ async def server_action(
     if server.get("type") == "local":
         raise HTTPException(status_code=400, detail="Power actions are not available for the local server")
     return _execute_action(server, body.action, user)
+
+
+# ---------------------------------------------------------------------------
+# Vhost management endpoints
+# ---------------------------------------------------------------------------
+
+@router.get("/vhosts/detail")
+async def vhost_detail(
+    domain: str,
+    port: int,
+    server_type: str,
+    config_file: str,
+    _: str = Depends(require_super_admin),
+) -> dict:
+    """Return full detail for a single vhost: config content, SSL info, enabled status."""
+    config_content = _read_vhost_config(config_file)
+    ssl_info = _ssl_cert_info(domain) if (port == 443 or "ssl" in config_content.lower()) else {}
+    enabled = _vhost_is_enabled(domain, port, server_type)
+    backups = _list_backups(domain)
+    return {
+        "domain": domain,
+        "port": port,
+        "server_type": server_type,
+        "config_file": config_file,
+        "config_content": config_content,
+        "enabled": enabled,
+        "ssl": ssl_info,
+        "backups": backups,
+        "checked_at": datetime.now(UTC).isoformat(),
+    }
+
+
+@router.post("/vhosts/toggle")
+async def vhost_toggle(
+    body: VhostToggleRequest,
+    user: str = Depends(require_super_admin),
+) -> dict:
+    """Enable or disable a vhost."""
+    _audit(user, "vhost_toggle", "local", f"{body.domain}:{body.port} enable={body.enable}", "started")
+    if body.server_type == "apache":
+        result = _toggle_apache_vhost(body.domain, body.port, body.enable)
+    elif body.server_type == "nginx":
+        result = _toggle_nginx_vhost(body.domain, body.enable)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown server type: {body.server_type}")
+    _audit(user, "vhost_toggle", "local", f"{body.domain}:{body.port}", "ok")
+    return result
+
+
+@router.post("/vhosts/save-config")
+async def vhost_save_config(
+    body: VhostConfigSaveRequest,
+    user: str = Depends(require_super_admin),
+) -> dict:
+    """Write an updated config file and reload the web server."""
+    _audit(user, "vhost_save_config", "local", body.config_file, "started")
+    _write_vhost_config(body.config_file, body.content, body.server_type)
+    # Reload the appropriate web server
+    if body.server_type == "apache":
+        _run(["sudo", "/bin/systemctl", "reload", "apache2"], timeout=15)
+    else:
+        _run(["sudo", "/bin/systemctl", "reload", "nginx"], timeout=15)
+    _audit(user, "vhost_save_config", "local", body.config_file, "ok")
+    return {"saved": True, "config_file": body.config_file}
+
+
+@router.post("/vhosts/backup")
+async def vhost_backup(
+    body: VhostBackupRequest,
+    user: str = Depends(require_super_admin),
+) -> dict:
+    """Create a timestamped backup of a vhost config."""
+    _audit(user, "vhost_backup", "local", f"{body.domain}:{body.port}", "started")
+    result = _backup_vhost(body.domain, body.port, body.server_type, body.config_file)
+    _audit(user, "vhost_backup", "local", body.config_file, "ok")
+    return result
+
+
+@router.get("/vhosts/backups")
+async def list_vhost_backups(
+    domain: str | None = None,
+    _: str = Depends(require_super_admin),
+) -> dict:
+    """List all vhost backups, optionally filtered by domain."""
+    backups = _list_backups(domain)
+    return {"backups": backups, "count": len(backups)}
+
+
+@router.post("/vhosts/restore")
+async def vhost_restore(
+    body: VhostRestoreRequest,
+    user: str = Depends(require_super_admin),
+) -> dict:
+    """Restore a vhost config from a backup file."""
+    _audit(user, "vhost_restore", "local", body.backup_file, "started")
+    result = _restore_vhost(body.backup_file)
+    _audit(user, "vhost_restore", "local", body.backup_file, "ok")
+    return result
