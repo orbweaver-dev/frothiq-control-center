@@ -694,31 +694,61 @@ NGINX_SITES_AVAIL = Path("/etc/nginx/sites-available")
 NGINX_SITES_ENABLED = Path("/etc/nginx/sites-enabled")
 
 
+def _parse_cert_output(out: str, cert_path: str | None = None) -> dict:
+    result: dict[str, Any] = {}
+    if cert_path:
+        result["cert_path"] = cert_path
+    for line in out.splitlines():
+        if line.startswith("notAfter="):
+            result["expires"] = line.split("=", 1)[1].strip()
+        elif line.startswith("issuer="):
+            result["issuer"] = line.split("=", 1)[1].strip()
+        elif line.startswith("subject="):
+            result["subject"] = line.split("=", 1)[1].strip()
+    return result
+
+
 def _ssl_cert_info(domain: str) -> dict:
-    """Return SSL cert expiry and issuer for a domain using openssl."""
+    """Return SSL cert expiry and issuer. Tries cert files first, falls back to live TLS probe."""
     cert_paths = [
         Path(f"/etc/letsencrypt/live/{domain}/cert.pem"),
         Path(f"/etc/ssl/certs/{domain}.pem"),
     ]
     for cert_path in cert_paths:
-        if cert_path.exists():
-            try:
-                out = _run_out(
-                    ["openssl", "x509", "-in", str(cert_path), "-noout",
-                     "-enddate", "-issuer", "-subject"],
-                    timeout=5,
-                )
-                result: dict[str, Any] = {"cert_path": str(cert_path)}
-                for line in out.splitlines():
-                    if line.startswith("notAfter="):
-                        result["expires"] = line.split("=", 1)[1].strip()
-                    elif line.startswith("issuer="):
-                        result["issuer"] = line.split("=", 1)[1].strip()
-                    elif line.startswith("subject="):
-                        result["subject"] = line.split("=", 1)[1].strip()
+        try:
+            exists = cert_path.exists()
+        except OSError:
+            # /etc/letsencrypt/live/ is root-only readable — skip silently
+            continue
+        if not exists:
+            continue
+        try:
+            out = _run_out(
+                ["openssl", "x509", "-in", str(cert_path), "-noout",
+                 "-enddate", "-issuer", "-subject"],
+                timeout=5,
+            )
+            result = _parse_cert_output(out, str(cert_path))
+            if result.get("expires"):
                 return result
-            except Exception:
-                pass
+        except Exception:
+            pass
+
+    # Fall back: probe the live TLS connection (no file permissions needed)
+    try:
+        proc = subprocess.run(
+            ["bash", "-c",
+             f"echo | openssl s_client -connect {domain}:443 -servername {domain} 2>/dev/null"
+             " | openssl x509 -noout -enddate -issuer -subject 2>/dev/null"],
+            capture_output=True, timeout=8,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            result = _parse_cert_output(proc.stdout.decode())
+            if result.get("expires"):
+                return result
+    except Exception:
+        pass
+
     return {}
 
 
@@ -1198,9 +1228,18 @@ async def vhost_detail(
 ) -> dict:
     """Return full detail for a single vhost: config content, SSL info, enabled status."""
     config_content = _read_vhost_config(config_file)
-    ssl_info = _ssl_cert_info(domain) if (port == 443 or "ssl" in config_content.lower()) else {}
-    enabled = _vhost_is_enabled(domain, port, server_type)
-    backups = _list_backups(domain)
+    try:
+        ssl_info = _ssl_cert_info(domain) if (port == 443 or "ssl" in config_content.lower()) else {}
+    except Exception:
+        ssl_info = {}
+    try:
+        enabled = _vhost_is_enabled(domain, port, server_type)
+    except Exception:
+        enabled = False
+    try:
+        backups = _list_backups(domain)
+    except Exception:
+        backups = []
     return {
         "domain": domain,
         "port": port,
