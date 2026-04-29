@@ -2,6 +2,8 @@
 import base64
 import datetime
 import json
+import re
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -344,4 +346,49 @@ def inspect_url(
                 for item in rich_results.get("detectedItems", [])
             ],
         },
+    }
+
+
+# ── Local Domain Enumeration ──────────────────────────────────────────────────
+
+_INFRA_PREFIXES = ("autoconfig.", "autodiscover.", "webmail.", "mail.", "admin.", "cpanel.", "whm.")
+_SKIP_HOSTS = {"wh1.zonkhost.net", "localhost"}
+
+
+def _local_vhosts() -> list[str]:
+    """Return primary domain names from the local Apache config (apachectl -S)."""
+    try:
+        result = subprocess.run(
+            ["apachectl", "-S"],
+            capture_output=True, text=True, timeout=10,
+        )
+        output = result.stdout + result.stderr
+    except Exception:
+        return []
+
+    domains: list[str] = []
+    seen: set[str] = set()
+    for line in output.splitlines():
+        m = re.search(r"port\s+\d+\s+namevhost\s+(\S+)\s+\(", line)
+        if not m:
+            continue
+        host = m.group(1).lower().split(":")[0]
+        if host in _SKIP_HOSTS:
+            continue
+        if any(host.startswith(p) for p in _INFRA_PREFIXES):
+            continue
+        if host not in seen:
+            seen.add(host)
+            domains.append(host)
+
+    return sorted(domains)
+
+
+@router.get("/gsc/local-sites")
+def local_sites(_: dict = Depends(require_super_admin)):
+    """Return all primary domains hosted on this server (Apache vhosts)."""
+    domains = _local_vhosts()
+    return {
+        "domains": [{"domain": d, "url": f"https://{d}"} for d in domains],
+        "count": len(domains),
     }
