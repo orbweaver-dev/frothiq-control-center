@@ -23,7 +23,7 @@ import hashlib
 import hmac
 import time
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
@@ -295,9 +295,19 @@ class EdgeEventRequest(BaseModel):
     license_token: str = Field(..., min_length=10)
     ip:            str = Field(..., min_length=7,  max_length=45, description="IPv4 or IPv6")
     event_type:    str = Field(..., max_length=64,
-                               description="blocked_local|blocked_rbl|failed_login|threat_detected")
+                               description="Any threat event type; unknown types are normalised to threat_detected")
     severity:      str = Field("high", max_length=16)
     reason:        str = Field("",     max_length=512)
+
+    # Canonical set the ThreatReport community pool understands.
+    # All other types from edge plugins (scanner_detected, sql_injection, etc.)
+    # are normalised to threat_detected so they are stored and propagated.
+    _CANONICAL_TYPES: ClassVar[frozenset[str]] = frozenset({
+        "blocked_local", "blocked_rbl", "failed_login", "brute_force",
+        "threat_detected", "scanner_detected", "sql_injection", "xss_attempt",
+        "path_traversal", "file_access_attempt", "xmlrpc_abuse", "probe_attempt",
+        "login_probe", "user_enumeration", "suspicious_request",
+    })
 
     @field_validator("ip")
     @classmethod
@@ -311,10 +321,9 @@ class EdgeEventRequest(BaseModel):
 
     @field_validator("event_type")
     @classmethod
-    def event_type_allowed(cls, v: str) -> str:
-        allowed = {"blocked_local", "blocked_rbl", "failed_login", "threat_detected"}
-        if v not in allowed:
-            raise ValueError(f"event_type must be one of: {', '.join(sorted(allowed))}")
+    def normalise_event_type(cls, v: str) -> str:
+        if v not in cls._CANONICAL_TYPES:
+            return "threat_detected"
         return v
 
 

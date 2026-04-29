@@ -20,7 +20,7 @@ import json
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import select
@@ -1099,7 +1099,7 @@ async def auto_compile_attack_report(
             return {"ok": False, "error": "unknown edge node"}
 
         tenant_id = node.tenant_id
-        domain    = node.site_url or ""
+        domain    = node.domain or ""
 
         # Deduplication: skip if already reported this IP in the last 24 hours
         dup = await session.execute(
