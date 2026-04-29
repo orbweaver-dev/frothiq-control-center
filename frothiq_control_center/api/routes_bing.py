@@ -139,6 +139,29 @@ def list_sites(_: dict = Depends(require_super_admin)):
     return {"sites": sites, "count": len(sites)}
 
 
+# ── Shared helpers for new GetPageStats / GetQueryStats API ───────────────────
+
+_BING_STATS_PARAMS = {
+    "granularity": 1,   # daily
+    "dataType": 0,
+    "deviceType": 0,
+    "country": "all",
+    "language": "all",
+}
+
+
+def _get_stats(method: str, site_url: str, start: str, end: str) -> list[dict]:
+    data = _bing_get(method, {
+        "siteUrl": site_url,
+        "startDate": start,
+        "endDate": end,
+        **_BING_STATS_PARAMS,
+        "pageNum": 0,
+    })
+    rows = data.get("d") or []
+    return rows if isinstance(rows, list) else []
+
+
 # ── Traffic Overview ──────────────────────────────────────────────────────────
 
 @router.get("/traffic")
@@ -147,29 +170,20 @@ def site_traffic(
     days: int = Query(28, ge=7, le=90),
     _: dict = Depends(require_super_admin),
 ):
-    """Aggregate traffic by summing top-pages data for the period."""
     start, end = _date_range(days)
-    data = _bing_get("GetTopPages", {
-        "siteUrl": site_url,
-        "startDate": start,
-        "endDate": end,
-        "country": "",
-        "language": "",
-        "pageNum": 0,
-    })
-    rows = data.get("d") or []
-    if not isinstance(rows, list):
-        rows = []
+    rows = _get_stats("GetPageStats", site_url, start, end)
 
     total_clicks = sum(int(r.get("Clicks", 0) or 0) for r in rows)
     total_impressions = sum(int(r.get("Impressions", 0) or 0) for r in rows)
+    clicked = [r for r in rows if int(r.get("AvgClickPosition", -1) or -1) > 0]
     avg_rank = (
-        sum(float(r.get("AvgClickRank", 0) or 0) for r in rows) / len(rows)
-        if rows else 0.0
+        sum(float(r["AvgClickPosition"]) for r in clicked) / len(clicked)
+        if clicked else 0.0
     )
+    impressed = [r for r in rows if int(r.get("AvgImpressionPosition", -1) or -1) > 0]
     avg_impression_rank = (
-        sum(float(r.get("AvgImpressionRank", 0) or 0) for r in rows) / len(rows)
-        if rows else 0.0
+        sum(float(r["AvgImpressionPosition"]) for r in impressed) / len(impressed)
+        if impressed else 0.0
     )
     ctr = (total_clicks / total_impressions * 100) if total_impressions else 0.0
 
@@ -180,7 +194,7 @@ def site_traffic(
             "ctr": round(ctr, 2),
             "avg_click_rank": round(avg_rank, 1),
             "avg_impression_rank": round(avg_impression_rank, 1),
-            "pages_tracked": len(rows),
+            "pages_tracked": len({r.get("Query") for r in rows if r.get("Query")}),
         },
         "period": {"start": start, "end": end, "days": days},
     }
@@ -196,32 +210,40 @@ def top_keywords(
     _: dict = Depends(require_super_admin),
 ):
     start, end = _date_range(days)
-    data = _bing_get("GetTopKeywords", {
-        "siteUrl": site_url,
-        "startDate": start,
-        "endDate": end,
-        "country": "",
-        "language": "",
-        "pageNum": page,
-    })
-    rows = data.get("d") or []
-    if not isinstance(rows, list):
-        rows = []
-    result = [
-        {
-            "query": r.get("Query", ""),
-            "impressions": int(r.get("Impressions", 0) or 0),
-            "clicks": int(r.get("Clicks", 0) or 0),
-            "ctr": round(
-                int(r.get("Clicks", 0) or 0) / max(int(r.get("Impressions", 1) or 1), 1) * 100, 1
-            ),
-            "avg_rank": round(float(r.get("AvgClickRank", 0) or 0), 1),
-            "avg_impression_rank": round(float(r.get("AvgImpressionRank", 0) or 0), 1),
-        }
-        for r in rows
-        if r.get("Query")
-    ]
-    return {"rows": result, "count": len(result), "page": page}
+    rows = _get_stats("GetQueryStats", site_url, start, end)
+
+    # Aggregate per-day rows by query
+    by_query: dict[str, dict] = {}
+    for r in rows:
+        q = r.get("Query", "")
+        if not q:
+            continue
+        if q not in by_query:
+            by_query[q] = {"clicks": 0, "impressions": 0, "positions": []}
+        by_query[q]["clicks"] += int(r.get("Clicks", 0) or 0)
+        by_query[q]["impressions"] += int(r.get("Impressions", 0) or 0)
+        pos = float(r.get("AvgClickPosition", -1) or -1)
+        if pos > 0:
+            by_query[q]["positions"].append(pos)
+
+    result = sorted(
+        [
+            {
+                "query": q,
+                "clicks": d["clicks"],
+                "impressions": d["impressions"],
+                "ctr": round(d["clicks"] / max(d["impressions"], 1) * 100, 1),
+                "avg_rank": round(sum(d["positions"]) / len(d["positions"]), 1) if d["positions"] else 0.0,
+            }
+            for q, d in by_query.items()
+        ],
+        key=lambda x: x["impressions"],
+        reverse=True,
+    )
+
+    page_size = 50
+    start_idx = page * page_size
+    return {"rows": result[start_idx: start_idx + page_size], "count": len(result), "page": page}
 
 
 # ── Top Pages ─────────────────────────────────────────────────────────────────
@@ -234,31 +256,40 @@ def top_pages(
     _: dict = Depends(require_super_admin),
 ):
     start, end = _date_range(days)
-    data = _bing_get("GetTopPages", {
-        "siteUrl": site_url,
-        "startDate": start,
-        "endDate": end,
-        "country": "",
-        "language": "",
-        "pageNum": page,
-    })
-    rows = data.get("d") or []
-    if not isinstance(rows, list):
-        rows = []
-    result = [
-        {
-            "url": r.get("Url", ""),
-            "impressions": int(r.get("Impressions", 0) or 0),
-            "clicks": int(r.get("Clicks", 0) or 0),
-            "ctr": round(
-                int(r.get("Clicks", 0) or 0) / max(int(r.get("Impressions", 1) or 1), 1) * 100, 1
-            ),
-            "avg_rank": round(float(r.get("AvgClickRank", 0) or 0), 1),
-        }
-        for r in rows
-        if r.get("Url")
-    ]
-    return {"rows": result, "count": len(result), "page": page}
+    rows = _get_stats("GetPageStats", site_url, start, end)
+
+    # Aggregate per-day rows by page URL (stored in "Query" field by Bing)
+    by_page: dict[str, dict] = {}
+    for r in rows:
+        url = r.get("Query", "")
+        if not url:
+            continue
+        if url not in by_page:
+            by_page[url] = {"clicks": 0, "impressions": 0, "positions": []}
+        by_page[url]["clicks"] += int(r.get("Clicks", 0) or 0)
+        by_page[url]["impressions"] += int(r.get("Impressions", 0) or 0)
+        pos = float(r.get("AvgClickPosition", -1) or -1)
+        if pos > 0:
+            by_page[url]["positions"].append(pos)
+
+    result = sorted(
+        [
+            {
+                "url": u,
+                "clicks": d["clicks"],
+                "impressions": d["impressions"],
+                "ctr": round(d["clicks"] / max(d["impressions"], 1) * 100, 1),
+                "avg_rank": round(sum(d["positions"]) / len(d["positions"]), 1) if d["positions"] else 0.0,
+            }
+            for u, d in by_page.items()
+        ],
+        key=lambda x: x["impressions"],
+        reverse=True,
+    )
+
+    page_size = 50
+    start_idx = page * page_size
+    return {"rows": result[start_idx: start_idx + page_size], "count": len(result), "page": page}
 
 
 # ── Crawl Stats & Issues ──────────────────────────────────────────────────────
@@ -311,12 +342,15 @@ def list_sitemaps(
     site_url: str = Query(...),
     _: dict = Depends(require_super_admin),
 ):
-    data = _bing_get("GetSitemaps", {"siteUrl": site_url})
+    try:
+        data = _bing_get("GetSitemaps", {"siteUrl": site_url})
+    except HTTPException:
+        return {"sitemaps": [], "count": 0, "note": "Bing Sitemaps API not available"}
     raw = data.get("d") or []
     sitemaps = []
     for s in (raw if isinstance(raw, list) else []):
         contents = s.get("ContentsCount") or []
-        total_urls = sum(c.get("Count", 0) for c in (contents if isinstance(contents, list) else []))
+        total_urls = sum(int(c.get("Count", 0) or 0) for c in (contents if isinstance(contents, list) else []))
         sitemaps.append({
             "url": s.get("Url", ""),
             "is_default": s.get("IsDefault", False),
@@ -403,10 +437,13 @@ def backlinks(
     count: int = Query(50, ge=10, le=100),
     _: dict = Depends(require_super_admin),
 ):
-    data = _bing_get("GetLinksToSite", {
-        "siteUrl": site_url,
-        "page": offset // count,
-    })
+    try:
+        data = _bing_get("GetLinksToSite", {
+            "siteUrl": site_url,
+            "page": offset // count,
+        })
+    except HTTPException:
+        return {"links": [], "count": 0, "note": "Bing Backlinks API not available"}
     raw = data.get("d") or []
     links = [
         {

@@ -244,8 +244,8 @@ def gsc_sitemaps(
     sitemaps = []
     for s in data.get("sitemap", []):
         contents = s.get("contents", [])
-        submitted = sum(c.get("submitted", 0) for c in contents)
-        indexed = sum(c.get("indexed", 0) for c in contents)
+        submitted = sum(int(c.get("submitted", 0) or 0) for c in contents)
+        indexed = sum(int(c.get("indexed", 0) or 0) for c in contents)
         sitemaps.append({
             "path": s["path"],
             "lastSubmitted": s.get("lastSubmitted"),
