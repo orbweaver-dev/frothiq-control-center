@@ -1,15 +1,11 @@
-"""WebOps Analytics — Google Search Console integration via service account JWT auth."""
-import base64
+"""WebOps Analytics — Google Search Console integration via OAuth2 user credentials."""
 import datetime
 import json
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
@@ -17,43 +13,30 @@ from .routes_auth import require_super_admin
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
-SA_KEY_FILE = Path("/var/lib/mc3/gsc-sa-key.json")
+ADC_FILE = Path("/var/lib/mc3/gsc-adc.json")
 GSC_BASE = "https://searchconsole.googleapis.com/webmasters/v3"
 GSC_V1_BASE = "https://searchconsole.googleapis.com/v1"
+QUOTA_PROJECT = "emerald-shield"
 
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
 
-def _get_sa_token(scope: str) -> str:
-    if not SA_KEY_FILE.exists():
-        raise HTTPException(503, "GSC service account key not configured at /var/lib/mc3/gsc-sa-key.json")
+def _get_gsc_token() -> str:
+    """Get a fresh access token using stored OAuth2 user credentials (ADC)."""
+    if not ADC_FILE.exists():
+        raise HTTPException(503, "GSC credentials not configured at /var/lib/mc3/gsc-adc.json")
     try:
-        raw = SA_KEY_FILE.read_text()
+        creds = json.loads(ADC_FILE.read_text())
     except PermissionError:
-        raise HTTPException(503, f"GSC service account key is not readable — fix ownership: chown frothiq {SA_KEY_FILE}")
-    try:
-        key_data = json.loads(raw)
+        raise HTTPException(503, f"GSC credentials file is not readable — fix ownership: chown frothiq {ADC_FILE}")
     except (json.JSONDecodeError, ValueError) as exc:
-        raise HTTPException(503, f"GSC service account key is malformed JSON: {exc}") from exc
-    try:
-        private_key = serialization.load_pem_private_key(key_data["private_key"].encode(), password=None)
-    except (KeyError, Exception) as exc:
-        raise HTTPException(503, f"GSC service account key has invalid private_key: {exc}") from exc
-    now = int(time.time())
-    header = base64.urlsafe_b64encode(json.dumps({"alg": "RS256", "typ": "JWT"}).encode()).rstrip(b"=")
-    payload = base64.urlsafe_b64encode(json.dumps({
-        "iss": key_data["client_email"],
-        "scope": scope,
-        "aud": "https://oauth2.googleapis.com/token",
-        "exp": now + 3600,
-        "iat": now,
-    }).encode()).rstrip(b"=")
-    signing_input = header + b"." + payload
-    sig = private_key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
-    jwt = signing_input + b"." + base64.urlsafe_b64encode(sig).rstrip(b"=")
+        raise HTTPException(503, f"GSC credentials file is malformed: {exc}") from exc
+
     data = urllib.parse.urlencode({
-        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-        "assertion": jwt.decode(),
+        "client_id": creds["client_id"],
+        "client_secret": creds["client_secret"],
+        "refresh_token": creds["refresh_token"],
+        "grant_type": "refresh_token",
     }).encode()
     req = urllib.request.Request(
         "https://oauth2.googleapis.com/token", data=data,
@@ -63,13 +46,13 @@ def _get_sa_token(scope: str) -> str:
         resp = urllib.request.urlopen(req, timeout=10)
         return json.loads(resp.read())["access_token"]
     except Exception as exc:
-        raise HTTPException(503, f"SA token error: {exc}") from exc
+        raise HTTPException(503, f"GSC token refresh error: {exc}") from exc
 
 
 def _gsc(method: str, path: str, token: str, body: dict | None = None, base: str = GSC_BASE) -> dict:
     url = f"{base}/{path}"
     data = json.dumps(body).encode() if body is not None else None
-    headers: dict = {"Authorization": f"Bearer {token}"}
+    headers: dict = {"Authorization": f"Bearer {token}", "x-goog-user-project": QUOTA_PROJECT}
     if data:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
@@ -98,7 +81,7 @@ def _date_range(days: int) -> tuple[str, str, str, str]:
 
 @router.get("/gsc/sites")
 def list_gsc_sites(_: dict = Depends(require_super_admin)):
-    token = _get_sa_token("https://www.googleapis.com/auth/webmasters.readonly")
+    token = _get_gsc_token()
     data = _gsc("GET", "sites", token)
     entries = data.get("siteEntry", [])
     sites = [{"url": e["siteUrl"], "permission": e.get("permissionLevel", "unknown")} for e in entries]
@@ -113,7 +96,7 @@ def gsc_performance(
     days: int = Query(28, ge=7, le=90),
     _: dict = Depends(require_super_admin),
 ):
-    token = _get_sa_token("https://www.googleapis.com/auth/webmasters.readonly")
+    token = _get_gsc_token()
     start, end, prev_start, prev_end = _date_range(days)
     site_enc = urllib.parse.quote(site_url, safe="")
 
@@ -159,7 +142,7 @@ def gsc_queries(
     limit: int = Query(25, ge=5, le=100),
     _: dict = Depends(require_super_admin),
 ):
-    token = _get_sa_token("https://www.googleapis.com/auth/webmasters.readonly")
+    token = _get_gsc_token()
     start, end, _, __ = _date_range(days)
     site_enc = urllib.parse.quote(site_url, safe="")
     data = _gsc("POST", f"sites/{site_enc}/searchAnalytics/query", token, {
@@ -184,7 +167,7 @@ def gsc_pages(
     limit: int = Query(25, ge=5, le=100),
     _: dict = Depends(require_super_admin),
 ):
-    token = _get_sa_token("https://www.googleapis.com/auth/webmasters.readonly")
+    token = _get_gsc_token()
     start, end, _, __ = _date_range(days)
     site_enc = urllib.parse.quote(site_url, safe="")
     data = _gsc("POST", f"sites/{site_enc}/searchAnalytics/query", token, {
@@ -208,7 +191,7 @@ def gsc_devices(
     days: int = Query(28, ge=7, le=90),
     _: dict = Depends(require_super_admin),
 ):
-    token = _get_sa_token("https://www.googleapis.com/auth/webmasters.readonly")
+    token = _get_gsc_token()
     start, end, _, __ = _date_range(days)
     site_enc = urllib.parse.quote(site_url, safe="")
     data = _gsc("POST", f"sites/{site_enc}/searchAnalytics/query", token, {
@@ -232,7 +215,7 @@ def gsc_countries(
     days: int = Query(28, ge=7, le=90),
     _: dict = Depends(require_super_admin),
 ):
-    token = _get_sa_token("https://www.googleapis.com/auth/webmasters.readonly")
+    token = _get_gsc_token()
     start, end, _, __ = _date_range(days)
     site_enc = urllib.parse.quote(site_url, safe="")
     data = _gsc("POST", f"sites/{site_enc}/searchAnalytics/query", token, {
@@ -255,7 +238,7 @@ def gsc_sitemaps(
     site_url: str = Query(...),
     _: dict = Depends(require_super_admin),
 ):
-    token = _get_sa_token("https://www.googleapis.com/auth/webmasters.readonly")
+    token = _get_gsc_token()
     site_enc = urllib.parse.quote(site_url, safe="")
     data = _gsc("GET", f"sites/{site_enc}/sitemaps", token)
     sitemaps = []
@@ -284,7 +267,7 @@ class SitemapBody(BaseModel):
 
 @router.post("/gsc/sitemaps/submit")
 def submit_sitemap(body: SitemapBody, _: dict = Depends(require_super_admin)):
-    token = _get_sa_token("https://www.googleapis.com/auth/webmasters")
+    token = _get_gsc_token()
     site_enc = urllib.parse.quote(body.site_url, safe="")
     feed_enc = urllib.parse.quote(body.feed_path, safe="")
     _gsc("PUT", f"sites/{site_enc}/sitemaps/{feed_enc}", token)
@@ -293,7 +276,7 @@ def submit_sitemap(body: SitemapBody, _: dict = Depends(require_super_admin)):
 
 @router.post("/gsc/sitemaps/delete")
 def delete_sitemap(body: SitemapBody, _: dict = Depends(require_super_admin)):
-    token = _get_sa_token("https://www.googleapis.com/auth/webmasters")
+    token = _get_gsc_token()
     site_enc = urllib.parse.quote(body.site_url, safe="")
     feed_enc = urllib.parse.quote(body.feed_path, safe="")
     _gsc("DELETE", f"sites/{site_enc}/sitemaps/{feed_enc}", token)
@@ -308,7 +291,7 @@ def inspect_url(
     inspection_url: str = Query(...),
     _: dict = Depends(require_super_admin),
 ):
-    token = _get_sa_token("https://www.googleapis.com/auth/webmasters.readonly")
+    token = _get_gsc_token()
     data = _gsc("POST", "urlInspection/index:inspect", token, {
         "inspectionUrl": inspection_url,
         "siteUrl": site_url,
