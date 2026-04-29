@@ -27,8 +27,18 @@ GSC_V1_BASE = "https://searchconsole.googleapis.com/v1"
 def _get_sa_token(scope: str) -> str:
     if not SA_KEY_FILE.exists():
         raise HTTPException(503, "GSC service account key not configured at /var/lib/mc3/gsc-sa-key.json")
-    key_data = json.loads(SA_KEY_FILE.read_text())
-    private_key = serialization.load_pem_private_key(key_data["private_key"].encode(), password=None)
+    try:
+        raw = SA_KEY_FILE.read_text()
+    except PermissionError:
+        raise HTTPException(503, f"GSC service account key is not readable — fix ownership: chown frothiq {SA_KEY_FILE}")
+    try:
+        key_data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(503, f"GSC service account key is malformed JSON: {exc}") from exc
+    try:
+        private_key = serialization.load_pem_private_key(key_data["private_key"].encode(), password=None)
+    except (KeyError, Exception) as exc:
+        raise HTTPException(503, f"GSC service account key has invalid private_key: {exc}") from exc
     now = int(time.time())
     header = base64.urlsafe_b64encode(json.dumps({"alg": "RS256", "typ": "JWT"}).encode()).rstrip(b"=")
     payload = base64.urlsafe_b64encode(json.dumps({

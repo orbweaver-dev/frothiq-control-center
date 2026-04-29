@@ -38,8 +38,12 @@ REGISTRY_FILE = Path("/var/lib/mc3/webops-servers.json")
 
 
 def _load_registry() -> list[dict]:
+    if not REGISTRY_FILE.exists():
+        return []
     try:
-        return json.loads(REGISTRY_FILE.read_text()) if REGISTRY_FILE.exists() else []
+        return json.loads(REGISTRY_FILE.read_text())
+    except PermissionError:
+        raise HTTPException(503, f"Server registry is not readable — fix ownership: chown frothiq {REGISTRY_FILE}")
     except (json.JSONDecodeError, OSError):
         return []
 

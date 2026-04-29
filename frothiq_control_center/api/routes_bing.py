@@ -24,9 +24,15 @@ BING_BASE = "https://ssl.bing.com/webmaster/api.svc/json"
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _key() -> str:
-    if not BING_KEY_FILE.exists() or not BING_KEY_FILE.read_text().strip():
+    if not BING_KEY_FILE.exists():
         raise HTTPException(503, "Bing Webmaster API key not configured")
-    return BING_KEY_FILE.read_text().strip()
+    try:
+        val = BING_KEY_FILE.read_text().strip()
+    except PermissionError:
+        raise HTTPException(503, f"Bing API key file is not readable — fix ownership: chown frothiq {BING_KEY_FILE}")
+    if not val:
+        raise HTTPException(503, "Bing Webmaster API key not configured")
+    return val
 
 
 def _bing_get(method: str, params: dict, key: str | None = None) -> dict:
