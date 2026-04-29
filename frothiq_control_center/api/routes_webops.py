@@ -36,10 +36,38 @@ router = APIRouter(prefix="/webops", tags=["webops"])
 
 REGISTRY_FILE = Path("/var/lib/mc3/webops-servers.json")
 
+_LOCAL_SERVER_ID = "wh1-local"
+
+
+def _make_local_server() -> dict:
+    return {
+        "id": _LOCAL_SERVER_ID,
+        "display_name": "wh1 (this server)",
+        "hostname": "wh1.zonkhost.net",
+        "ip": "127.0.0.1",
+        "type": "local",
+        "provider": "Zonkhost",
+        "os": "Ubuntu 22.04",
+        "ssh_user": "",
+        "ssh_port": 22,
+        "ssh_key": "",
+        "libvirt_name": "",
+        "tags": ["local", "wh1"],
+        "notes": "Auto-registered local server",
+        "added_at": datetime.now(UTC).isoformat(),
+        "added_by": "system",
+    }
+
 
 def _load_registry() -> list[dict]:
     if not REGISTRY_FILE.exists():
-        return []
+        servers = [_make_local_server()]
+        try:
+            REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            REGISTRY_FILE.write_text(json.dumps(servers, indent=2))
+        except OSError:
+            pass
+        return servers
     try:
         return json.loads(REGISTRY_FILE.read_text())
     except PermissionError:
@@ -162,116 +190,10 @@ def _ssh_check(server: dict) -> dict:
 
 def _ssh_metrics(server: dict) -> dict:
     """Fetch resource metrics over SSH — single connection, hardcoded commands only."""
-    script = (
-        "echo LOAD:$(cat /proc/loadavg 2>/dev/null | awk '{print $1\",\"$2\",\"$3}');"
-        "echo MEM:$(free -b 2>/dev/null | awk 'NR==2{print $2\",\"$3\",\"$4}');"
-        "echo SWAP:$(free -b 2>/dev/null | awk 'NR==3{print $2\",\"$3\",\"$4}');"
-        "echo UPTIME:$(awk '{print $1}' /proc/uptime 2>/dev/null);"
-        "echo HOST:$(hostname -s 2>/dev/null);"
-        "echo OS:$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '\"');"
-        "echo PROCS:$(ps aux --no-headers 2>/dev/null | wc -l);"
-        "echo CPU:$(grep -m1 'cpu ' /proc/stat | awk '{u=$2+$4; t=$2+$3+$4+$5; if(t>0) printf \"%.1f\", u*100/t; else print 0}');"
-        # Multiple disk mounts — semicolon-delimited: mountpoint|size|used|avail|pct|fstype
-        "echo DISKS:$(df -P -B1 2>/dev/null | awk 'NR>1 && $6!=\"\" {gsub(/%/,\"\",$5); printf \"%s|%s|%s|%s|%s|%s;\", $6,$2,$3,$4,$5,$1}' | grep -v 'tmpfs\\|devtmpfs\\|squashfs\\|loop\\|udev\\|sysfs\\|proc' | head -c 2000);"
-        # Network IO — semicolon-delimited: iface|bytes_rx|bytes_tx (from /proc/net/dev)
-        "echo NETIO:$(awk 'NR>2 && $1!~/lo:/{gsub(/:/,\"\",$1); printf \"%s|%s|%s;\", $1,$2,$10}' /proc/net/dev 2>/dev/null | head -c 500)"
-    )
-    out, _, rc = _run(_ssh_base(server) + [script], timeout=20)
+    out, _, rc = _run(_ssh_base(server) + [_METRICS_SCRIPT], timeout=20)
     if rc != 0:
         return {}
-
-    result: dict[str, Any] = {}
-    for line in out.splitlines():
-        if ":" not in line:
-            continue
-        key, _, val = line.partition(":")
-        key = key.strip(); val = val.strip()
-
-        if key == "LOAD":
-            parts = val.split(",")
-            result["load_avg"] = {"1m": _safe_float(parts, 0), "5m": _safe_float(parts, 1), "15m": _safe_float(parts, 2)}
-
-        elif key == "MEM":
-            parts = val.split(",")
-            total = _safe_int(parts, 0); used = _safe_int(parts, 1); free = _safe_int(parts, 2)
-            result["memory"] = {
-                "total_gb": round(total / 1e9, 2),
-                "used_gb":  round(used  / 1e9, 2),
-                "free_gb":  round(free  / 1e9, 2),
-                "percent":  round(used / total * 100, 1) if total else 0,
-            }
-
-        elif key == "SWAP":
-            parts = val.split(",")
-            total = _safe_int(parts, 0); used = _safe_int(parts, 1)
-            if total > 0:
-                result["swap"] = {
-                    "total_gb": round(total / 1e9, 2),
-                    "used_gb":  round(used  / 1e9, 2),
-                    "percent":  round(used / total * 100, 1),
-                }
-
-        elif key == "DISKS":
-            disks = []
-            for entry in val.split(";"):
-                entry = entry.strip()
-                if not entry:
-                    continue
-                parts = entry.split("|")
-                if len(parts) < 5:
-                    continue
-                mount = parts[0]; size_b = _safe_int(parts, 1)
-                used_b = _safe_int(parts, 2); avail_b = _safe_int(parts, 3)
-                pct = _safe_float(parts, 4); fstype = parts[5] if len(parts) > 5 else ""
-                disks.append({
-                    "mountpoint": mount,
-                    "total_gb":   round(size_b  / 1e9, 2),
-                    "used_gb":    round(used_b  / 1e9, 2),
-                    "free_gb":    round(avail_b / 1e9, 2),
-                    "percent":    pct,
-                    "fstype":     fstype,
-                })
-            if disks:
-                result["disks"] = disks
-                # Keep legacy single-disk key pointing at root or first disk
-                root = next((d for d in disks if d["mountpoint"] == "/"), disks[0])
-                result["disk"] = {k: root[k] for k in ("total_gb", "used_gb", "free_gb", "percent")}
-
-        elif key == "NETIO":
-            ifaces = []
-            for entry in val.split(";"):
-                entry = entry.strip()
-                if not entry:
-                    continue
-                parts = entry.split("|")
-                if len(parts) < 3:
-                    continue
-                ifaces.append({
-                    "iface":    parts[0],
-                    "bytes_rx": _safe_int(parts, 1),
-                    "bytes_tx": _safe_int(parts, 2),
-                })
-            if ifaces:
-                result["network_io"] = ifaces
-
-        elif key == "UPTIME":
-            secs = _safe_float([val], 0)
-            result["uptime_secs"] = secs
-            result["uptime"] = _fmt_uptime(secs)
-
-        elif key == "HOST":
-            result["hostname_live"] = val
-
-        elif key == "OS":
-            result["os_live"] = val
-
-        elif key == "PROCS":
-            result["process_count"] = _safe_int([val], 0)
-
-        elif key == "CPU":
-            result["cpu_percent"] = _safe_float([val], 0)
-
-    return result
+    return _parse_metrics_output(out)
 
 
 def _ssh_vhosts(server: dict) -> list[dict]:
@@ -376,6 +298,242 @@ def _ssh_ports(server: dict) -> list[dict]:
         if port.isdigit():
             ports.append({"port": port, "address": line})
     return ports
+
+
+# ---------------------------------------------------------------------------
+# Local server helpers (no SSH — reads /proc and conf files directly)
+# ---------------------------------------------------------------------------
+
+_METRICS_SCRIPT = (
+    "echo LOAD:$(cat /proc/loadavg 2>/dev/null | awk '{print $1\",\"$2\",\"$3}');"
+    "echo MEM:$(free -b 2>/dev/null | awk 'NR==2{print $2\",\"$3\",\"$4}');"
+    "echo SWAP:$(free -b 2>/dev/null | awk 'NR==3{print $2\",\"$3\",\"$4}');"
+    "echo UPTIME:$(awk '{print $1}' /proc/uptime 2>/dev/null);"
+    "echo HOST:$(hostname -s 2>/dev/null);"
+    "echo OS:$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '\"');"
+    "echo PROCS:$(ps aux --no-headers 2>/dev/null | wc -l);"
+    "echo CPU:$(grep -m1 'cpu ' /proc/stat | awk '{u=$2+$4; t=$2+$3+$4+$5; if(t>0) printf \"%.1f\", u*100/t; else print 0}');"
+    "echo DISKS:$(df -P -B1 2>/dev/null | awk 'NR>1 && $6!=\"\" {gsub(/%/,\"\",$5); printf \"%s|%s|%s|%s|%s|%s;\", $6,$2,$3,$4,$5,$1}' | grep -v 'tmpfs\\|devtmpfs\\|squashfs\\|loop\\|udev\\|sysfs\\|proc' | head -c 2000);"
+    "echo NETIO:$(awk 'NR>2 && $1!~/lo:/{gsub(/:/,\"\",$1); printf \"%s|%s|%s;\", $1,$2,$10}' /proc/net/dev 2>/dev/null | head -c 500)"
+)
+
+
+def _parse_metrics_output(out: str) -> dict:
+    result: dict[str, Any] = {}
+    for line in out.splitlines():
+        if ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        key = key.strip(); val = val.strip()
+        if key == "LOAD":
+            parts = val.split(",")
+            result["load_avg"] = {"1m": _safe_float(parts, 0), "5m": _safe_float(parts, 1), "15m": _safe_float(parts, 2)}
+        elif key == "MEM":
+            parts = val.split(",")
+            total = _safe_int(parts, 0); used = _safe_int(parts, 1); free = _safe_int(parts, 2)
+            result["memory"] = {
+                "total_gb": round(total / 1e9, 2),
+                "used_gb":  round(used  / 1e9, 2),
+                "free_gb":  round(free  / 1e9, 2),
+                "percent":  round(used / total * 100, 1) if total else 0,
+            }
+        elif key == "SWAP":
+            parts = val.split(",")
+            total = _safe_int(parts, 0); used = _safe_int(parts, 1)
+            if total > 0:
+                result["swap"] = {
+                    "total_gb": round(total / 1e9, 2),
+                    "used_gb":  round(used  / 1e9, 2),
+                    "percent":  round(used / total * 100, 1),
+                }
+        elif key == "DISKS":
+            disks = []
+            for entry in val.split(";"):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                parts = entry.split("|")
+                if len(parts) < 5:
+                    continue
+                mount = parts[0]; size_b = _safe_int(parts, 1)
+                used_b = _safe_int(parts, 2); avail_b = _safe_int(parts, 3)
+                pct = _safe_float(parts, 4); fstype = parts[5] if len(parts) > 5 else ""
+                disks.append({
+                    "mountpoint": mount,
+                    "total_gb":   round(size_b  / 1e9, 2),
+                    "used_gb":    round(used_b  / 1e9, 2),
+                    "free_gb":    round(avail_b / 1e9, 2),
+                    "percent":    pct,
+                    "fstype":     fstype,
+                })
+            if disks:
+                result["disks"] = disks
+                root = next((d for d in disks if d["mountpoint"] == "/"), disks[0])
+                result["disk"] = {k: root[k] for k in ("total_gb", "used_gb", "free_gb", "percent")}
+        elif key == "NETIO":
+            ifaces = []
+            for entry in val.split(";"):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                parts = entry.split("|")
+                if len(parts) < 3:
+                    continue
+                ifaces.append({"iface": parts[0], "bytes_rx": _safe_int(parts, 1), "bytes_tx": _safe_int(parts, 2)})
+            if ifaces:
+                result["network_io"] = ifaces
+        elif key == "UPTIME":
+            secs = _safe_float([val], 0)
+            result["uptime_secs"] = secs
+            result["uptime"] = _fmt_uptime(secs)
+        elif key == "HOST":
+            result["hostname_live"] = val
+        elif key == "OS":
+            result["os_live"] = val
+        elif key == "PROCS":
+            result["process_count"] = _safe_int([val], 0)
+        elif key == "CPU":
+            result["cpu_percent"] = _safe_float([val], 0)
+    return result
+
+
+def _local_metrics() -> dict:
+    out, _, rc = _run(["bash", "-c", _METRICS_SCRIPT], timeout=20)
+    if rc != 0:
+        return {}
+    return _parse_metrics_output(out)
+
+
+def _local_services() -> list[dict]:
+    cmd = (
+        "systemctl list-units --type=service --state=running "
+        "--no-pager --plain 2>/dev/null | head -40 | awk '{print $1}'"
+    )
+    out, _, rc = _run(["bash", "-c", cmd], timeout=12)
+    if rc != 0:
+        return []
+    return [{"name": ln.strip()} for ln in out.splitlines() if ln.strip().endswith(".service")]
+
+
+def _local_ports() -> list[dict]:
+    cmd = "ss -tlnp 2>/dev/null | awk 'NR>1 {print $4}' | head -30"
+    out, _, rc = _run(["bash", "-c", cmd], timeout=10)
+    if rc != 0:
+        return []
+    ports = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        _, _, port = line.rpartition(":")
+        if port.isdigit():
+            ports.append({"port": port, "address": line})
+    return ports
+
+
+def _nginx_server_blocks(text: str) -> list[str]:
+    """Extract each top-level server { } block from an Nginx config via brace counting."""
+    blocks: list[str] = []
+    depth = 0
+    in_server = False
+    current: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not in_server:
+            if re.match(r"^server\s*\{", stripped):
+                in_server = True
+                depth = stripped.count("{") - stripped.count("}")
+                current = [line]
+        else:
+            current.append(line)
+            depth += stripped.count("{") - stripped.count("}")
+            if depth <= 0:
+                blocks.append("\n".join(current))
+                in_server = False
+                current = []
+    return blocks
+
+
+def _local_vhosts() -> list[dict]:
+    """Parse Apache and Nginx virtual host configs from system conf dirs directly."""
+    vhosts: list[dict] = []
+
+    # ── Apache: /etc/apache2/sites-enabled/*.conf ──────────────────────────────
+    apache_dir = Path("/etc/apache2/sites-enabled")
+    if apache_dir.exists():
+        for conf_file in sorted(apache_dir.glob("*.conf")):
+            try:
+                text = conf_file.read_text(errors="replace")
+            except OSError:
+                continue
+            for block_m in re.finditer(
+                r"<VirtualHost\s+([^>]+)>(.*?)</VirtualHost>",
+                text, re.DOTALL | re.IGNORECASE,
+            ):
+                vhost_addr = block_m.group(1).strip()
+                block = block_m.group(2)
+                port_m = re.search(r":(\d+)", vhost_addr.split()[0])
+                port = int(port_m.group(1)) if port_m else 80
+                sn_m = re.search(r"^\s*ServerName\s+(\S+)", block, re.MULTILINE | re.IGNORECASE)
+                domain = sn_m.group(1).strip() if sn_m else None
+                if not domain:
+                    continue
+                ssl = port == 443 or bool(re.search(r"SSLEngine\s+on", block, re.IGNORECASE))
+                dr_m = re.search(r"^\s*DocumentRoot\s+(\S+)", block, re.MULTILINE | re.IGNORECASE)
+                vhosts.append({
+                    "domain": domain, "port": port, "ssl": ssl,
+                    "server": "apache",
+                    "doc_root": dr_m.group(1).strip() if dr_m else None,
+                    "config_file": str(conf_file),
+                })
+
+    # ── Nginx: conf.d/*.conf and sites-enabled/*.conf ──────────────────────────
+    for nginx_dir in (Path("/etc/nginx/conf.d"), Path("/etc/nginx/sites-enabled")):
+        if not nginx_dir.exists():
+            continue
+        for conf_file in sorted(nginx_dir.glob("*.conf")):
+            try:
+                text = conf_file.read_text(errors="replace")
+            except OSError:
+                continue
+            for block in _nginx_server_blocks(text):
+                # server_name — handles both inline and multi-line (Frappe) format
+                sn_m = re.search(r"server_name\s+(.*?)\s*;", block, re.DOTALL | re.IGNORECASE)
+                if not sn_m:
+                    continue
+                names = sn_m.group(1).split()
+                domain = next((n for n in names if n and not n.startswith("$") and n != "_"), None)
+                if not domain:
+                    continue
+                port = 80
+                ssl = False
+                for lm in re.finditer(r"listen\s+([^;]+);", block, re.IGNORECASE):
+                    lv = lm.group(1).strip()
+                    if "ssl" in lv:
+                        ssl = True
+                    # port from IP:PORT / [IPv6]:PORT, or bare PORT
+                    pm = re.search(r":(\d+)(?:\s|$)", lv) or re.search(r"^(\d+)(?:\s|$)", lv)
+                    if pm:
+                        port = int(pm.group(1))
+                if port == 443:
+                    ssl = True
+                dr_m = re.search(r"^\s*root\s+(\S+)\s*;", block, re.MULTILINE | re.IGNORECASE)
+                vhosts.append({
+                    "domain": domain, "port": port, "ssl": ssl,
+                    "server": "nginx",
+                    "doc_root": dr_m.group(1).strip() if dr_m else None,
+                    "config_file": str(conf_file),
+                })
+
+    # Deduplicate by domain+port
+    seen: set[tuple] = set()
+    unique: list[dict] = []
+    for v in vhosts:
+        key_t = (v["domain"], v["port"])
+        if key_t not in seen:
+            seen.add(key_t)
+            unique.append(v)
+    return sorted(unique, key=lambda v: (v["domain"], v["port"]))
 
 
 # ---------------------------------------------------------------------------
@@ -598,6 +756,16 @@ async def server_status(server_id: str, _: str = Depends(require_super_admin)) -
         "checked_at": datetime.now(UTC).isoformat(),
     }
 
+    if stype == "local":
+        result["ping"]    = {"reachable": True, "latency_ms": 0, "packet_loss": "0%"}
+        result["ssh"]     = {"reachable": None}
+        result["is_up"]   = True
+        result["state"]   = "running"
+        result["metrics"] = _local_metrics()
+        result["services"]= _local_services()
+        result["ports"]   = _local_ports()
+        return result
+
     # Ping check
     result["ping"] = _ping_check(server["ip"])
 
@@ -627,10 +795,21 @@ async def server_status(server_id: str, _: str = Depends(require_super_admin)) -
 
 @router.get("/servers/{server_id}/vhosts")
 async def server_vhosts(server_id: str, _: str = Depends(require_super_admin)) -> dict:
-    """Return virtual host configurations scraped from the remote server."""
+    """Return virtual host configurations scraped from the server."""
     server = _find_server(server_id)
-    if server.get("type") != "ssh":
-        return {"vhosts": [], "web_servers": [], "note": "vhost scraping only available for SSH servers",
+    stype = server.get("type")
+
+    if stype == "local":
+        vhosts = _local_vhosts()
+        return {
+            "vhosts": vhosts,
+            "web_servers": list({v["server"] for v in vhosts}),
+            "count": len(vhosts),
+            "checked_at": datetime.now(UTC).isoformat(),
+        }
+
+    if stype != "ssh":
+        return {"vhosts": [], "web_servers": [], "note": "vhost scraping only available for SSH and local servers",
                 "checked_at": datetime.now(UTC).isoformat()}
     ssh = _ssh_check(server)
     if not ssh["reachable"]:
@@ -654,4 +833,6 @@ async def server_action(
     if body.action not in ("start", "stop", "restart"):
         raise HTTPException(status_code=400, detail="action must be 'start', 'stop', or 'restart'")
     server = _find_server(server_id)
+    if server.get("type") == "local":
+        raise HTTPException(status_code=400, detail="Power actions are not available for the local server")
     return _execute_action(server, body.action, user)
