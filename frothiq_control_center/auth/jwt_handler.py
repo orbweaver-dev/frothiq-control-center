@@ -48,9 +48,10 @@ class TokenPayload(BaseModel):
     iat: datetime
     exp: datetime
     jti: str | None = None  # token ID for revocation
+    email: str = ""   # user's email address for audit logs
 
 
-def create_access_token(user_id: str, role: Role, extra: dict[str, Any] | None = None) -> str:
+def create_access_token(user_id: str, role: Role, email: str = "", extra: dict[str, Any] | None = None) -> str:
     settings = get_settings()
     now = datetime.now(UTC)
     expire = now + timedelta(minutes=settings.access_token_expire_minutes)
@@ -60,13 +61,14 @@ def create_access_token(user_id: str, role: Role, extra: dict[str, Any] | None =
         "type": TOKEN_TYPE_ACCESS,
         "iat": now,
         "exp": expire,
+        "email": email,
     }
     if extra:
         payload.update(extra)
     return jwt.encode(payload, settings.secret_key, algorithm=settings.jwt_algorithm)
 
 
-def create_refresh_token(user_id: str, role: Role) -> str:
+def create_refresh_token(user_id: str, role: Role, email: str = "") -> str:
     settings = get_settings()
     now = datetime.now(UTC)
     expire = now + timedelta(days=settings.refresh_token_expire_days)
@@ -76,6 +78,7 @@ def create_refresh_token(user_id: str, role: Role) -> str:
         "type": TOKEN_TYPE_REFRESH,
         "iat": now,
         "exp": expire,
+        "email": email,
     }
     return jwt.encode(payload, settings.secret_key, algorithm=settings.jwt_algorithm)
 

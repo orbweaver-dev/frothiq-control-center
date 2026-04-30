@@ -34,6 +34,12 @@ from frothiq_control_center.models.schemas import (
     UserResponse,
     UserUpdate,
 )
+from pydantic import BaseModel, Field as PydanticField
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = PydanticField(..., min_length=1)
+    new_password: str = PydanticField(..., min_length=8)
 from frothiq_control_center.models.user import CCUser
 from frothiq_control_center.services.audit_service import log_action
 
@@ -158,8 +164,8 @@ async def login(
                 redis=redis,
             )
             return TokenResponse(
-                access_token=create_access_token(user.id, user.role),
-                refresh_token=create_refresh_token(user.id, user.role),
+                access_token=create_access_token(user.id, user.role, email=user.email),
+                refresh_token=create_refresh_token(user.id, user.role, email=user.email),
                 role=user.role,
                 user_id=user.id,
                 full_name=user.full_name,
@@ -187,8 +193,8 @@ async def login(
             mfa_challenge_token=challenge_token,
         )
 
-    access_token = create_access_token(user.id, user.role)
-    refresh_token = create_refresh_token(user.id, user.role)
+    access_token = create_access_token(user.id, user.role, email=user.email)
+    refresh_token = create_refresh_token(user.id, user.role, email=user.email)
 
     await log_action(
         action="auth.login.success",
@@ -236,8 +242,8 @@ async def refresh_token(payload: RefreshRequest, request: Request):
         )
 
     return TokenResponse(
-        access_token=create_access_token(user.id, user.role),
-        refresh_token=create_refresh_token(user.id, user.role),
+        access_token=create_access_token(user.id, user.role, email=user.email),
+        refresh_token=create_refresh_token(user.id, user.role, email=user.email),
         role=user.role,
         user_id=user.id,
         full_name=user.full_name,
@@ -355,6 +361,42 @@ async def update_user(
     )
 
     return UserResponse.model_validate(user)
+
+
+@router.post("/me/change-password", status_code=status.HTTP_204_NO_CONTENT)
+async def change_own_password(
+    payload: ChangePasswordRequest,
+    request: Request,
+    current_user: TokenPayload = Depends(get_current_user),
+):
+    """Change the authenticated user's own password. Requires current password."""
+    db: AsyncSession = _get_db(request)
+    redis = _get_redis(request)
+
+    result = await db.execute(select(CCUser).where(CCUser.id == current_user.sub))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    if not verify_password(payload.current_password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password is incorrect",
+        )
+
+    user.hashed_password = hash_password(payload.new_password)
+    await db.commit()
+
+    await log_action(
+        action="user.change_password",
+        user_id=current_user.sub,
+        user_email=current_user.sub,
+        resource=current_user.sub,
+        detail="Password changed by user",
+        ip_address=request.client.host if request.client else None,
+        db=db,
+        redis=redis,
+    )
 
 
 @router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)

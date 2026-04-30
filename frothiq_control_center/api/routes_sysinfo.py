@@ -898,6 +898,87 @@ _UPGRADE_JOB: dict = {
 _UPGRADE_LOCK = threading.Lock()
 
 
+# ---------------------------------------------------------------------------
+# Critical services — watchdog + post-upgrade recovery
+# ---------------------------------------------------------------------------
+
+# Services that must always be running; the watchdog will restart them if stopped.
+CRITICAL_SERVICES = [
+    "ssh",
+    "apache2",
+    "frothiq-nft",
+    "frothiq-lfd",
+    "frothiq-core",
+    "frothiq-control-center",
+    "frothiq-ui",
+    "frothiq-gateway",
+]
+
+_WATCHDOG_LOG: list[dict] = []
+_WATCHDOG_LOCK = threading.Lock()
+
+
+def _service_is_active(name: str) -> bool:
+    r = subprocess.run(
+        ["sudo", "systemctl", "is-active", name],
+        capture_output=True, text=True, timeout=5,
+    )
+    return r.stdout.strip() == "active"
+
+
+def _restart_service(name: str) -> tuple[bool, str]:
+    r = subprocess.run(
+        ["sudo", "systemctl", "start", name],
+        capture_output=True, text=True, timeout=30,
+    )
+    ok = r.returncode == 0
+    msg = (r.stdout + r.stderr).strip()
+    return ok, msg
+
+
+def _watchdog_tick() -> None:
+    recovered = []
+    failed = []
+    for svc in CRITICAL_SERVICES:
+        try:
+            if not _service_is_active(svc):
+                ok, msg = _restart_service(svc)
+                entry = {
+                    "service": svc,
+                    "action": "start",
+                    "success": ok,
+                    "message": msg,
+                    "ts": datetime.now(UTC).isoformat(),
+                }
+                if ok:
+                    recovered.append(entry)
+                else:
+                    entry["message"] = msg or "start command failed"
+                    failed.append(entry)
+        except Exception as exc:
+            failed.append({"service": svc, "action": "start", "success": False,
+                           "message": str(exc), "ts": datetime.now(UTC).isoformat()})
+
+    if recovered or failed:
+        with _WATCHDOG_LOCK:
+            _WATCHDOG_LOG.extend(recovered + failed)
+            if len(_WATCHDOG_LOG) > 200:
+                del _WATCHDOG_LOG[:-200]
+
+
+def _watchdog_loop() -> None:
+    while True:
+        time.sleep(60)
+        try:
+            _watchdog_tick()
+        except Exception:
+            pass
+
+
+# Start the watchdog background thread once at import time.
+threading.Thread(target=_watchdog_loop, daemon=True, name="service-watchdog").start()
+
+
 def _run_upgrade() -> None:
     """Run apt-get update + apt-get upgrade in a background thread."""
     _UPGRADE_JOB["lines"] = []
@@ -920,7 +1001,36 @@ def _run_upgrade() -> None:
     }
 
     try:
-        # Step 1: refresh package lists
+        # Step 1: finish any previously interrupted dpkg operations.
+        _emit("[apt] Checking for interrupted package operations…")
+        proc0 = subprocess.run(
+            ["sudo", "dpkg", "--configure", "-a"],
+            capture_output=True, text=True, env=apt_env, timeout=120,
+        )
+        for line in (proc0.stdout + proc0.stderr).splitlines():
+            line = line.strip()
+            if line and not line.startswith("\x1b[") and not line.startswith("[?"):
+                _emit(line)
+
+        # Step 2: fix any broken dependency state before upgrading.
+        _emit("[apt] Fixing broken dependencies…")
+        proc_fix = subprocess.run(
+            ["sudo", "apt-get", "install", "-f", "-y", "-q",
+             "-o", "Dpkg::Options::=--force-confdef",
+             "-o", "Dpkg::Options::=--force-confold"],
+            capture_output=True, text=True, env=apt_env, timeout=180,
+        )
+        for line in (proc_fix.stdout + proc_fix.stderr).splitlines():
+            line = line.strip()
+            if line and not line.startswith("\x1b[") and not line.startswith("[?"):
+                _emit(line)
+        if proc_fix.returncode != 0:
+            _UPGRADE_JOB["status"] = "error"
+            _UPGRADE_JOB["error"] = "apt-get -f install failed (rc={})".format(proc_fix.returncode)
+            _UPGRADE_JOB["finished_at"] = datetime.now(UTC).isoformat()
+            return
+
+        # Step 3: refresh package lists.
         _emit("[apt] Refreshing package lists…")
         proc = subprocess.run(
             ["sudo", "apt-get", "update", "-q"],
@@ -938,7 +1048,7 @@ def _run_upgrade() -> None:
             _UPGRADE_JOB["finished_at"] = datetime.now(UTC).isoformat()
             return
 
-        # Step 2: upgrade all packages.
+        # Step 4: upgrade all packages.
         # -o Dpkg::Options force-confdef/confold: handle config file conflicts without prompting.
         _emit("[apt] Starting package upgrade…")
         proc2 = subprocess.run(
@@ -975,6 +1085,20 @@ def _run_upgrade() -> None:
         _UPGRADE_JOB["error"] = str(exc)[:300]
         _emit(f"[apt] Exception: {exc}")
 
+    finally:
+        # Always run watchdog after an upgrade — packages being stopped mid-install
+        # is the most common cause of critical services going down.
+        _emit("[apt] Checking critical services after upgrade…")
+        try:
+            _watchdog_tick()
+            with _WATCHDOG_LOCK:
+                recent = [e for e in _WATCHDOG_LOG if e.get("action") == "start"][-10:]
+            for entry in recent:
+                status = "restarted" if entry["success"] else "FAILED to restart"
+                _emit(f"[watchdog] {entry['service']}: {status}")
+        except Exception as exc:
+            _emit(f"[watchdog] Error during post-upgrade check: {exc}")
+
     _UPGRADE_JOB["finished_at"] = datetime.now(UTC).isoformat()
 
 
@@ -1008,6 +1132,41 @@ async def get_upgrade_status(_: str = Depends(require_super_admin)) -> dict:
         "started_at": _UPGRADE_JOB["started_at"],
         "finished_at": _UPGRADE_JOB["finished_at"],
         "error": _UPGRADE_JOB["error"],
+    }
+
+
+@router.get("/watchdog")
+async def get_watchdog_status(_: str = Depends(require_super_admin)) -> dict:
+    """Return current health of all critical services + recent recovery events."""
+    statuses = {}
+    for svc in CRITICAL_SERVICES:
+        try:
+            statuses[svc] = _service_is_active(svc)
+        except Exception:
+            statuses[svc] = False
+    with _WATCHDOG_LOCK:
+        log = list(_WATCHDOG_LOG[-50:])
+    return {
+        "services": statuses,
+        "all_healthy": all(statuses.values()),
+        "recovery_log": log,
+        "checked_at": datetime.now(UTC).isoformat(),
+    }
+
+
+@router.post("/watchdog/run")
+async def run_watchdog_now(_: str = Depends(require_super_admin)) -> dict:
+    """Trigger an immediate watchdog check and return results."""
+    before = {svc: _service_is_active(svc) for svc in CRITICAL_SERVICES}
+    _watchdog_tick()
+    after = {svc: _service_is_active(svc) for svc in CRITICAL_SERVICES}
+    with _WATCHDOG_LOCK:
+        log = list(_WATCHDOG_LOG[-20:])
+    return {
+        "before": before,
+        "after": after,
+        "recovery_log": log,
+        "checked_at": datetime.now(UTC).isoformat(),
     }
 
 
@@ -2073,3 +2232,767 @@ async def system_shutdown(body: SystemPowerRequest, user: str = Depends(require_
     if rc != 0:
         raise HTTPException(status_code=500, detail=err.strip() or "shutdown failed")
     return {"ok": True, "action": "shutdown", "executed_at": datetime.now(UTC).isoformat()}
+
+
+# ---------------------------------------------------------------------------
+# SSE — live upgrade log streaming
+# ---------------------------------------------------------------------------
+
+import asyncio as _asyncio
+from fastapi.responses import StreamingResponse as _StreamingResponse
+
+
+@router.get("/os/upgrade/stream")
+async def stream_upgrade_log(_: str = Depends(require_super_admin)):
+    """Server-Sent Events stream of the running upgrade log.
+
+    The client receives one event per new log line. The stream closes when the
+    upgrade finishes (status != 'running') or after 10 minutes of silence.
+    """
+    async def _generator():
+        sent = 0
+        idle = 0
+        yield "retry: 2000\n\n"
+        while True:
+            lines = _UPGRADE_JOB.get("lines", [])
+            new = lines[sent:]
+            if new:
+                idle = 0
+                for line in new:
+                    data = line.replace("\n", " ").strip()
+                    if data:
+                        yield f"data: {data}\n\n"
+                sent += len(new)
+            status = _UPGRADE_JOB.get("status", "idle")
+            if status != "running" and sent >= len(_UPGRADE_JOB.get("lines", [])):
+                yield f"event: done\ndata: {status}\n\n"
+                break
+            await _asyncio.sleep(0.5)
+            idle += 1
+            if idle > 1200:  # 10 minutes
+                yield "event: timeout\ndata: stream timeout\n\n"
+                break
+
+    return _StreamingResponse(
+        _generator(),
+        media_type="text/event-stream",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# SMART disk health
+# ---------------------------------------------------------------------------
+
+@router.get("/disk/smart")
+async def get_smart_health(_: str = Depends(require_super_admin)) -> dict:
+    """Return SMART health data for all physical block devices using smartctl."""
+    import json as _json
+
+    # Enumerate physical block devices (exclude loop, sr, dm)
+    devices: list[str] = []
+    try:
+        lsblk_out, _, _ = _run(["lsblk", "-d", "-n", "-o", "NAME,TYPE"], timeout=5)
+        for line in lsblk_out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == "disk":
+                devices.append(f"/dev/{parts[0]}")
+    except Exception:
+        pass
+
+    results: list[dict] = []
+    for dev in devices:
+        out, err, rc = _run(["sudo", "smartctl", "-a", "-j", dev], timeout=15)
+        try:
+            data = _json.loads(out)
+        except Exception:
+            results.append({"device": dev, "error": err.strip() or "smartctl parse error"})
+            continue
+
+        smart_status = data.get("smart_status", {})
+        ata_attrs = data.get("ata_smart_attributes", {}).get("table", [])
+        nvme = data.get("nvme_smart_health_information_log", {})
+        model_info = data.get("model_name") or data.get("model_family") or ""
+        temp = (
+            data.get("temperature", {}).get("current")
+            or nvme.get("temperature", {}).get("current")
+        )
+        results.append({
+            "device": dev,
+            "model": model_info,
+            "serial": data.get("serial_number", ""),
+            "firmware": data.get("firmware_version", ""),
+            "capacity_bytes": data.get("user_capacity", {}).get("bytes"),
+            "rotation_rate": data.get("rotation_rate"),
+            "passed": smart_status.get("passed"),
+            "temperature_c": temp,
+            "power_on_hours": next(
+                (a["raw"]["value"] for a in ata_attrs if a.get("id") == 9),
+                nvme.get("power_on_hours"),
+            ),
+            "reallocated_sectors": next(
+                (a["raw"]["value"] for a in ata_attrs if a.get("id") == 5), None
+            ),
+            "pending_sectors": next(
+                (a["raw"]["value"] for a in ata_attrs if a.get("id") == 197), None
+            ),
+            "uncorrectable_errors": next(
+                (a["raw"]["value"] for a in ata_attrs if a.get("id") == 198),
+                nvme.get("media_errors"),
+            ),
+            "attributes": [
+                {
+                    "id": a.get("id"),
+                    "name": a.get("name"),
+                    "value": a.get("value"),
+                    "worst": a.get("worst"),
+                    "thresh": a.get("thresh"),
+                    "raw": a.get("raw", {}).get("value"),
+                    "failed": a.get("when_failed") not in (None, "", "never", "-"),
+                }
+                for a in ata_attrs
+            ],
+        })
+
+    return {"devices": results, "count": len(results), "checked_at": datetime.now(UTC).isoformat()}
+
+
+# ---------------------------------------------------------------------------
+# Package hold / pin management
+# ---------------------------------------------------------------------------
+
+@router.get("/packages/holds")
+async def list_package_holds(_: str = Depends(require_super_admin)) -> dict:
+    """Return all packages currently held (apt-mark showhold)."""
+    out, _, _ = _run(["sudo", "apt-mark", "showhold"], timeout=10)
+    held = [p.strip() for p in out.splitlines() if p.strip()]
+    return {"held": held, "count": len(held), "checked_at": datetime.now(UTC).isoformat()}
+
+
+class PackageHoldRequest(BaseModel):
+    package: str
+    action: str  # "hold" | "unhold"
+
+
+@router.post("/packages/hold")
+async def set_package_hold(body: PackageHoldRequest, user: str = Depends(require_super_admin)) -> dict:
+    if body.action not in ("hold", "unhold"):
+        raise HTTPException(400, "action must be 'hold' or 'unhold'")
+    if not re.match(r"^[a-zA-Z0-9_.+-]+$", body.package):
+        raise HTTPException(400, "Invalid package name")
+    out, err, rc = _run(["sudo", "apt-mark", body.action, body.package], timeout=10)
+    result = "ok" if rc == 0 else "error"
+    _audit(user, f"package_{body.action}", body.package, result)
+    if rc != 0:
+        raise HTTPException(500, err.strip() or f"apt-mark {body.action} failed")
+    return {"ok": True, "package": body.package, "action": body.action, "executed_at": datetime.now(UTC).isoformat()}
+
+
+# ---------------------------------------------------------------------------
+# Audit log viewer
+# ---------------------------------------------------------------------------
+
+@router.get("/audit-log")
+async def get_audit_log(
+    _: str = Depends(require_super_admin),
+    lines: int = Query(200, ge=1, le=1000),
+    search: str = Query("", max_length=100),
+) -> dict:
+    """Read the last N lines of the MC3 audit log."""
+    log_path = Path("/var/log/mc3-audit.log")
+    entries: list[dict] = []
+    try:
+        out, _, _ = _run(["sudo", "tail", f"-{lines * 3}", str(log_path)], timeout=5)
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if search and search.lower() not in line.lower():
+                continue
+            # Parse: "2025-01-01 12:00:00,000  user=X action=Y detail='Z' result=W"
+            entry: dict[str, str] = {"raw": line}
+            ts_match = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+            if ts_match:
+                entry["timestamp"] = ts_match.group(1)
+            for field in ("user", "action", "detail", "result"):
+                m = re.search(rf"{field}=(\S+)", line)
+                if m:
+                    entry[field] = m.group(1).strip("'\"")
+            entries.append(entry)
+    except Exception as exc:
+        return {"entries": [], "total": 0, "error": str(exc)}
+
+    entries = entries[-lines:]
+    return {"entries": list(reversed(entries)), "total": len(entries), "checked_at": datetime.now(UTC).isoformat()}
+
+
+# ---------------------------------------------------------------------------
+# Historical metrics (SQLite time-series, 30-day)
+# ---------------------------------------------------------------------------
+
+import sqlite3 as _sqlite3
+import logging as _metrics_logging
+
+_METRICS_DB = Path("/var/lib/mc3/metrics.db")
+_METRICS_DB.parent.mkdir(parents=True, exist_ok=True)
+_metrics_log = _metrics_logging.getLogger("mc3.metrics")
+
+
+def _metrics_db() -> _sqlite3.Connection:
+    conn = _sqlite3.connect(str(_METRICS_DB), check_same_thread=False)
+    conn.row_factory = _sqlite3.Row
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS metrics (
+            ts INTEGER PRIMARY KEY,
+            cpu_pct REAL,
+            mem_pct REAL,
+            swap_pct REAL,
+            disk_root_pct REAL,
+            net_sent_mb REAL,
+            net_recv_mb REAL,
+            load_1m REAL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ts ON metrics(ts)")
+    conn.commit()
+    return conn
+
+
+def _metrics_sample() -> None:
+    try:
+        cpu = psutil.cpu_percent(interval=1)
+        mem = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+        net = psutil.net_io_counters()
+        try:
+            disk_root = psutil.disk_usage("/").percent
+        except Exception:
+            disk_root = 0.0
+        load1 = psutil.getloadavg()[0]
+        ts = int(time.time())
+        conn = _metrics_db()
+        conn.execute(
+            "INSERT OR REPLACE INTO metrics VALUES (?,?,?,?,?,?,?,?)",
+            (ts, cpu, mem.percent, swap.percent, disk_root,
+             round(net.bytes_sent / 1e6, 4), round(net.bytes_recv / 1e6, 4), round(load1, 2))
+        )
+        # Prune records older than 30 days
+        conn.execute("DELETE FROM metrics WHERE ts < ?", (ts - 30 * 86400,))
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        _metrics_log.warning("metrics sample error: %s", exc)
+
+
+def _metrics_loop() -> None:
+    while True:
+        try:
+            _metrics_sample()
+        except Exception:
+            pass
+        time.sleep(60)
+
+
+threading.Thread(target=_metrics_loop, daemon=True, name="metrics-sampler").start()
+
+
+@router.get("/metrics/history")
+async def get_metrics_history(
+    _: str = Depends(require_super_admin),
+    hours: int = Query(24, ge=1, le=720),
+    resolution: int = Query(60, ge=5, le=3600, description="Bucket size in seconds"),
+) -> dict:
+    """Return time-bucketed CPU/mem/disk/net metrics for the last N hours."""
+    since = int(time.time()) - hours * 3600
+    try:
+        conn = _metrics_db()
+        rows = conn.execute(
+            "SELECT ts, cpu_pct, mem_pct, swap_pct, disk_root_pct, net_sent_mb, net_recv_mb, load_1m "
+            "FROM metrics WHERE ts >= ? ORDER BY ts",
+            (since,),
+        ).fetchall()
+        conn.close()
+    except Exception as exc:
+        return {"error": str(exc), "rows": []}
+
+    # Bucket by resolution
+    buckets: dict[int, list] = {}
+    for row in rows:
+        bucket = (row["ts"] // resolution) * resolution
+        buckets.setdefault(bucket, []).append(dict(row))
+
+    averaged = []
+    for bucket_ts in sorted(buckets):
+        group = buckets[bucket_ts]
+        n = len(group)
+        averaged.append({
+            "ts": bucket_ts,
+            "cpu_pct": round(sum(r["cpu_pct"] for r in group) / n, 1),
+            "mem_pct": round(sum(r["mem_pct"] for r in group) / n, 1),
+            "swap_pct": round(sum(r["swap_pct"] for r in group) / n, 1),
+            "disk_root_pct": round(sum(r["disk_root_pct"] for r in group) / n, 1),
+            "net_sent_mb": round(sum(r["net_sent_mb"] for r in group) / n, 4),
+            "net_recv_mb": round(sum(r["net_recv_mb"] for r in group) / n, 4),
+            "load_1m": round(sum(r["load_1m"] for r in group) / n, 2),
+        })
+
+    return {
+        "rows": averaged,
+        "count": len(averaged),
+        "hours": hours,
+        "resolution": resolution,
+        "since": since,
+        "checked_at": datetime.now(UTC).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Resource alert thresholds
+# ---------------------------------------------------------------------------
+
+_ALERT_CONFIG_PATH = Path("/var/lib/mc3/alert_thresholds.json")
+_ALERT_DEFAULTS: dict = {
+    "cpu_pct": 90.0,
+    "mem_pct": 90.0,
+    "disk_root_pct": 85.0,
+    "load_1m": 8.0,
+    "enabled": True,
+}
+
+
+def _load_alert_config() -> dict:
+    try:
+        import json as _j
+        return {**_ALERT_DEFAULTS, **_j.loads(_ALERT_CONFIG_PATH.read_text())}
+    except Exception:
+        return dict(_ALERT_DEFAULTS)
+
+
+def _save_alert_config(cfg: dict) -> None:
+    import json as _j
+    _ALERT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _ALERT_CONFIG_PATH.write_text(_j.dumps(cfg, indent=2))
+
+
+@router.get("/alerts/thresholds")
+async def get_alert_thresholds(_: str = Depends(require_super_admin)) -> dict:
+    cfg = _load_alert_config()
+    # Evaluate current state against thresholds
+    cpu = psutil.cpu_percent(interval=0.2)
+    mem = psutil.virtual_memory().percent
+    load1 = psutil.getloadavg()[0]
+    try:
+        disk = psutil.disk_usage("/").percent
+    except Exception:
+        disk = 0.0
+    alerts = []
+    if cfg["enabled"]:
+        if cpu >= cfg["cpu_pct"]:
+            alerts.append({"metric": "cpu_pct", "value": cpu, "threshold": cfg["cpu_pct"]})
+        if mem >= cfg["mem_pct"]:
+            alerts.append({"metric": "mem_pct", "value": mem, "threshold": cfg["mem_pct"]})
+        if disk >= cfg["disk_root_pct"]:
+            alerts.append({"metric": "disk_root_pct", "value": disk, "threshold": cfg["disk_root_pct"]})
+        if load1 >= cfg["load_1m"]:
+            alerts.append({"metric": "load_1m", "value": round(load1, 2), "threshold": cfg["load_1m"]})
+    return {
+        "thresholds": cfg,
+        "current": {"cpu_pct": cpu, "mem_pct": mem, "disk_root_pct": disk, "load_1m": round(load1, 2)},
+        "active_alerts": alerts,
+        "checked_at": datetime.now(UTC).isoformat(),
+    }
+
+
+class AlertThresholdsRequest(BaseModel):
+    cpu_pct: float | None = None
+    mem_pct: float | None = None
+    disk_root_pct: float | None = None
+    load_1m: float | None = None
+    enabled: bool | None = None
+
+
+@router.post("/alerts/thresholds")
+async def update_alert_thresholds(body: AlertThresholdsRequest, user: str = Depends(require_super_admin)) -> dict:
+    cfg = _load_alert_config()
+    if body.cpu_pct is not None:
+        cfg["cpu_pct"] = max(10.0, min(100.0, body.cpu_pct))
+    if body.mem_pct is not None:
+        cfg["mem_pct"] = max(10.0, min(100.0, body.mem_pct))
+    if body.disk_root_pct is not None:
+        cfg["disk_root_pct"] = max(10.0, min(100.0, body.disk_root_pct))
+    if body.load_1m is not None:
+        cfg["load_1m"] = max(0.1, min(128.0, body.load_1m))
+    if body.enabled is not None:
+        cfg["enabled"] = body.enabled
+    _save_alert_config(cfg)
+    _audit(user, "alert_thresholds_update", str(cfg), "ok")
+    return {"ok": True, "thresholds": cfg}
+
+
+# ---------------------------------------------------------------------------
+# Log rotation management
+# ---------------------------------------------------------------------------
+
+@router.get("/log-rotation/configs")
+async def list_logrotate_configs(_: str = Depends(require_super_admin)) -> dict:
+    """List logrotate config files and their current state."""
+    configs: list[dict] = []
+    for conf_dir in ["/etc/logrotate.d", "/etc/logrotate.conf"]:
+        p = Path(conf_dir)
+        if p.is_file():
+            configs.append({"path": str(p), "name": p.name, "is_dir": False})
+        elif p.is_dir():
+            for f in sorted(p.iterdir()):
+                if f.is_file():
+                    try:
+                        content = f.read_text(errors="replace")
+                        configs.append({"path": str(f), "name": f.name, "is_dir": False, "size": f.stat().st_size, "preview": content[:300]})
+                    except Exception:
+                        configs.append({"path": str(f), "name": f.name, "error": "unreadable"})
+
+    # Get logrotate status (last run times)
+    status_path = Path("/var/lib/logrotate/status")
+    last_runs: dict[str, str] = {}
+    try:
+        for line in status_path.read_text(errors="replace").splitlines():
+            m = re.match(r'^"(.+)" (.+)$', line.strip())
+            if m:
+                last_runs[m.group(1)] = m.group(2)
+    except Exception:
+        pass
+
+    return {"configs": configs, "last_runs": last_runs, "checked_at": datetime.now(UTC).isoformat()}
+
+
+@router.post("/log-rotation/run")
+async def run_logrotate(user: str = Depends(require_super_admin)) -> dict:
+    """Force-run logrotate on all configs."""
+    out, err, rc = _run(["sudo", "logrotate", "--force", "/etc/logrotate.conf"], timeout=60)
+    result = "ok" if rc == 0 else "error"
+    _audit(user, "logrotate_run", "--force", result)
+    return {
+        "ok": rc == 0,
+        "stdout": out[:1000],
+        "stderr": err[:500],
+        "returncode": rc,
+        "executed_at": datetime.now(UTC).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Filesystem backup jobs
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+_BACKUP_JOBS_PATH = Path("/var/lib/mc3/backup_jobs.json")
+_BACKUP_RUNNING: dict[str, dict] = {}
+_BACKUP_LOCK = threading.Lock()
+
+
+def _load_backup_jobs() -> list[dict]:
+    try:
+        return _json.loads(_BACKUP_JOBS_PATH.read_text())
+    except Exception:
+        return []
+
+
+def _save_backup_jobs(jobs: list[dict]) -> None:
+    _BACKUP_JOBS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _BACKUP_JOBS_PATH.write_text(_json.dumps(jobs, indent=2))
+
+
+@router.get("/backup/jobs")
+async def list_backup_jobs(_: str = Depends(require_super_admin)) -> dict:
+    jobs = _load_backup_jobs()
+    with _BACKUP_LOCK:
+        for job in jobs:
+            if job["id"] in _BACKUP_RUNNING:
+                job["status"] = _BACKUP_RUNNING[job["id"]]["status"]
+                job["last_log"] = _BACKUP_RUNNING[job["id"]].get("log", [])[-20:]
+    return {"jobs": jobs, "count": len(jobs), "checked_at": datetime.now(UTC).isoformat()}
+
+
+class BackupJobRequest(BaseModel):
+    name: str
+    source: str        # absolute path to backup
+    destination: str   # absolute path for backup output
+    method: str = "rsync"   # "rsync" | "tar"
+    exclude: list[str] = []
+
+
+@router.post("/backup/jobs")
+async def create_backup_job(body: BackupJobRequest, user: str = Depends(require_super_admin)) -> dict:
+    if not body.source.startswith("/") or not body.destination.startswith("/"):
+        raise HTTPException(400, "Source and destination must be absolute paths")
+    if body.method not in ("rsync", "tar"):
+        raise HTTPException(400, "method must be 'rsync' or 'tar'")
+    jobs = _load_backup_jobs()
+    job_id = str(uuid.uuid4())[:8]
+    job = {
+        "id": job_id,
+        "name": body.name[:80],
+        "source": body.source,
+        "destination": body.destination,
+        "method": body.method,
+        "exclude": body.exclude[:20],
+        "created_at": datetime.now(UTC).isoformat(),
+        "last_run": None,
+        "last_result": None,
+    }
+    jobs.append(job)
+    _save_backup_jobs(jobs)
+    _audit(user, "backup_job_create", f"{body.source}→{body.destination}", "ok")
+    return {"ok": True, "job": job}
+
+
+@router.delete("/backup/jobs/{job_id}")
+async def delete_backup_job(job_id: str, user: str = Depends(require_super_admin)) -> dict:
+    jobs = _load_backup_jobs()
+    original = len(jobs)
+    jobs = [j for j in jobs if j["id"] != job_id]
+    if len(jobs) == original:
+        raise HTTPException(404, "Job not found")
+    _save_backup_jobs(jobs)
+    _audit(user, "backup_job_delete", job_id, "ok")
+    return {"ok": True}
+
+
+def _run_backup_job(job: dict) -> None:
+    job_id = job["id"]
+    with _BACKUP_LOCK:
+        _BACKUP_RUNNING[job_id] = {"status": "running", "log": []}
+
+    def _log(msg: str) -> None:
+        with _BACKUP_LOCK:
+            _BACKUP_RUNNING[job_id]["log"].append(msg)
+
+    try:
+        src, dst, method = job["source"], job["destination"], job["method"]
+        Path(dst).mkdir(parents=True, exist_ok=True)
+
+        if method == "rsync":
+            cmd = ["sudo", "rsync", "-av", "--delete"]
+            for ex in job.get("exclude", []):
+                cmd += ["--exclude", ex]
+            cmd += [src.rstrip("/") + "/", dst.rstrip("/") + "/"]
+        else:  # tar
+            ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+            archive = str(Path(dst) / f"backup_{ts}.tar.gz")
+            cmd = ["sudo", "tar", "-czf", archive]
+            for ex in job.get("exclude", []):
+                cmd += ["--exclude", ex]
+            cmd.append(src)
+
+        _log(f"Starting {method} backup: {src} → {dst}")
+        out, err, rc = _run(cmd, timeout=3600)
+        for line in (out + err).splitlines():
+            _log(line.strip())
+        result = "ok" if rc == 0 else f"error (rc={rc})"
+        _log(f"Backup {result}")
+
+        jobs = _load_backup_jobs()
+        for j in jobs:
+            if j["id"] == job_id:
+                j["last_run"] = datetime.now(UTC).isoformat()
+                j["last_result"] = result
+        _save_backup_jobs(jobs)
+
+        with _BACKUP_LOCK:
+            _BACKUP_RUNNING[job_id]["status"] = result
+    except Exception as exc:
+        with _BACKUP_LOCK:
+            _BACKUP_RUNNING[job_id]["status"] = f"error: {exc}"
+        _log(f"Exception: {exc}")
+
+
+@router.post("/backup/jobs/{job_id}/run")
+async def run_backup_job(job_id: str, user: str = Depends(require_super_admin)) -> dict:
+    jobs = _load_backup_jobs()
+    job = next((j for j in jobs if j["id"] == job_id), None)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    with _BACKUP_LOCK:
+        if _BACKUP_RUNNING.get(job_id, {}).get("status") == "running":
+            return {"ok": False, "message": "Job already running"}
+    _audit(user, "backup_job_run", job_id, "started")
+    thread = threading.Thread(target=_run_backup_job, args=(job,), daemon=True)
+    thread.start()
+    return {"ok": True, "job_id": job_id}
+
+
+@router.get("/backup/jobs/{job_id}/log")
+async def get_backup_job_log(job_id: str, _: str = Depends(require_super_admin)) -> dict:
+    with _BACKUP_LOCK:
+        info = _BACKUP_RUNNING.get(job_id, {})
+    return {
+        "job_id": job_id,
+        "status": info.get("status", "idle"),
+        "log": info.get("log", []),
+        "checked_at": datetime.now(UTC).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# SSH key management
+# ---------------------------------------------------------------------------
+
+_ALLOWED_KEY_TYPES = {"ssh-rsa", "ssh-dss", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384",
+                      "ecdsa-sha2-nistp521", "ssh-ed25519", "sk-ecdsa-sha2-nistp256@openssh.com",
+                      "sk-ssh-ed25519@openssh.com"}
+
+
+def _auth_keys_path(username: str) -> Path:
+    try:
+        pw = pwd.getpwnam(username)
+        return Path(pw.pw_dir) / ".ssh" / "authorized_keys"
+    except KeyError:
+        raise HTTPException(404, f"User not found: {username}")
+
+
+def _read_auth_keys(username: str) -> list[dict]:
+    path = _auth_keys_path(username)
+    out, _, _ = _run(["sudo", "cat", str(path)], timeout=5)
+    keys = []
+    for i, line in enumerate(out.splitlines()):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 2:
+            continue
+        keys.append({
+            "index": i,
+            "type": parts[0],
+            "key": parts[1][:40] + "…" if len(parts[1]) > 40 else parts[1],
+            "comment": parts[2] if len(parts) > 2 else "",
+            "full": line,
+        })
+    return keys
+
+
+@router.get("/ssh/keys/{username}")
+async def get_ssh_keys(username: str, _: str = Depends(require_super_admin)) -> dict:
+    if not re.match(r"^[a-zA-Z0-9_.-]+$", username):
+        raise HTTPException(400, "Invalid username")
+    keys = _read_auth_keys(username)
+    return {"username": username, "keys": keys, "count": len(keys)}
+
+
+class SSHKeyRequest(BaseModel):
+    public_key: str
+
+
+@router.post("/ssh/keys/{username}")
+async def add_ssh_key(username: str, body: SSHKeyRequest, user: str = Depends(require_super_admin)) -> dict:
+    if not re.match(r"^[a-zA-Z0-9_.-]+$", username):
+        raise HTTPException(400, "Invalid username")
+    key = body.public_key.strip()
+    key_type = key.split()[0] if key.split() else ""
+    if key_type not in _ALLOWED_KEY_TYPES:
+        raise HTTPException(400, f"Unsupported key type: {key_type!r}")
+
+    path = _auth_keys_path(username)
+    # Ensure .ssh dir exists
+    _run(["sudo", "mkdir", "-p", str(path.parent)], timeout=5)
+    _run(["sudo", "chmod", "700", str(path.parent)], timeout=5)
+    # Append key
+    append_cmd = f"echo {_shlex_quote(key)} | sudo tee -a {_shlex_quote(str(path))}"
+    out, err, rc = _run(["sudo", "bash", "-c", f"echo {_shlex_quote(key)} >> {_shlex_quote(str(path))}"], timeout=5)
+    if rc != 0:
+        raise HTTPException(500, err.strip() or "Failed to append key")
+    _run(["sudo", "chmod", "600", str(path)], timeout=5)
+    _audit(user, "ssh_key_add", f"{username}: {key[:40]}", "ok")
+    return {"ok": True, "username": username}
+
+
+class SSHKeyDeleteRequest(BaseModel):
+    key_fragment: str   # unique substring of the key to delete (the full key or comment)
+
+
+@router.delete("/ssh/keys/{username}")
+async def delete_ssh_key(username: str, body: SSHKeyDeleteRequest, user: str = Depends(require_super_admin)) -> dict:
+    if not re.match(r"^[a-zA-Z0-9_.-]+$", username):
+        raise HTTPException(400, "Invalid username")
+    path = _auth_keys_path(username)
+    out, _, _ = _run(["sudo", "cat", str(path)], timeout=5)
+    original_lines = out.splitlines()
+    frag = body.key_fragment.strip()
+    new_lines = [l for l in original_lines if frag not in l]
+    if len(new_lines) == len(original_lines):
+        raise HTTPException(404, "Key not found")
+    new_content = "\n".join(new_lines) + "\n"
+    write_cmd = ["sudo", "bash", "-c", f"printf %s {_shlex_quote(new_content)} > {_shlex_quote(str(path))}"]
+    _, err, rc = _run(write_cmd, timeout=5)
+    if rc != 0:
+        raise HTTPException(500, err.strip() or "Failed to write authorized_keys")
+    _audit(user, "ssh_key_delete", f"{username}: {frag[:40]}", "ok")
+    return {"ok": True, "removed": len(original_lines) - len(new_lines)}
+
+
+def _shlex_quote(s: str) -> str:
+    import shlex
+    return shlex.quote(s)
+
+
+# ---------------------------------------------------------------------------
+# Database admin (MariaDB / MySQL)
+# ---------------------------------------------------------------------------
+
+@router.get("/database/databases")
+async def list_databases(_: str = Depends(require_super_admin)) -> dict:
+    """List all MariaDB/MySQL databases."""
+    out, err, rc = _run(
+        ["sudo", "mysql", "-e", "SHOW DATABASES;", "--skip-column-names", "-s"],
+        timeout=10
+    )
+    if rc != 0:
+        return {"error": err.strip() or "mysql unavailable", "databases": []}
+    dbs = [line.strip() for line in out.splitlines() if line.strip()]
+    return {"databases": dbs, "count": len(dbs), "checked_at": datetime.now(UTC).isoformat()}
+
+
+@router.get("/database/databases/{db}/tables")
+async def list_tables(db: str, _: str = Depends(require_super_admin)) -> dict:
+    if not re.match(r"^[a-zA-Z0-9_]+$", db):
+        raise HTTPException(400, "Invalid database name")
+    out, err, rc = _run(
+        ["sudo", "mysql", db, "-e", "SHOW TABLES;", "--skip-column-names", "-s"],
+        timeout=10
+    )
+    if rc != 0:
+        raise HTTPException(500, err.strip() or "mysql error")
+    tables = [line.strip() for line in out.splitlines() if line.strip()]
+    return {"database": db, "tables": tables, "count": len(tables)}
+
+
+class DBQueryRequest(BaseModel):
+    database: str
+    query: str   # must be SELECT only
+
+
+@router.post("/database/query")
+async def run_db_query(body: DBQueryRequest, user: str = Depends(require_super_admin)) -> dict:
+    """Execute a read-only SELECT query against a MariaDB database."""
+    if not re.match(r"^[a-zA-Z0-9_]+$", body.database):
+        raise HTTPException(400, "Invalid database name")
+    # Enforce read-only — only allow SELECT statements
+    stripped = body.query.strip().upper()
+    if not stripped.startswith("SELECT") and not stripped.startswith("SHOW") and not stripped.startswith("DESCRIBE") and not stripped.startswith("EXPLAIN"):
+        raise HTTPException(400, "Only SELECT, SHOW, DESCRIBE, and EXPLAIN queries are allowed")
+    if len(body.query) > 2000:
+        raise HTTPException(400, "Query too long (max 2000 chars)")
+
+    out, err, rc = _run(
+        ["sudo", "mysql", body.database, "-e", body.query, "--table"],
+        timeout=30
+    )
+    if rc != 0:
+        raise HTTPException(500, err.strip() or "query error")
+    _audit(user, "db_query", f"{body.database}: {body.query[:80]}", "ok")
+    return {
+        "database": body.database,
+        "query": body.query,
+        "result": out[:50000],
+        "executed_at": datetime.now(UTC).isoformat(),
+    }

@@ -5,15 +5,22 @@ Terminal command execution, permission-aware file manager, and network tools.
 
 from __future__ import annotations
 
+import asyncio
+import fcntl
 import os
+import pty
 import pwd
+import signal
 import socket
+import struct
 import subprocess
 import tempfile
+import threading
+import termios
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 
@@ -493,3 +500,140 @@ async def check_ports(
             except ValueError:
                 pass
     return {"host": host, "ports": results}
+
+
+# ---------------------------------------------------------------------------
+# WebSocket PTY terminal — persistent shell session
+# ---------------------------------------------------------------------------
+
+def _set_winsize(fd: int, rows: int, cols: int) -> None:
+    """Resize the PTY window."""
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    except Exception:
+        pass
+
+
+@router.websocket("/pty")
+async def pty_terminal(ws: WebSocket, token: str = ""):
+    """
+    WebSocket PTY — provides a real persistent bash shell.
+
+    Client → server messages:
+      {"type": "input",  "data": "<text>"}         — keystrokes
+      {"type": "resize", "rows": N, "cols": N}      — terminal resize
+      {"type": "ping"}                              — keepalive
+
+    Server → client messages:
+      {"type": "output", "data": "<text>"}          — shell output
+      {"type": "exit",   "code": N}                 — shell exited
+    """
+    from frothiq_control_center.auth.jwt_handler import decode_token as _decode_token
+    from frothiq_control_center.auth.jwt_handler import role_at_least as _role_at_least
+    from jose import JWTError as _JWTError
+
+    # Authenticate via query-param token (WS can't send Authorization header)
+    try:
+        payload = _decode_token(token)
+        if not _role_at_least(payload.role, "super_admin"):
+            await ws.close(code=4003)
+            return
+    except (_JWTError, Exception):
+        await ws.close(code=4001)
+        return
+
+    await ws.accept()
+
+    # Spawn bash in a PTY
+    master_fd, slave_fd = pty.openpty()
+    _set_winsize(master_fd, 24, 80)
+
+    env = {
+        **os.environ,
+        "TERM": "xterm-256color",
+        "COLUMNS": "80",
+        "LINES": "24",
+        "HOME": os.path.expanduser("~"),
+        "SHELL": "/bin/bash",
+    }
+
+    proc = subprocess.Popen(
+        ["/bin/bash", "--login"],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        preexec_fn=os.setsid,
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+
+    # Make master_fd non-blocking for async reads
+    flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+    fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+    loop = asyncio.get_event_loop()
+    stop_event = asyncio.Event()
+
+    async def _read_output():
+        """Read PTY output and forward to client."""
+        while not stop_event.is_set():
+            try:
+                data = await loop.run_in_executor(None, _blocking_read, master_fd)
+                if data is None:
+                    break
+                await ws.send_json({"type": "output", "data": data.decode("utf-8", errors="replace")})
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                await asyncio.sleep(0.01)
+
+    def _blocking_read(fd: int) -> bytes | None:
+        import select
+        ready, _, _ = select.select([fd], [], [], 0.1)
+        if ready:
+            try:
+                return os.read(fd, 4096)
+            except OSError:
+                return None
+        return b""
+
+    output_task = asyncio.create_task(_read_output())
+
+    try:
+        while True:
+            msg = await ws.receive_json()
+            mtype = msg.get("type")
+
+            if mtype == "input":
+                data = msg.get("data", "")
+                if data:
+                    os.write(master_fd, data.encode("utf-8", errors="replace"))
+
+            elif mtype == "resize":
+                rows = int(msg.get("rows", 24))
+                cols = int(msg.get("cols", 80))
+                _set_winsize(master_fd, rows, cols)
+
+            elif mtype == "ping":
+                await ws.send_json({"type": "pong"})
+
+            if proc.poll() is not None:
+                await ws.send_json({"type": "exit", "code": proc.returncode or 0})
+                break
+
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        stop_event.set()
+        output_task.cancel()
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            pass
+        try:
+            os.close(master_fd)
+        except Exception:
+            pass

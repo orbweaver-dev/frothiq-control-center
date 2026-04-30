@@ -23,29 +23,73 @@ router = APIRouter(prefix="/sysinfo/wordpress", tags=["wordpress"])
 _WP_CLI = "/usr/local/bin/wp"
 _WP_CLI_FLAGS = ["--allow-root", "--skip-plugins", "--skip-themes", "--format=json"]
 
-# Known home directories to search for wp-config.php
+# Known home directories to search for WordPress installs
 _SEARCH_ROOTS = [Path("/home"), Path("/var/www")]
+
+# Frappe bench sites directory — any home dir matching a site here is excluded
+_FRAPPE_SITES_DIR = Path("/home/frappe/frappe-bench/sites")
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _frappe_site_home_users() -> set[str]:
+    """
+    Return the set of home-directory usernames that belong to Frappe bench sites.
+
+    Frappe sites are named like 'agiient.com' or 'emeraldshield.org'.
+    Their Virtualmin home dirs are typically /home/agiient or /home/emeraldshield
+    (the part before the first dot). We collect both the full site name and the
+    subdomain prefix so we can match either form found in _SEARCH_ROOTS.
+    """
+    names: set[str] = set()
+    try:
+        for p in _FRAPPE_SITES_DIR.iterdir():
+            if p.is_dir() and (p / "site_config.json").exists():
+                names.add(p.name)                    # e.g. "agiient.com"
+                names.add(p.name.split(".")[0])      # e.g. "agiient"
+    except (PermissionError, OSError):
+        pass
+    return names
+
+
+def _is_real_wordpress(wp_dir: Path) -> bool:
+    """
+    Confirm a directory is an active WordPress install, not just a leftover
+    wp-config.php.  Requires wp-login.php AND wp-includes/version.php.
+    """
+    return (wp_dir / "wp-login.php").exists() and (wp_dir / "wp-includes" / "version.php").exists()
+
+
 def _discover_installs() -> list[dict]:
-    """Walk _SEARCH_ROOTS to find wp-config.php files (max depth 5)."""
+    """
+    Walk _SEARCH_ROOTS to find real WordPress installs.
+
+    Exclusion rules (applied in order):
+      1. Path depth > 5 — skip buried configs
+      2. Home-dir username matches a Frappe bench site — not WordPress
+      3. wp-login.php or wp-includes/version.php missing — not a real WP install
+    """
+    frappe_users = _frappe_site_home_users()
     found: list[dict] = []
     for root in _SEARCH_ROOTS:
         if not root.exists():
             continue
         try:
             for config in root.rglob("wp-config.php"):
-                # Skip depth > 5 to avoid buried configs
                 parts = config.relative_to(root).parts
                 if len(parts) > 5:
                     continue
-                wp_path = str(config.parent)
-                domain = _guess_domain(config)
-                found.append({"path": wp_path, "domain": domain})
+                # Rule 2: exclude Frappe bench sites
+                home_user = parts[0] if parts else ""
+                if home_user in frappe_users:
+                    continue
+                # Rule 3: must have real WordPress core files
+                wp_dir = config.parent
+                if not _is_real_wordpress(wp_dir):
+                    continue
+                found.append({"path": str(wp_dir), "domain": _guess_domain(config)})
         except (PermissionError, OSError):
             continue
     # Deduplicate by path
