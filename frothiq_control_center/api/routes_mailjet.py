@@ -68,7 +68,8 @@ async def get_account(_: TokenPayload = Depends(require_super_admin)) -> dict[st
     if creds is None:
         return {"configured": False}
     try:
-        data = await _get("/apikey/me")
+        # /apikey/me doesn't exist; /apikey returns the key(s) for this credential
+        data = await _get("/apikey")
         record = data.get("Data", [{}])[0]
         return {
             "configured": True,
@@ -95,17 +96,18 @@ async def get_stats(_: TokenPayload = Depends(require_super_admin)) -> dict[str,
         data = await _get("/statcounters", {
             "CounterSource": "APIKey",
             "CounterTiming": "Message",
-            "CounterResolution": "Lifetime",
+            "CounterResolution": "Day",
             "FromTS": from_ts,
             "ToTS": to_ts,
         })
-        row = (data.get("Data") or [{}])[0]
-        sent = row.get("MessageSentCount", 0)
-        delivered = row.get("MessageDeliveredCount", 0) or sent - row.get("MessageBounceCount", 0)
-        bounced = row.get("MessageBounceCount", 0)
-        spam = row.get("MessageSpamCount", 0)
-        opened = row.get("MessageOpenedCount", 0)
-        clicked = row.get("MessageClickedCount", 0)
+        rows = data.get("Data") or []
+        sent = sum(r.get("MessageSentCount", 0) for r in rows)
+        bounced = sum(r.get("MessageBounceCount", 0) for r in rows)
+        delivered_raw = sum(r.get("MessageDeliveredCount", 0) for r in rows)
+        delivered = delivered_raw or max(sent - bounced, 0)
+        spam = sum(r.get("MessageSpamCount", 0) for r in rows)
+        opened = sum(r.get("MessageOpenedCount", 0) for r in rows)
+        clicked = sum(r.get("MessageClickedCount", 0) for r in rows)
         return {
             "configured": True,
             "period_days": 30,
