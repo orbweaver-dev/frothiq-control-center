@@ -1448,3 +1448,222 @@ async def domain_overview(domain: str, _: str = Depends(require_super_admin)) ->
         "dns": dns,
         "checked_at": datetime.now(UTC).isoformat(),
     }
+
+
+# ---------------------------------------------------------------------------
+# DNS zone file management (direct BIND)
+# ---------------------------------------------------------------------------
+
+ZONE_DIR = Path("/var/lib/bind")
+_DNS_TYPES = {"A", "AAAA", "MX", "NS", "TXT", "CNAME", "CAA", "SRV", "PTR"}
+# Record types we display but never let the user add/remove via the editor
+_DNS_READONLY_TYPES = {"SOA", "NS"}
+
+# Regex: <name> [<ttl>] IN <type> <value>  (handles both absolute and relative names)
+_ZONE_RECORD_RE = re.compile(
+    r"^(\S+)\s+"          # name
+    r"(?:(\d+)\s+)?"      # optional TTL
+    r"IN\s+"              # class
+    r"(\S+)\s+"           # type
+    r"(.+?)\s*$",         # value
+    re.IGNORECASE,
+)
+_SERIAL_RE = re.compile(r"(\d{10})\s*;?\s*[Ss]erial", re.MULTILINE)
+_SERIAL_RE2 = re.compile(r"(\d{8,10})\s*\n\s*\d+\s*\n")  # SOA block style
+
+
+def _zone_file(domain: str) -> Path:
+    return ZONE_DIR / f"{domain}.hosts"
+
+
+def _read_zone_raw(domain: str) -> str:
+    out = _run_out(["sudo", "/bin/cat", str(_zone_file(domain))], timeout=5)
+    if not out:
+        raise HTTPException(status_code=404, detail=f"Zone file not found for {domain}")
+    return out
+
+
+def _parse_zone(content: str) -> list[dict]:
+    """Parse BIND zone file lines into record dicts."""
+    records = []
+    for line in content.splitlines():
+        stripped = line.split(";")[0].strip()  # strip inline comments
+        if not stripped:
+            continue
+        m = _ZONE_RECORD_RE.match(stripped)
+        if not m:
+            continue
+        name, ttl, rtype, value = m.group(1), m.group(2), m.group(3).upper(), m.group(4).strip()
+        # Strip surrounding quotes from TXT/SPF values
+        if value.startswith('"') and value.endswith('"'):
+            value = value[1:-1]
+        records.append({
+            "name": name,
+            "ttl": int(ttl) if ttl else None,
+            "type": rtype,
+            "value": value,
+            "readonly": rtype in _DNS_READONLY_TYPES,
+        })
+    return records
+
+
+def _increment_serial(content: str) -> str:
+    """Increment the SOA serial. Tries YYYYMMDDnn style; falls back to plain int."""
+    today = datetime.now().strftime("%Y%m%d")
+
+    def replacer(m: re.Match) -> str:
+        old = m.group(1)
+        if len(old) == 10 and old[:8] == today:
+            new = str(int(old) + 1)
+        elif len(old) >= 8:
+            new = today + "01"
+        else:
+            new = str(int(old) + 1)
+        return m.group(0).replace(old, new, 1)
+
+    # Try inline "NNNNNNNNNN ; serial" pattern
+    new_content, n = _SERIAL_RE.subn(replacer, content)
+    if n:
+        return new_content
+    # Fallback: first 8–10 digit number inside SOA block
+    soa_start = content.find("SOA")
+    soa_end = content.find(")", soa_start) + 1 if soa_start != -1 else -1
+    if soa_start != -1 and soa_end > soa_start:
+        soa_block = content[soa_start:soa_end]
+        digits_re = re.compile(r"\b(\d{8,10})\b")
+        m2 = digits_re.search(soa_block)
+        if m2:
+            old = m2.group(1)
+            new = today + "01" if old[:8] != today else str(int(old) + 1)
+            return content[:soa_start] + soa_block.replace(old, new, 1) + content[soa_end:]
+    return content
+
+
+def _write_zone(domain: str, content: str) -> None:
+    """Write zone file via sudo tee, validate with named-checkzone, then reload."""
+    zone_path = str(_zone_file(domain))
+    proc = subprocess.run(
+        ["sudo", "/usr/bin/tee", zone_path],
+        input=content.encode(),
+        capture_output=True,
+        timeout=10,
+    )
+    if proc.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"Write failed: {proc.stderr.decode()}")
+    # Validate the zone
+    check = _run_out(["sudo", "/usr/sbin/named-checkzone", domain, zone_path], timeout=5)
+    if "OK" not in check:
+        raise HTTPException(status_code=500, detail=f"Zone validation failed: {check}")
+    # Reload BIND for this zone only
+    _run_out(["sudo", "/usr/sbin/rndc", "reload", domain], timeout=10)
+
+
+class DnsAddRequest(BaseModel):
+    name: str
+    type: str
+    value: str
+    ttl: int | None = None
+
+
+class DnsRemoveRequest(BaseModel):
+    name: str
+    type: str
+    value: str
+
+
+class DnsUpdateRequest(BaseModel):
+    old_name: str
+    old_type: str
+    old_value: str
+    name: str
+    type: str
+    value: str
+    ttl: int | None = None
+
+
+def _canonical_name(name: str, domain: str) -> str:
+    """Ensure name is absolute (ends with '.') or is '@'."""
+    if name == "@" or name.endswith("."):
+        return name
+    # If it already contains the domain, make it absolute
+    if name.endswith(f".{domain}") or name == domain:
+        return name.rstrip(".") + "."
+    return name
+
+
+@router.get("/domains/{domain}/dns")
+async def domain_dns_records(domain: str, _: str = Depends(require_super_admin)) -> dict:
+    """Return all DNS records by parsing the BIND zone file directly."""
+    content = _read_zone_raw(domain)
+    records = _parse_zone(content)
+    return {"domain": domain, "records": records, "count": len(records)}
+
+
+@router.post("/domains/{domain}/dns/add")
+async def domain_dns_add(domain: str, body: DnsAddRequest, _: str = Depends(require_super_admin)) -> dict:
+    """Add a DNS record to the zone file."""
+    rtype = body.type.upper()
+    if rtype not in _DNS_TYPES:
+        raise HTTPException(status_code=400, detail=f"Unsupported record type: {rtype}")
+    content = _read_zone_raw(domain)
+    content = _increment_serial(content)
+    ttl_str = f"\t{body.ttl}" if body.ttl else ""
+    value = f'"{body.value}"' if rtype == "TXT" and not body.value.startswith('"') else body.value
+    new_line = f"{body.name}{ttl_str}\tIN\t{rtype}\t{value}\n"
+    content = content.rstrip("\n") + "\n" + new_line
+    _write_zone(domain, content)
+    return {"ok": True, "detail": "Record added and zone reloaded"}
+
+
+@router.post("/domains/{domain}/dns/remove")
+async def domain_dns_remove(domain: str, body: DnsRemoveRequest, _: str = Depends(require_super_admin)) -> dict:
+    """Remove a DNS record from the zone file."""
+    content = _read_zone_raw(domain)
+    rtype = body.type.upper()
+    new_lines = []
+    removed = 0
+    for line in content.splitlines(keepends=True):
+        stripped = line.split(";")[0].strip()
+        m = _ZONE_RECORD_RE.match(stripped)
+        if m:
+            ln, _, lt, lv = m.group(1), m.group(2), m.group(3).upper(), m.group(4).strip()
+            lv_clean = lv.strip('"')
+            if ln == body.name and lt == rtype and (lv == body.value or lv_clean == body.value):
+                removed += 1
+                continue
+        new_lines.append(line)
+    if not removed:
+        raise HTTPException(status_code=404, detail="Record not found in zone file")
+    new_content = _increment_serial("".join(new_lines))
+    _write_zone(domain, new_content)
+    return {"ok": True, "detail": f"Record removed and zone reloaded"}
+
+
+@router.post("/domains/{domain}/dns/update")
+async def domain_dns_update(domain: str, body: DnsUpdateRequest, _: str = Depends(require_super_admin)) -> dict:
+    """Update (replace) a DNS record in the zone file."""
+    content = _read_zone_raw(domain)
+    rtype_old = body.old_type.upper()
+    rtype_new = body.type.upper()
+    if rtype_new not in _DNS_TYPES:
+        raise HTTPException(status_code=400, detail=f"Unsupported record type: {rtype_new}")
+    new_lines = []
+    updated = 0
+    for line in content.splitlines(keepends=True):
+        stripped = line.split(";")[0].strip()
+        m = _ZONE_RECORD_RE.match(stripped)
+        if m and not updated:
+            ln, ttl, lt, lv = m.group(1), m.group(2), m.group(3).upper(), m.group(4).strip()
+            lv_clean = lv.strip('"')
+            if ln == body.old_name and lt == rtype_old and (lv == body.old_value or lv_clean == body.old_value):
+                ttl_str = f"\t{body.ttl}" if body.ttl else (f"\t{ttl}" if ttl else "")
+                value = f'"{body.value}"' if rtype_new == "TXT" and not body.value.startswith('"') else body.value
+                new_lines.append(f"{body.name}{ttl_str}\tIN\t{rtype_new}\t{value}\n")
+                updated += 1
+                continue
+        new_lines.append(line)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Record not found in zone file")
+    new_content = _increment_serial("".join(new_lines))
+    _write_zone(domain, new_content)
+    return {"ok": True, "detail": "Record updated and zone reloaded"}
