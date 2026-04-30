@@ -1333,3 +1333,118 @@ async def vhost_deploy(
     result = _deploy_vhost(domain, body.server_type, doc_root)
     _audit(user, "vhost_deploy", "local", domain, "ok")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Domain Manager — overview aggregation helpers
+# ---------------------------------------------------------------------------
+
+def _domain_emails(domain: str) -> list[dict]:
+    """List mail/FTP users for a domain via virtualmin."""
+    out = _run_out(["sudo", "/usr/sbin/virtualmin", "list-users", "--domain", domain], timeout=10)
+    users = []
+    for line in out.splitlines():
+        parts = line.split()
+        if not parts or parts[0] in ("User", "----"):
+            continue
+        username = parts[0]
+        real_name = parts[1] if len(parts) > 1 else ""
+        mail = parts[2].strip().lower() == "yes" if len(parts) > 2 else False
+        ftp  = parts[3].strip().lower() != "no"  if len(parts) > 3 else False
+        users.append({
+            "username": username,
+            "real_name": real_name,
+            "email": f"{username}@{domain}",
+            "mail": mail,
+            "ftp": ftp,
+        })
+    return users
+
+
+def _domain_databases(domain: str) -> list[dict]:
+    """List databases for a domain via virtualmin."""
+    out = _run_out(["sudo", "/usr/sbin/virtualmin", "list-databases", "--domain", domain], timeout=10)
+    dbs = []
+    for line in out.splitlines():
+        parts = line.split()
+        if not parts or parts[0] in ("Database", "----"):
+            continue
+        name = parts[0]
+        db_type = parts[1] if len(parts) > 1 else "mysql"
+        size = parts[2] if len(parts) > 2 else "?"
+        dbs.append({"name": name, "type": db_type, "size": size})
+    return dbs
+
+
+def _domain_dns(domain: str) -> dict:
+    """Return A, MX, NS, TXT records for a domain via dig."""
+    records: dict[str, list[str]] = {}
+    for rtype in ("A", "MX", "NS", "TXT"):
+        out = _run_out(["dig", "+short", rtype, domain], timeout=5)
+        values = [v.strip() for v in out.splitlines() if v.strip()]
+        if values:
+            records[rtype] = values
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Domain Manager endpoint
+# ---------------------------------------------------------------------------
+
+@router.get("/domains")
+async def list_domains(_: str = Depends(require_super_admin)) -> dict:
+    """Return a deduplicated list of apex domains derived from vhost configs."""
+    vhosts = _local_vhosts()
+    seen: set[str] = set()
+    domains = []
+    for v in vhosts:
+        parts = v["domain"].split(".")
+        apex = ".".join(parts[-2:]) if len(parts) >= 2 else v["domain"]
+        if apex not in seen:
+            seen.add(apex)
+            domains.append(apex)
+    return {"domains": sorted(domains), "count": len(domains)}
+
+
+@router.get("/domains/{domain}/overview")
+async def domain_overview(domain: str, _: str = Depends(require_super_admin)) -> dict:
+    """Comprehensive domain view: vhosts, SSL, email, databases, DNS, subdomains."""
+    all_vhosts = _local_vhosts()
+    domain_vhosts = [
+        v for v in all_vhosts
+        if v["domain"] == domain or v["domain"].endswith(f".{domain}")
+    ]
+
+    # Deduplicate by (subdomain, port)
+    subdomains = sorted({v["domain"] for v in domain_vhosts if v["domain"] != domain})
+
+    try:
+        ssl_info = _ssl_cert_info(domain)
+    except Exception:
+        ssl_info = {}
+
+    try:
+        emails = _domain_emails(domain)
+    except Exception:
+        emails = []
+
+    try:
+        databases = _domain_databases(domain)
+    except Exception:
+        databases = []
+
+    try:
+        dns = _domain_dns(domain)
+    except Exception:
+        dns = {}
+
+    return {
+        "domain": domain,
+        "vhosts": domain_vhosts,
+        "subdomains": subdomains,
+        "ssl": ssl_info,
+        "emails": emails,
+        "databases": databases,
+        "dns": dns,
+        "checked_at": datetime.now(UTC).isoformat(),
+    }
