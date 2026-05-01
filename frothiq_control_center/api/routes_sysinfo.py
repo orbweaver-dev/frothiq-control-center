@@ -2937,56 +2937,57 @@ def _shlex_quote(s: str) -> str:
 
 # ---------------------------------------------------------------------------
 # Database admin (MariaDB / MySQL)
+# Uses frothiq_dba credentials — ALL PRIVILEGES on all databases.
 # ---------------------------------------------------------------------------
+
+_DB_CNF = "--defaults-extra-file=/etc/mysql/frothiq_dba.cnf"
+_DB_NAME_RE = re.compile(r"^[a-zA-Z0-9_\-]+$")
+
+
+def _mysql(*args: str, timeout: int = 15) -> tuple[str, str, int]:
+    """Run mariadb CLI with frothiq_dba credentials."""
+    return _run(["mariadb", _DB_CNF, *args], timeout=timeout)
+
 
 @router.get("/database/databases")
 async def list_databases(_: str = Depends(require_super_admin)) -> dict:
-    """List all MariaDB/MySQL databases."""
-    out, err, rc = _run(
-        ["sudo", "mysql", "-e", "SHOW DATABASES;", "--skip-column-names", "-s"],
-        timeout=10
-    )
+    """List all MariaDB databases visible to frothiq_dba."""
+    out, err, rc = _mysql("-e", "SHOW DATABASES;", "--skip-column-names", "-s")
     if rc != 0:
-        return {"error": err.strip() or "mysql unavailable", "databases": []}
+        return {"error": err.strip() or "mariadb unavailable", "databases": []}
     dbs = [line.strip() for line in out.splitlines() if line.strip()]
     return {"databases": dbs, "count": len(dbs), "checked_at": datetime.now(UTC).isoformat()}
 
 
 @router.get("/database/databases/{db}/tables")
 async def list_tables(db: str, _: str = Depends(require_super_admin)) -> dict:
-    if not re.match(r"^[a-zA-Z0-9_]+$", db):
+    if not _DB_NAME_RE.match(db):
         raise HTTPException(400, "Invalid database name")
-    out, err, rc = _run(
-        ["sudo", "mysql", db, "-e", "SHOW TABLES;", "--skip-column-names", "-s"],
-        timeout=10
-    )
+    out, err, rc = _mysql(db, "-e", "SHOW TABLES;", "--skip-column-names", "-s")
     if rc != 0:
-        raise HTTPException(500, err.strip() or "mysql error")
+        raise HTTPException(500, err.strip() or "mariadb error")
     tables = [line.strip() for line in out.splitlines() if line.strip()]
     return {"database": db, "tables": tables, "count": len(tables)}
 
 
 class DBQueryRequest(BaseModel):
     database: str
-    query: str   # must be SELECT only
+    query: str
 
 
 @router.post("/database/query")
 async def run_db_query(body: DBQueryRequest, user: str = Depends(require_super_admin)) -> dict:
-    """Execute a read-only SELECT query against a MariaDB database."""
-    if not re.match(r"^[a-zA-Z0-9_]+$", body.database):
+    """Execute a read-only SELECT/SHOW/DESCRIBE/EXPLAIN query against a MariaDB database."""
+    if not _DB_NAME_RE.match(body.database):
         raise HTTPException(400, "Invalid database name")
-    # Enforce read-only — only allow SELECT statements
     stripped = body.query.strip().upper()
-    if not stripped.startswith("SELECT") and not stripped.startswith("SHOW") and not stripped.startswith("DESCRIBE") and not stripped.startswith("EXPLAIN"):
+    allowed_prefixes = ("SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "DESC")
+    if not any(stripped.startswith(p) for p in allowed_prefixes):
         raise HTTPException(400, "Only SELECT, SHOW, DESCRIBE, and EXPLAIN queries are allowed")
     if len(body.query) > 2000:
         raise HTTPException(400, "Query too long (max 2000 chars)")
 
-    out, err, rc = _run(
-        ["sudo", "mysql", body.database, "-e", body.query, "--table"],
-        timeout=30
-    )
+    out, err, rc = _mysql(body.database, "-e", body.query, "--table", timeout=30)
     if rc != 0:
         raise HTTPException(500, err.strip() or "query error")
     _audit(user, "db_query", f"{body.database}: {body.query[:80]}", "ok")
@@ -2996,3 +2997,40 @@ async def run_db_query(body: DBQueryRequest, user: str = Depends(require_super_a
         "result": out[:50000],
         "executed_at": datetime.now(UTC).isoformat(),
     }
+
+
+class DBCreateRequest(BaseModel):
+    name: str
+    charset: str = "utf8mb4"
+    collation: str = "utf8mb4_unicode_ci"
+
+
+@router.post("/database/databases")
+async def create_database(body: DBCreateRequest, user: str = Depends(require_super_admin)) -> dict:
+    """Create a new MariaDB database."""
+    if not _DB_NAME_RE.match(body.name):
+        raise HTTPException(400, "Invalid database name")
+    allowed_charsets = {"utf8mb4", "utf8", "latin1", "ascii"}
+    if body.charset not in allowed_charsets:
+        raise HTTPException(400, f"Unsupported charset. Allowed: {', '.join(allowed_charsets)}")
+    sql = f"CREATE DATABASE `{body.name}` CHARACTER SET {body.charset} COLLATE {body.collation};"
+    out, err, rc = _mysql("-e", sql)
+    if rc != 0:
+        raise HTTPException(500, err.strip() or "create database failed")
+    _audit(user, "db_create", body.name, "ok")
+    return {"created": body.name, "charset": body.charset, "collation": body.collation}
+
+
+@router.delete("/database/databases/{db}")
+async def drop_database(db: str, user: str = Depends(require_super_admin)) -> dict:
+    """Drop a MariaDB database. Irreversible — caller must confirm."""
+    if not _DB_NAME_RE.match(db):
+        raise HTTPException(400, "Invalid database name")
+    protected = {"mysql", "information_schema", "performance_schema", "sys", "frothiq_cc"}
+    if db in protected:
+        raise HTTPException(403, f"Database '{db}' is protected and cannot be dropped")
+    out, err, rc = _mysql("-e", f"DROP DATABASE `{db}`;")
+    if rc != 0:
+        raise HTTPException(500, err.strip() or "drop database failed")
+    _audit(user, "db_drop", db, "ok")
+    return {"dropped": db}
