@@ -367,13 +367,16 @@ def _redis_detail() -> dict:
     # Key config values
     config_keys = ["maxmemory", "maxmemory-policy", "bind", "port", "databases",
                    "loglevel", "save", "requirepass", "appendonly", "hz",
-                   "tcp-keepalive", "timeout"]
+                   "tcp-keepalive", "timeout", "maxclients", "protected-mode",
+                   "lazyfree-lazy-eviction", "activerehashing", "appendfsync"]
     config: dict[str, str] = {}
     for key in config_keys:
         out = r("CONFIG", "GET", key)
-        lines = [l for l in out.strip().splitlines() if l.strip()]
-        if len(lines) >= 2:
-            val = lines[1] if key != "requirepass" else ("*****" if lines[1] else "(not set)")
+        lines = out.strip().splitlines()
+        # CONFIG GET always returns key on line 0; value on line 1 (may be empty string)
+        if lines:
+            raw_val = lines[1] if len(lines) >= 2 else ""
+            val = raw_val if key != "requirepass" else ("*****" if raw_val else "(not set)")
             config[key] = val
 
     # Keyspace
@@ -616,6 +619,52 @@ def _openssh_detail() -> dict:
     return {"settings": settings, "active_connections": conn_count}
 
 
+def _rails_detail() -> dict:
+    def _v(cmd: list[str]) -> str:
+        return _out(cmd, timeout=8).strip()
+
+    ruby_version  = _v(["ruby",    "--version"])
+    gem_version   = _v(["gem",     "--version"])
+    bundler_ver   = _v(["bundle3.2", "--version"]) or _v(["bundle", "--version"])
+
+    # Installed Rails gem version(s)
+    gem_list_out  = _v(["gem", "list", "^rails$"])
+    rails_version = gem_list_out if gem_list_out else "(not installed)"
+
+    # Running Puma/Unicorn/Thin processes
+    processes: list[dict] = []
+    ps_out = _out(["ps", "aux"], timeout=5)
+    for line in ps_out.splitlines():
+        lower = line.lower()
+        if any(kw in lower for kw in ("puma", "unicorn", "thin ", "passenger")):
+            parts = line.split(None, 10)
+            if len(parts) >= 11:
+                processes.append({"user": parts[0], "pid": parts[1], "cpu": parts[2], "mem": parts[3], "cmd": parts[10]})
+
+    # Gemfiles found in common deployment locations
+    gemfiles: list[str] = []
+    for base in ("/home", "/var/www", "/opt"):
+        try:
+            for gf in Path(base).rglob("Gemfile"):
+                if ".bundle" not in str(gf) and len(gf.parts) - len(Path(base).parts) <= 5:
+                    gemfiles.append(str(gf))
+                    if len(gemfiles) >= 10:
+                        break
+        except (PermissionError, OSError):
+            pass
+        if len(gemfiles) >= 10:
+            break
+
+    return {
+        "ruby_version": ruby_version,
+        "gem_version": gem_version,
+        "bundler_version": bundler_ver,
+        "rails_version": rails_version,
+        "app_processes": processes,
+        "gemfiles_found": gemfiles,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Dispatch endpoint
 # ---------------------------------------------------------------------------
@@ -630,6 +679,7 @@ HANDLERS = {
     "dovecot": _dovecot_detail,
     "bind9": _bind9_detail,
     "openssh": _openssh_detail,
+    "rails": _rails_detail,
 }
 
 

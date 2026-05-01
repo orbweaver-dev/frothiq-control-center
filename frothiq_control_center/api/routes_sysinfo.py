@@ -163,6 +163,14 @@ KNOWN_SERVERS: dict[str, dict] = {
         "log_paths": ["/var/log/fail2ban.log"],
         "category": "security",
     },
+    "rails": {
+        "label": "Ruby on Rails",
+        "service": "puma",
+        "binaries": ["ruby"],
+        "config_paths": ["/usr/lib/ruby", "/usr/bin/ruby"],
+        "log_paths": [],
+        "category": "web",
+    },
 }
 
 # ---------------------------------------------------------------------------
