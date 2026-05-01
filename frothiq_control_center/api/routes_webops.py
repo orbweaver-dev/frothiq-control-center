@@ -2099,3 +2099,165 @@ async def dns_sign_dnssec(
 
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _do)
+
+
+# ---------------------------------------------------------------------------
+# Reverse Proxy discovery — scan Apache + Nginx for real ProxyPass / proxy_pass
+# ---------------------------------------------------------------------------
+
+_APACHE_SITES_ENABLED = Path("/etc/apache2/sites-enabled")
+_NGINX_CONF_DIRS = [Path("/etc/nginx/sites-enabled"), Path("/etc/nginx/conf.d")]
+
+# ProxyPass exclusion patterns — not real upstream proxies
+_PROXY_EXCLUSIONS = {"!", "/.well-known", ".well-known"}
+
+
+def _is_exclusion(target: str) -> bool:
+    return target.strip() in _PROXY_EXCLUSIONS or target.strip().startswith("!")
+
+
+def _scan_apache_proxies() -> list[dict]:
+    """Return list of ProxyPass entries from Apache sites-enabled."""
+    results: list[dict] = []
+    if not _APACHE_SITES_ENABLED.exists():
+        return results
+
+    for conf_file in sorted(_APACHE_SITES_ENABLED.glob("*.conf")):
+        try:
+            text = subprocess.run(
+                ["sudo", "cat", str(conf_file)], capture_output=True, text=True, timeout=5
+            ).stdout
+        except Exception:
+            continue
+
+        current_vhost: str | None = None
+        current_port: int | None = None
+        seen: set[tuple] = set()
+
+        for line in text.splitlines():
+            stripped = line.strip()
+            # Track which VirtualHost we're in (for port context)
+            vh_match = re.match(r"<VirtualHost[^>]*:(\d+)>", stripped, re.IGNORECASE)
+            if vh_match:
+                current_port = int(vh_match.group(1))
+
+            # ServerName
+            sn = re.match(r"ServerName\s+(\S+)", stripped, re.IGNORECASE)
+            if sn:
+                current_vhost = sn.group(1)
+
+            # ProxyPass (not ProxyPassReverse)
+            pp = re.match(r"ProxyPass(?!Reverse)\s+(\S+)\s+(\S+)", stripped, re.IGNORECASE)
+            if pp:
+                path, target = pp.group(1), pp.group(2)
+                if _is_exclusion(target):
+                    continue
+                key = (current_vhost, path, target)
+                if key in seen:
+                    continue
+                seen.add(key)
+                proto = "wss" if target.startswith("ws") else ("https" if current_port == 443 else "http")
+                results.append({
+                    "source": current_vhost or conf_file.stem,
+                    "path": path,
+                    "target": target,
+                    "type": "ws" if target.startswith("ws") else "http",
+                    "ssl": current_port == 443,
+                    "server": "apache",
+                    "config_file": conf_file.name,
+                })
+
+    return results
+
+
+def _parse_nginx_upstreams(text: str) -> dict[str, str]:
+    """Extract upstream name → first server address from nginx config text."""
+    upstreams: dict[str, str] = {}
+    for m in re.finditer(r"upstream\s+(\S+)\s*\{([^}]+)\}", text, re.DOTALL):
+        name = m.group(1)
+        body = m.group(2)
+        srv = re.search(r"server\s+(\S+?)(?:\s|;)", body)
+        if srv:
+            upstreams[name] = srv.group(1)
+    return upstreams
+
+
+def _scan_nginx_proxies() -> list[dict]:
+    """Return list of proxy_pass entries from Nginx config directories."""
+    results: list[dict] = []
+
+    # Collect all nginx config text + upstream map
+    all_text = ""
+    conf_files: list[Path] = []
+    for d in _NGINX_CONF_DIRS:
+        if d.exists():
+            for f in sorted(d.glob("*.conf")):
+                conf_files.append(f)
+                try:
+                    t = subprocess.run(
+                        ["sudo", "cat", str(f)], capture_output=True, text=True, timeout=5
+                    ).stdout
+                    all_text += t
+                except Exception:
+                    pass
+
+    upstreams = _parse_nginx_upstreams(all_text)
+
+    for f in conf_files:
+        try:
+            text = subprocess.run(
+                ["sudo", "cat", str(f)], capture_output=True, text=True, timeout=5
+            ).stdout
+        except Exception:
+            continue
+
+        current_server: str | None = None
+        current_location: str | None = None
+        seen: set[tuple] = set()
+
+        for line in text.splitlines():
+            stripped = line.strip()
+            sn = re.match(r"server_name\s+([^;]+);", stripped)
+            if sn:
+                current_server = sn.group(1).split()[0]
+            loc = re.match(r"location\s+(\S+)\s*\{?", stripped)
+            if loc:
+                current_location = loc.group(1)
+            pp = re.match(r"proxy_pass\s+(\S+?);", stripped)
+            if pp:
+                raw_target = pp.group(1)
+                # Resolve upstream names to actual addresses
+                resolved = raw_target
+                for uname, uaddr in upstreams.items():
+                    resolved = resolved.replace(uname, uaddr)
+                key = (current_server, current_location, raw_target)
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append({
+                    "source": current_server or f.stem,
+                    "path": current_location or "/",
+                    "target": raw_target,
+                    "target_resolved": resolved if resolved != raw_target else None,
+                    "type": "ws" if raw_target.startswith("ws") else "http",
+                    "ssl": False,
+                    "server": "nginx",
+                    "config_file": f.name,
+                })
+
+    return results
+
+
+@router.get("/proxy/routes")
+async def list_proxy_routes(_: str = Depends(require_super_admin)) -> dict:
+    """Scan Apache and Nginx configs for active reverse proxy rules."""
+    apache = _scan_apache_proxies()
+    nginx  = _scan_nginx_proxies()
+    routes = apache + nginx
+    return {
+        "routes": routes,
+        "count": len(routes),
+        "apache_count": len(apache),
+        "nginx_count": len(nginx),
+        "checked_at": datetime.now(UTC).isoformat(),
+    }
