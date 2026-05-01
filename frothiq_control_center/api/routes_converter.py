@@ -454,6 +454,312 @@ else:
 
 
 # ---------------------------------------------------------------------------
+# WordPress REST API enabler — mu-plugin injection for local sites
+# ---------------------------------------------------------------------------
+
+_MU_PLUGIN_FILENAME = "frothiq-migration-api.php"
+_MU_PLUGIN_CONTENT = """\
+<?php
+/**
+ * FrothIQ Migration — Temporary REST API enabler.
+ * Created automatically by FrothIQ Control Center.
+ * Removed when migration is complete.
+ */
+defined('ABSPATH') || exit;
+
+// Any filter that returns WP_Error on rest_authentication_errors disables the API.
+// Run at maximum priority (PHP_INT_MAX) so this overrides security plugins.
+add_filter('rest_authentication_errors', function($result) {
+    return ($result instanceof WP_Error) ? null : $result;
+}, PHP_INT_MAX);
+"""
+
+
+class WpApiRequest(BaseModel):
+    docroot: str
+
+
+@router.post("/local-wp-enable-api")
+async def local_wp_enable_api(req: WpApiRequest, _: str = Depends(require_super_admin)) -> dict:
+    """Inject a must-use plugin that re-enables the WordPress REST API for migration."""
+    import asyncio
+    import subprocess as sp
+
+    docroot = req.docroot.rstrip("/")
+    mu_dir = f"{docroot}/wp-content/mu-plugins"
+    plugin_path = f"{mu_dir}/{_MU_PLUGIN_FILENAME}"
+
+    def _do() -> dict:
+        r = sp.run(["sudo", "mkdir", "-p", mu_dir], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return {"ok": False, "error": f"mkdir failed: {r.stderr.strip()}"}
+
+        r = sp.run(["sudo", "tee", plugin_path], input=_MU_PLUGIN_CONTENT,
+                   capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return {"ok": False, "error": f"write failed: {r.stderr.strip()}"}
+
+        # Match ownership to the docroot so WordPress can see the file
+        stat_r = sp.run(["sudo", "stat", "-c", "%U:%G", docroot],
+                        capture_output=True, text=True, timeout=5)
+        if stat_r.returncode == 0:
+            owner = stat_r.stdout.strip()
+            sp.run(["sudo", "chown", owner, plugin_path], capture_output=True, timeout=5)
+
+        return {"ok": True, "plugin_path": plugin_path}
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _do)
+
+
+@router.post("/local-wp-disable-api")
+async def local_wp_disable_api(req: WpApiRequest, _: str = Depends(require_super_admin)) -> dict:
+    """Remove the must-use plugin created by local_wp_enable_api."""
+    import asyncio
+    import subprocess as sp
+
+    docroot = req.docroot.rstrip("/")
+    plugin_path = f"{docroot}/wp-content/mu-plugins/{_MU_PLUGIN_FILENAME}"
+
+    def _do() -> dict:
+        r = sp.run(["sudo", "rm", "-f", plugin_path], capture_output=True, timeout=10)
+        return {"ok": r.returncode == 0}
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _do)
+
+
+# ---------------------------------------------------------------------------
+# Local site scanner — reads Apache vhosts, fingerprints DocumentRoots
+# ---------------------------------------------------------------------------
+
+def _read_file_safe(path: str) -> str:
+    """Read a file via sudo cat, tolerating permission errors."""
+    import subprocess
+    try:
+        r = subprocess.run(["sudo", "cat", path], capture_output=True, text=True, timeout=5)
+        return r.stdout if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+def _path_exists_safe(path: str) -> bool:
+    import subprocess
+    try:
+        r = subprocess.run(["sudo", "stat", path], capture_output=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+def _detect_docroot_apps(docroot: str, servername: str, port: int) -> list[dict]:
+    """Fingerprint a DocumentRoot and return detected applications."""
+    apps: list[dict] = []
+    proto = "https" if port == 443 else "http"
+    base_url = f"{proto}://{servername}"
+
+    # ── WordPress ──────────────────────────────────────────────────────────
+    if _path_exists_safe(f"{docroot}/wp-config.php") or _path_exists_safe(f"{docroot}/wp-login.php"):
+        version = ""
+        ver_txt = _read_file_safe(f"{docroot}/wp-includes/version.php")
+        m = re.search(r"\$wp_version\s*=\s*['\"]([^'\"]+)['\"]", ver_txt)
+        if m:
+            version = m.group(1)
+        apps.append({
+            "servername": servername, "docroot": docroot,
+            "app": "wordpress", "label": "WordPress",
+            "version": version, "url": base_url,
+            "convertible": True,
+        })
+
+    # ── Joomla! ────────────────────────────────────────────────────────────
+    elif _path_exists_safe(f"{docroot}/configuration.php") and _path_exists_safe(f"{docroot}/components"):
+        version = ""
+        ver_xml = _read_file_safe(f"{docroot}/libraries/src/Version.php") or \
+                  _read_file_safe(f"{docroot}/includes/defines.php")
+        m = re.search(r"RELEASE\s*=\s*['\"]([^'\"]+)['\"]", ver_xml) or \
+            re.search(r"JVERSION\s*=\s*['\"]([^'\"]+)['\"]", ver_xml)
+        if m:
+            version = m.group(1)
+        apps.append({
+            "servername": servername, "docroot": docroot,
+            "app": "joomla", "label": "Joomla!",
+            "version": version, "url": base_url,
+            "convertible": True,
+        })
+
+    # ── phpMyAdmin ─────────────────────────────────────────────────────────
+    elif (_path_exists_safe(f"{docroot}/config.inc.php") or _path_exists_safe(f"{docroot}/config.sample.inc.php")) \
+         and _path_exists_safe(f"{docroot}/index.php") \
+         and (_path_exists_safe(f"{docroot}/libraries") or _path_exists_safe(f"{docroot}/src")):
+        apps.append({
+            "servername": servername, "docroot": docroot,
+            "app": "phpmyadmin", "label": "phpMyAdmin",
+            "version": "", "url": base_url,
+            "convertible": False,
+        })
+
+    # ── Roundcube Webmail ──────────────────────────────────────────────────
+    elif _path_exists_safe(f"{docroot}/config/config.inc.php") and \
+         _path_exists_safe(f"{docroot}/program/lib/Roundcube"):
+        apps.append({
+            "servername": servername, "docroot": docroot,
+            "app": "roundcube", "label": "Roundcube Webmail",
+            "version": "", "url": base_url,
+            "convertible": False,
+        })
+
+    # ── Drupal ─────────────────────────────────────────────────────────────
+    elif _path_exists_safe(f"{docroot}/core/lib/Drupal.php") or \
+         (_path_exists_safe(f"{docroot}/includes/bootstrap.inc") and _path_exists_safe(f"{docroot}/sites")):
+        apps.append({
+            "servername": servername, "docroot": docroot,
+            "app": "drupal", "label": "Drupal",
+            "version": "", "url": base_url,
+            "convertible": False,
+        })
+
+    # ── Laravel ────────────────────────────────────────────────────────────
+    elif _path_exists_safe(f"{docroot}/../artisan") and _path_exists_safe(f"{docroot}/../app"):
+        apps.append({
+            "servername": servername, "docroot": docroot,
+            "app": "laravel", "label": "Laravel",
+            "version": "", "url": base_url,
+            "convertible": False,
+        })
+
+    # ── Generic PHP site (public_html present, has index.php) ──────────────
+    elif _path_exists_safe(f"{docroot}/index.php"):
+        apps.append({
+            "servername": servername, "docroot": docroot,
+            "app": "php", "label": "PHP Site",
+            "version": "", "url": base_url,
+            "convertible": False,
+        })
+
+    return apps
+
+
+def _scan_apache_vhosts() -> list[dict]:
+    """Parse /etc/apache2/sites-enabled to get (servername, docroot, port) tuples."""
+    import pathlib
+    vhosts: list[dict] = []
+    seen: set[str] = set()
+
+    sites_dir = pathlib.Path("/etc/apache2/sites-enabled")
+    if not sites_dir.exists():
+        return vhosts
+
+    for cf in sites_dir.iterdir():
+        content = _read_file_safe(str(cf))
+        if not content:
+            continue
+        # Group 1 = VirtualHost header (IP:port), Group 2 = block body
+        for vh_header, block in re.findall(
+            r'<VirtualHost([^>]*)>(.*?)</VirtualHost>', content, re.DOTALL | re.IGNORECASE
+        ):
+            port = 80
+            m_port = re.search(r':(\d+)', vh_header)
+            if m_port:
+                port = int(m_port.group(1))
+            sn = re.search(r'^\s*ServerName\s+(\S+)', block, re.MULTILINE | re.IGNORECASE)
+            dr = re.search(r'^\s*DocumentRoot\s+(\S+)', block, re.MULTILINE | re.IGNORECASE)
+            if sn and dr:
+                name = sn.group(1).strip("\"'")
+                root = dr.group(1).strip("\"'")
+                key = f"{name}|{port}"
+                if key not in seen:
+                    seen.add(key)
+                    vhosts.append({"servername": name, "docroot": root, "port": port})
+
+    return vhosts
+
+
+def _scan_nginx_vhosts() -> list[dict]:
+    """Parse /etc/nginx/sites-enabled to get (servername, docroot, port) tuples."""
+    import pathlib
+    vhosts: list[dict] = []
+    seen: set[str] = set()
+
+    sites_dir = pathlib.Path("/etc/nginx/sites-enabled")
+    if not sites_dir.exists():
+        return vhosts
+
+    for cf in sites_dir.iterdir():
+        if cf.name.startswith('.'):
+            continue
+        content = _read_file_safe(str(cf))
+        if not content:
+            continue
+
+        lines = content.splitlines()
+        i = 0
+        while i < len(lines):
+            if re.match(r'^\s*server\s*\{', lines[i]):
+                depth = 0
+                block_lines: list[str] = []
+                while i < len(lines):
+                    line = lines[i]
+                    depth += line.count('{') - line.count('}')
+                    block_lines.append(line)
+                    i += 1
+                    if depth <= 0:
+                        break
+
+                block = '\n'.join(block_lines)
+
+                ports = [int(m.group(1)) for m in re.finditer(r'\blisten\s+(?:\S+:)?(\d+)', block)]
+                port = 443 if 443 in ports else (ports[0] if ports else 80)
+
+                sn_match = re.search(r'\bserver_name\s+([^;]+);', block)
+                root_match = re.search(r'^\s*root\s+(\S+)\s*;', block, re.MULTILINE)
+
+                if sn_match and root_match:
+                    names = sn_match.group(1).split()
+                    root = root_match.group(1).strip("\"'")
+                    name = next(
+                        (n for n in names if not n.startswith('_') and '*' not in n and n != 'localhost'),
+                        None,
+                    )
+                    if name:
+                        key = f"{name}|{port}"
+                        if key not in seen:
+                            seen.add(key)
+                            vhosts.append({"servername": name, "docroot": root, "port": port})
+            else:
+                i += 1
+
+    return vhosts
+
+
+@router.get("/local-scan")
+async def scan_local_sites(_: str = Depends(require_super_admin)) -> dict:
+    """
+    Scan local Apache and Nginx virtual hosts for installed CMS and web applications.
+    Results are grouped by domain name; HTTPS vhost takes precedence over HTTP.
+    """
+    import asyncio
+
+    def _scan() -> list[dict]:
+        all_vhosts = _scan_apache_vhosts() + _scan_nginx_vhosts()
+
+        # Deduplicate by domain: one entry per servername, HTTPS preferred over HTTP
+        domain_vhosts: dict[str, dict] = {}
+        for vhost in all_vhosts:
+            name = vhost["servername"]
+            if name not in domain_vhosts or vhost["port"] == 443:
+                domain_vhosts[name] = vhost
+
+        sites: list[dict] = []
+        for vhost in domain_vhosts.values():
+            apps = _detect_docroot_apps(vhost["docroot"], vhost["servername"], vhost["port"])
+            sites.extend(apps)
+        return sites
+
+    loop = asyncio.get_event_loop()
+    sites = await loop.run_in_executor(None, _scan)
+    return {"sites": sites, "total": len(sites)}
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -472,7 +778,7 @@ async def discover_site(req: DiscoverRequest, _: str = Depends(require_super_adm
             r = await client.get(f"{url}/wp-json/", timeout=_TIMEOUT, follow_redirects=True)
             if r.status_code == 200 and "json" in r.headers.get("content-type", ""):
                 data = r.json()
-                if "namespaces" in data or "name" in data:
+                if isinstance(data, dict) and ("namespaces" in data or "name" in data):
                     detected_cms = "wordpress"
                     rest_api = True
                     wp_info = {
@@ -486,38 +792,63 @@ async def discover_site(req: DiscoverRequest, _: str = Depends(require_super_adm
             pass
 
         # ── WordPress HTML signals ──────────────────────────────────────────
+        homepage_body = ""
         if not detected_cms:
             try:
                 r = await client.get(url, timeout=_TIMEOUT, follow_redirects=True)
-                body = r.text
-                if "wp-content" in body or "wp-includes" in body:
+                homepage_body = r.text
+                if "wp-content" in homepage_body or "wp-includes" in homepage_body:
                     detected_cms = "wordpress"
                     signals.append("WordPress fingerprint in page HTML (wp-content/wp-includes)")
-                elif "wp-login.php" in body:
+                elif "wp-login.php" in homepage_body:
                     detected_cms = "wordpress"
                     signals.append("WordPress login link detected in HTML")
+                elif re.search(r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']WordPress', homepage_body, re.I):
+                    detected_cms = "wordpress"
+                    signals.append("WordPress generator meta tag detected")
+            except Exception:
+                pass
+
+        # ── WordPress xmlrpc probe (fires only if HTML check also missed) ───
+        if not detected_cms:
+            try:
+                r = await client.get(f"{url}/xmlrpc.php", timeout=_TIMEOUT, follow_redirects=True)
+                if r.status_code == 405 or (r.status_code == 200 and "XML-RPC" in r.text):
+                    detected_cms = "wordpress"
+                    signals.append("WordPress XML-RPC endpoint detected at /xmlrpc.php")
             except Exception:
                 pass
 
         # ── Joomla REST API ─────────────────────────────────────────────────
+        # Require HTTP 200 + JSON with Joomla-specific structure.
+        # Do NOT treat 401/403 as evidence — any web server can return those
+        # for an unknown path, causing WordPress sites to be mis-detected.
         if not detected_cms:
             try:
                 r = await client.get(f"{url}/api/index.php/v1/", timeout=_TIMEOUT, follow_redirects=True)
-                if r.status_code in (200, 401, 403):
+                if r.status_code == 200:
                     ct = r.headers.get("content-type", "")
-                    if "json" in ct or r.status_code in (401, 403):
-                        detected_cms = "joomla"
-                        rest_api = r.status_code == 200
-                        signals.append(f"Joomla v4 REST API at /api/index.php/v1/ (HTTP {r.status_code})")
+                    if "json" in ct:
+                        try:
+                            jdata = r.json()
+                            # Joomla v4 API root returns {"data": [...], "links": {...}}
+                            if isinstance(jdata, dict) and ("data" in jdata or "links" in jdata):
+                                detected_cms = "joomla"
+                                rest_api = True
+                                signals.append("Joomla v4 REST API at /api/index.php/v1/ confirmed (HTTP 200 + JSON)")
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
         # ── Joomla HTML signals ─────────────────────────────────────────────
         if not detected_cms:
             try:
-                r = await client.get(url, timeout=_TIMEOUT, follow_redirects=True)
-                body = r.text.lower()
-                if "joomla" in body and "/administrator" in body:
+                body = homepage_body or (await client.get(url, timeout=_TIMEOUT, follow_redirects=True)).text
+                body_lower = body.lower()
+                has_joomla_tag = re.search(r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']Joomla', body, re.I)
+                has_joomla_text = "joomla" in body_lower and "/administrator" in body_lower
+                if has_joomla_tag or has_joomla_text:
                     detected_cms = "joomla"
                     signals.append("Joomla fingerprint in page HTML")
             except Exception:
