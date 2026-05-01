@@ -1459,6 +1459,26 @@ _DNS_TYPES = {"A", "AAAA", "MX", "NS", "TXT", "CNAME", "CAA", "SRV", "PTR"}
 # Record types we display but never let the user add/remove via the editor
 _DNS_READONLY_TYPES = {"SOA", "NS"}
 
+# ---------------------------------------------------------------------------
+# DNS setup — server defaults (mirrors Virtualmin zone template)
+# ---------------------------------------------------------------------------
+
+_DNS_SERVER_IPV4   = "144.202.77.105"
+_DNS_SERVER_IPV6   = "2001:19f0:6401:8c8:5400:5ff:fe9a:967d"
+_DNS_NS_PRIMARY    = "wh1.zonkhost.net."
+_DNS_NS_SECONDARY  = "ns2.zonkhost.net."
+_DNS_SOA_ADMIN     = "admin.zonkhost.net."
+_DKIM_KEY_FILE     = "/etc/dkim.key"
+_DKIM_DOMAINS_FILE = "/etc/dkim-domains.txt"
+_NAMED_CONF_LOCAL  = "/etc/bind/named.conf.local"
+_DNSSEC_KEY_DIR    = Path("/etc/bind/dnssec")
+# Slave nameservers notified on zone change and permitted to AXFR
+_DNS_SLAVES_V4     = ["45.76.238.211", "137.220.49.108"]
+_DNS_SLAVES_V6     = [
+    "2001:19f0:6401:19bf:5400:5ff:fea5:70ed",
+    "2001:19f0:6401:131d:5400:5ff:fea5:a076",
+]
+
 # Regex: <name> [<ttl>] IN <type> <value>  (handles both absolute and relative names)
 _ZONE_RECORD_RE = re.compile(
     r"^(\S+)\s+"          # name
@@ -1667,3 +1687,415 @@ async def domain_dns_update(domain: str, body: DnsUpdateRequest, _: str = Depend
     new_content = _increment_serial("".join(new_lines))
     _write_zone(domain, new_content)
     return {"ok": True, "detail": "Record updated and zone reloaded"}
+
+
+# ---------------------------------------------------------------------------
+# DNS Setup — Virtualmin-style zone initialization + DKIM/DMARC/DNSSEC
+# ---------------------------------------------------------------------------
+
+class DnsSetupRequest(BaseModel):
+    server_ip:    str  = _DNS_SERVER_IPV4
+    server_ipv6:  str  = _DNS_SERVER_IPV6
+    dkim:         bool = True
+    dmarc:        bool = True
+    dmarc_policy: str  = "none"   # none | quarantine | reject
+    spf:          bool = True
+    caa:          bool = True
+    autoconfig:   bool = True
+    register_dkim: bool = True
+    create_zone:  bool = True
+
+
+class DnsSignRequest(BaseModel):
+    algorithm: str = "ECDSAP256SHA256"
+
+
+def _zone_file_exists(domain: str) -> bool:
+    r = subprocess.run(["sudo", "stat", str(_zone_file(domain))],
+                       capture_output=True, timeout=5)
+    return r.returncode == 0
+
+
+def _domain_in_named_conf(domain: str) -> bool:
+    content = _run_out(["sudo", "cat", _NAMED_CONF_LOCAL], timeout=5)
+    return bool(re.search(rf'zone\s+"{re.escape(domain)}"', content))
+
+
+def _domain_in_dkim_list(domain: str) -> bool:
+    content = _run_out(["sudo", "cat", _DKIM_DOMAINS_FILE], timeout=5)
+    return domain in content.splitlines()
+
+
+def _dkim_selector() -> str:
+    conf = _run_out(["sudo", "cat", "/etc/opendkim.conf"], timeout=5)
+    m = re.search(r'^\s*Selector\s+(\S+)', conf, re.MULTILINE)
+    return m.group(1) if m else "default"
+
+
+def _dkim_pubkey() -> str:
+    """Extract the base64-encoded SubjectPublicKeyInfo from the server DKIM key."""
+    r = subprocess.run(
+        ["sudo", "bash", "-c", f"openssl rsa -in {_DKIM_KEY_FILE} -pubout 2>/dev/null"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if r.returncode != 0:
+        return ""
+    return "".join(
+        line for line in r.stdout.splitlines()
+        if not line.startswith("-----")
+    )
+
+
+def _dkim_txt_value(pubkey: str) -> str:
+    """Format a DKIM public key as a BIND multi-string TXT value (250-char chunks)."""
+    full = f"v=DKIM1; k=rsa; t=s; p={pubkey}"
+    chunks = [full[i:i + 250] for i in range(0, len(full), 250)]
+    return "( " + " ".join(f'"{c}"' for c in chunks) + " )"
+
+
+def _named_conf_zone_stanza(domain: str) -> str:
+    notify_block = "\n".join(f"\t\t{ip};" for ip in _DNS_SLAVES_V4)
+    transfer_ips = ["127.0.0.1", "localnets"] + _DNS_SLAVES_V4 + _DNS_SLAVES_V6 + ["trusted"]
+    transfer_block = "\n".join(f"\t\t{ip};" for ip in transfer_ips)
+    return (
+        f'zone "{domain}" {{\n'
+        f'\ttype master;\n'
+        f'\tfile "/var/lib/bind/{domain}.hosts";\n'
+        f'\talso-notify {{\n{notify_block}\n\t\t}};\n'
+        f'\tnotify yes;\n'
+        f'\tallow-transfer {{\n{transfer_block}\n\t\t}};\n'
+        f'\t}};\n'
+    )
+
+
+def _generate_zone_content(domain: str, opts: DnsSetupRequest) -> str:
+    """Build a complete zone file from the standard template."""
+    serial = datetime.now().strftime("%Y%m%d") + "01"
+    d = domain + "."
+    ip4, ip6 = opts.server_ip, opts.server_ipv6
+
+    lines: list[str] = [
+        "$ttl 3600",
+        f"{d}\tIN\tSOA\t{_DNS_NS_PRIMARY} {_DNS_SOA_ADMIN} (",
+        f"\t\t\t{serial} ; serial",
+        "\t\t\t3600",
+        "\t\t\t600",
+        "\t\t\t1209600",
+        "\t\t\t3600 )",
+        f"{d}\tIN\tNS\t{_DNS_NS_PRIMARY}",
+        f"@\tIN\tNS\t{_DNS_NS_SECONDARY}",
+        f"{d}\tIN\tA\t{ip4}",
+        f"www.{d}\tIN\tA\t{ip4}",
+        f"ftp.{d}\tIN\tA\t{ip4}",
+        f"localhost.{d}\tIN\tA\t127.0.0.1",
+        f"mail.{d}\tIN\tA\t{ip4}",
+        f"{d}\tIN\tMX\t10 mail.{d}",
+    ]
+    if ip6:
+        lines += [
+            f"{d}\tIN\tAAAA\t{ip6}",
+            f"www.{d}\tIN\tAAAA\t{ip6}",
+            f"ftp.{d}\tIN\tAAAA\t{ip6}",
+            f"mail.{d}\tIN\tAAAA\t{ip6}",
+        ]
+    if opts.autoconfig:
+        lines += [f"autoconfig.{d}\tIN\tA\t{ip4}", f"autodiscover.{d}\tIN\tA\t{ip4}"]
+        if ip6:
+            lines += [f"autoconfig.{d}\tIN\tAAAA\t{ip6}", f"autodiscover.{d}\tIN\tAAAA\t{ip6}"]
+    if opts.spf:
+        spf = f"v=spf1 a mx ip4:{ip4}"
+        if ip6:
+            spf += f" ip6:{ip6}"
+        spf += " ~all"
+        lines.append(f'{d}\tIN\tTXT\t"{spf}"')
+    if opts.dmarc:
+        p = opts.dmarc_policy or "none"
+        lines.append(
+            f'_dmarc.{d}\tIN\tTXT\t"v=DMARC1; p={p}; pct=100;'
+            f' ruf=mailto:postmaster@{domain}; rua=mailto:postmaster@{domain}"'
+        )
+    if opts.dkim:
+        sel = _dkim_selector()
+        pub = _dkim_pubkey()
+        if pub:
+            lines.append(f"{sel}._domainkey.{d}\tIN\tTXT\t{_dkim_txt_value(pub)}")
+    if opts.caa:
+        lines.append(f'{d}\tIN\tCAA\t0 issue "letsencrypt.org"')
+    return "\n".join(lines) + "\n"
+
+
+@router.get("/domains/{domain}/dns/setup-status")
+async def dns_setup_status(domain: str, _: str = Depends(require_super_admin)) -> dict:
+    """Return a checklist of standard DNS records present for the domain."""
+    sel = _dkim_selector()
+    status: dict[str, bool | str] = {
+        "zone_exists":       False,
+        "in_named_conf":     _domain_in_named_conf(domain),
+        "a_record":          False,
+        "aaaa_record":       False,
+        "mx_record":         False,
+        "spf_record":        False,
+        "dkim_record":       False,
+        "dmarc_record":      False,
+        "dkim_registered":   _domain_in_dkim_list(domain),
+        "dnssec_signed":     False,
+        "caa_record":        False,
+        "autoconfig_record": False,
+        "dkim_selector":     sel,
+        "server_ip":         _DNS_SERVER_IPV4,
+        "server_ipv6":       _DNS_SERVER_IPV6,
+    }
+
+    if not _zone_file_exists(domain):
+        return {"domain": domain, "status": status}
+
+    status["zone_exists"] = True
+    try:
+        content = _read_zone_raw(domain)
+    except HTTPException:
+        return {"domain": domain, "status": status}
+
+    records = _parse_zone(content)
+    rtypes   = {r["type"] for r in records}
+    txt_vals = [r["value"].lower() for r in records if r["type"] == "TXT"]
+
+    status["a_record"]    = "A"    in rtypes
+    status["aaaa_record"] = "AAAA" in rtypes
+    status["mx_record"]   = "MX"   in rtypes
+    status["caa_record"]  = "CAA"  in rtypes
+    status["spf_record"]  = any("v=spf1"   in v for v in txt_vals)
+    status["dmarc_record"] = any("v=dmarc1" in v for v in txt_vals)
+    status["dkim_record"]  = any("v=dkim1"  in v for v in txt_vals)
+    status["dnssec_signed"] = "RRSIG" in rtypes or "DNSKEY" in rtypes
+    status["autoconfig_record"] = any(
+        "autoconfig." in r["name"] or "autodiscover." in r["name"]
+        for r in records
+    )
+    return {"domain": domain, "status": status}
+
+
+@router.post("/domains/{domain}/dns/setup")
+async def dns_setup(
+    domain: str,
+    body: DnsSetupRequest,
+    _: str = Depends(require_super_admin),
+) -> dict:
+    """
+    Initialize or augment a zone with the standard Virtualmin-equivalent record set:
+    A/AAAA, MX, SPF, DKIM, DMARC, CAA, autoconfig.  Creates the zone file (and
+    named.conf stanza) when create_zone=True and none exists yet.
+    """
+    import asyncio
+
+    def _run_setup() -> dict:
+        steps: list[str] = []
+        warnings: list[str] = []
+        zone_exists = _zone_file_exists(domain)
+
+        # ── 1. Create zone + register in named.conf ────────────────────────
+        if not zone_exists:
+            if not body.create_zone:
+                raise HTTPException(400, "Zone file not found and create_zone is False.")
+
+            if not _domain_in_named_conf(domain):
+                conf = _run_out(["sudo", "cat", _NAMED_CONF_LOCAL], timeout=5)
+                new_conf = conf.rstrip("\n") + "\n" + _named_conf_zone_stanza(domain) + "\n"
+                proc = subprocess.run(
+                    ["sudo", "tee", _NAMED_CONF_LOCAL],
+                    input=new_conf.encode(), capture_output=True, timeout=10,
+                )
+                if proc.returncode != 0:
+                    raise HTTPException(500, f"Failed to update named.conf.local: {proc.stderr.decode()}")
+                check = _run_out(["sudo", "named-checkconf"], timeout=10)
+                if check.strip():
+                    raise HTTPException(500, f"named-checkconf error: {check}")
+                _run_out(["sudo", "rndc", "reconfig"], timeout=10)
+                steps.append("Registered zone in named.conf.local")
+
+            content = _generate_zone_content(domain, body)
+            _write_zone(domain, content)
+            steps.append("Created zone file with standard records")
+
+        else:
+            # ── 2. Augment existing zone ───────────────────────────────────
+            content = _read_zone_raw(domain)
+            records  = _parse_zone(content)
+            rtypes   = {r["type"] for r in records}
+            txt_vals = [r["value"].lower() for r in records if r["type"] == "TXT"]
+            additions: list[str] = []
+            d, ip4, ip6 = domain + ".", body.server_ip, body.server_ipv6
+
+            if "A" not in rtypes:
+                additions.append(f"{d}\tIN\tA\t{ip4}")
+                steps.append("Added A record")
+            if "AAAA" not in rtypes and ip6:
+                additions.append(f"{d}\tIN\tAAAA\t{ip6}")
+                steps.append("Added AAAA record")
+            if "MX" not in rtypes:
+                additions += [f"mail.{d}\tIN\tA\t{ip4}", f"{d}\tIN\tMX\t10 mail.{d}"]
+                if ip6:
+                    additions.append(f"mail.{d}\tIN\tAAAA\t{ip6}")
+                steps.append("Added mail A and MX records")
+            if body.spf and not any("v=spf1" in v for v in txt_vals):
+                spf = f"v=spf1 a mx ip4:{ip4}" + (f" ip6:{ip6}" if ip6 else "") + " ~all"
+                additions.append(f'{d}\tIN\tTXT\t"{spf}"')
+                steps.append("Added SPF record")
+            if body.dmarc and not any("v=dmarc1" in v for v in txt_vals):
+                p = body.dmarc_policy or "none"
+                additions.append(
+                    f'_dmarc.{d}\tIN\tTXT\t"v=DMARC1; p={p}; pct=100;'
+                    f' ruf=mailto:postmaster@{domain}; rua=mailto:postmaster@{domain}"'
+                )
+                steps.append(f"Added DMARC record (policy: {p})")
+            if body.dkim and not any("v=dkim1" in v for v in txt_vals):
+                sel, pub = _dkim_selector(), _dkim_pubkey()
+                if pub:
+                    additions.append(f"{sel}._domainkey.{d}\tIN\tTXT\t{_dkim_txt_value(pub)}")
+                    steps.append(f"Added DKIM TXT record (selector: {sel})")
+                else:
+                    warnings.append("Could not extract DKIM public key — DKIM record skipped.")
+            if body.caa and "CAA" not in rtypes:
+                additions.append(f'{d}\tIN\tCAA\t0 issue "letsencrypt.org"')
+                steps.append("Added CAA record (Let's Encrypt)")
+            if body.autoconfig:
+                has_ac = any("autoconfig." in r["name"] or "autodiscover." in r["name"] for r in records)
+                if not has_ac:
+                    additions += [f"autoconfig.{d}\tIN\tA\t{ip4}", f"autodiscover.{d}\tIN\tA\t{ip4}"]
+                    if ip6:
+                        additions += [f"autoconfig.{d}\tIN\tAAAA\t{ip6}", f"autodiscover.{d}\tIN\tAAAA\t{ip6}"]
+                    steps.append("Added autoconfig/autodiscover records")
+
+            if additions:
+                new_content = _increment_serial(content.rstrip("\n") + "\n" + "\n".join(additions) + "\n")
+                _write_zone(domain, new_content)
+            elif not steps:
+                warnings.append("All standard records already present; nothing added.")
+
+        # ── 3. Register with OpenDKIM ──────────────────────────────────────
+        if body.dkim and body.register_dkim:
+            if not _domain_in_dkim_list(domain):
+                dkim_list = _run_out(["sudo", "cat", _DKIM_DOMAINS_FILE], timeout=5)
+                new_list = dkim_list.rstrip("\n") + f"\n{domain}\n"
+                proc = subprocess.run(
+                    ["sudo", "tee", _DKIM_DOMAINS_FILE],
+                    input=new_list.encode(), capture_output=True, timeout=10,
+                )
+                if proc.returncode == 0:
+                    _run_out(["sudo", "systemctl", "reload", "opendkim"], timeout=10)
+                    steps.append("Registered domain in OpenDKIM and reloaded service")
+                else:
+                    warnings.append("Could not update dkim-domains.txt — check file permissions.")
+            else:
+                steps.append("Domain already registered in OpenDKIM")
+
+        return {"ok": True, "domain": domain, "steps": steps, "warnings": warnings}
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _run_setup)
+
+
+@router.post("/domains/{domain}/dns/sign-dnssec")
+async def dns_sign_dnssec(
+    domain: str,
+    body: DnsSignRequest = DnsSignRequest(),
+    _: str = Depends(require_super_admin),
+) -> dict:
+    """
+    Generate DNSSEC keys (KSK + ZSK) for the zone, sign it, and return the DS
+    records for submission to the domain registrar.
+    Keys are stored in /etc/bind/dnssec/{domain}/ and reused on re-signing.
+    """
+    import asyncio
+    import secrets
+
+    def _do() -> dict:
+        steps: list[str] = []
+        key_dir = _DNSSEC_KEY_DIR / domain
+        zone_path = str(_zone_file(domain))
+
+        # ── 1. Ensure key directory ────────────────────────────────────────
+        subprocess.run(["sudo", "mkdir", "-p", str(key_dir)], capture_output=True, timeout=10)
+
+        # ── 2. Generate keys if not already present ────────────────────────
+        existing = _run_out(["sudo", "find", str(key_dir), "-name", f"K{domain}.+*.key"], timeout=5)
+        if not existing.strip():
+            alg = body.algorithm
+            ksk = subprocess.run(
+                ["sudo", "bash", "-c",
+                 f'cd "{key_dir}" && dnssec-keygen -a {alg} -f KSK -n ZONE "{domain}"'],
+                capture_output=True, text=True, timeout=60,
+            )
+            if ksk.returncode != 0:
+                raise HTTPException(500, f"KSK generation failed: {ksk.stderr.strip()}")
+            steps.append(f"Generated KSK: {ksk.stdout.strip()}")
+
+            zsk = subprocess.run(
+                ["sudo", "bash", "-c",
+                 f'cd "{key_dir}" && dnssec-keygen -a {alg} -n ZONE "{domain}"'],
+                capture_output=True, text=True, timeout=60,
+            )
+            if zsk.returncode != 0:
+                raise HTTPException(500, f"ZSK generation failed: {zsk.stderr.strip()}")
+            steps.append(f"Generated ZSK: {zsk.stdout.strip()}")
+        else:
+            steps.append("Reusing existing DNSSEC keys")
+
+        # ── 3. Sign the zone ───────────────────────────────────────────────
+        salt = secrets.token_hex(8)
+        signed_path = zone_path + ".signed"
+        sign = subprocess.run(
+            ["sudo", "bash", "-c",
+             f'dnssec-signzone -A -3 {salt} -N INCREMENT -o "{domain}" -t'
+             f' -K "{key_dir}" -f "{signed_path}" "{zone_path}"'],
+            capture_output=True, text=True, cwd=str(ZONE_DIR), timeout=120,
+        )
+        if sign.returncode != 0:
+            raise HTTPException(500, f"dnssec-signzone failed: {sign.stderr.strip()}")
+        steps.append("Zone signed successfully")
+
+        # ── 4. Replace zone file with signed version ───────────────────────
+        mv = subprocess.run(
+            ["sudo", "mv", signed_path, zone_path],
+            capture_output=True, timeout=10,
+        )
+        if mv.returncode != 0:
+            raise HTTPException(500, f"Could not install signed zone: {mv.stderr.decode().strip()}")
+        steps.append("Installed signed zone file")
+
+        _run_out(["sudo", "rndc", "reload", domain], timeout=10)
+        steps.append("Reloaded BIND")
+
+        # ── 5. Extract DS records for registrar ───────────────────────────
+        ksk_keys = _run_out(
+            ["sudo", "find", str(key_dir), "-name", f"K{domain}.+*.key"],
+            timeout=5,
+        ).strip().splitlines()
+        ds_records: list[str] = []
+        for kf in ksk_keys:
+            kf = kf.strip()
+            if not kf:
+                continue
+            # Only KSK files produce DS records
+            key_content = _run_out(["sudo", "cat", kf], timeout=5)
+            if "KSK" not in key_content and "257" not in key_content:
+                continue
+            out = subprocess.run(
+                ["sudo", "bash", "-c", f'dnssec-dsfromkey "{kf}"'],
+                capture_output=True, text=True, timeout=10,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                ds_records.append(out.stdout.strip())
+
+        return {
+            "ok": True,
+            "domain": domain,
+            "steps": steps,
+            "ds_records": ds_records,
+            "note": (
+                "Submit these DS record(s) to your domain registrar to enable DNSSEC delegation. "
+                "Each registrar's control panel has a 'DS Records' or 'DNSSEC' section."
+            ),
+        }
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _do)
