@@ -40,6 +40,7 @@ from .routes_wordpress import router as wordpress_router
 from .routes_spamassassin import router as spamassassin_router
 from .routes_mail import router as mail_router
 from .routes_mailjet import router as mailjet_router
+from .routes_dns_checker import router as dns_checker_router
 
 # All control center routes under /api/v1/cc/
 api_router = APIRouter(prefix="/api/v1/cc")
@@ -110,6 +111,8 @@ api_router.include_router(spamassassin_router)
 api_router.include_router(mail_router)
 # Mailjet — account status, statistics, senders, test send
 api_router.include_router(mailjet_router)
+# DNS Propagation Checker — 25-resolver parallel global DNS check
+api_router.include_router(dns_checker_router)
 
 # Public edge registration (no JWT — separate prefix /api/v1/edge/)
 # This is mounted directly on the FastAPI app in main.py
