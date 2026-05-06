@@ -36,11 +36,8 @@ from .routes_recovery import router as recovery_router
 from .routes_dev_reports import router as dev_reports_router
 from .routes_analytics import router as analytics_router
 from .routes_bing import router as bing_router
-from .routes_wordpress import router as wordpress_router
-from .routes_spamassassin import router as spamassassin_router
-from .routes_mail import router as mail_router
-from .routes_mailjet import router as mailjet_router
-from .routes_dns_checker import router as dns_checker_router
+from .routes_vultr import router as vultr_router
+from .routes_autoupdate import router as autoupdate_router
 
 # All control center routes under /api/v1/cc/
 api_router = APIRouter(prefix="/api/v1/cc")
@@ -103,16 +100,10 @@ api_router.include_router(dev_reports_router)
 api_router.include_router(analytics_router)
 # WebOps Analytics — Microsoft Bing Webmaster Tools via API key
 api_router.include_router(bing_router)
-# ServOps Tools — WordPress monitor (WP-CLI based, server-local installs)
-api_router.include_router(wordpress_router)
-# ServOps Tools — SpamAssassin service control and configuration
-api_router.include_router(spamassassin_router)
-# ServOps — Mail infrastructure autodiscover (Postfix + Dovecot)
-api_router.include_router(mail_router)
-# Mailjet — account status, statistics, senders, test send
-api_router.include_router(mailjet_router)
-# DNS Propagation Checker — 25-resolver parallel global DNS check
-api_router.include_router(dns_checker_router)
+# ServOps — Vultr cloud storage management (object storage + block volumes)
+api_router.include_router(vultr_router)
+# Auto-update engine — FrothIQ plugin and MC3 service deployment
+api_router.include_router(autoupdate_router)
 
 # Public edge registration (no JWT — separate prefix /api/v1/edge/)
 # This is mounted directly on the FastAPI app in main.py
