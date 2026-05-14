@@ -38,6 +38,17 @@ from .routes_analytics import router as analytics_router
 from .routes_bing import router as bing_router
 from .routes_vultr import router as vultr_router
 from .routes_autoupdate import router as autoupdate_router
+from .routes_mail_aliases import router as mail_aliases_router
+from .routes_mail_quotas import router as mail_quotas_router
+from .routes_apache_logs import router as apache_logs_router
+from .routes_clamav import router as clamav_router
+from .routes_disk_quotas import router as disk_quotas_router
+from .routes_fail2ban import router as fail2ban_router
+from .routes_bandwidth import router as bandwidth_router
+from .routes_logrotate import router as logrotate_router
+from .routes_packages import router as packages_router
+from .routes_rbl import router as rbl_router
+from .routes_wp_seo import router as wp_seo_router
 
 # All control center routes under /api/v1/cc/
 api_router = APIRouter(prefix="/api/v1/cc")
@@ -104,6 +115,28 @@ api_router.include_router(bing_router)
 api_router.include_router(vultr_router)
 # Auto-update engine — FrothIQ plugin and MC3 service deployment
 api_router.include_router(autoupdate_router)
+# Mail Alias & Forwarding Manager — Virtualmin alias CRUD
+api_router.include_router(mail_aliases_router)
+# Mail Quota Manager — per-mailbox disk quota read/write
+api_router.include_router(mail_quotas_router)
+# Per-Domain Apache Log Viewer
+api_router.include_router(apache_logs_router)
+# ClamAV Virus Scanner Management
+api_router.include_router(clamav_router)
+# Per-User & Per-Group Disk Quota Management
+api_router.include_router(disk_quotas_router)
+# Fail2ban Configuration & Jail Manager
+api_router.include_router(fail2ban_router)
+# Bandwidth Monitoring per Network Interface
+api_router.include_router(bandwidth_router)
+# Logrotate Rule Editor
+api_router.include_router(logrotate_router)
+# Package Manager — apt install/remove/search
+api_router.include_router(packages_router)
+# RBL / DNSBL — IP blacklist reputation checks
+api_router.include_router(rbl_router)
+# WordPress SEO & Plugin Compliance — WP-CLI based
+api_router.include_router(wp_seo_router)
 
 # Public edge registration (no JWT — separate prefix /api/v1/edge/)
 # This is mounted directly on the FastAPI app in main.py
