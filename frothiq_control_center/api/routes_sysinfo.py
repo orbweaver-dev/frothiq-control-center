@@ -823,10 +823,13 @@ async def delete_cron_entry(body: CronDeleteRequest, _: str = Depends(require_su
 async def get_log_files(_: str = Depends(require_super_admin)) -> dict:
     files = []
     for path_str in LOG_FILES:
-        p = Path(path_str)
-        if p.exists() and p.is_file():
-            stat = p.stat()
-            files.append({"path": path_str, "size_kb": round(stat.st_size / 1024, 1), "modified": datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat()})
+        try:
+            p = Path(path_str)
+            if p.exists() and p.is_file():
+                stat = p.stat()
+                files.append({"path": path_str, "size_kb": round(stat.st_size / 1024, 1), "modified": datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat()})
+        except (PermissionError, OSError):
+            continue
     return {"files": files}
 
 
