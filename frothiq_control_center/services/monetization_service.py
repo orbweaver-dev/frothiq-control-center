@@ -39,6 +39,7 @@ async def get_monetization_overview() -> dict[str, Any]:
         pass
 
     # Fallback: assemble from core tenant list — core provides all fields
+    tenants_data: dict[str, Any] = {}
     try:
         tenants_data = await core_client.get("/api/v2/internal/tenants")
         tenants = tenants_data.get("tenants", [])
