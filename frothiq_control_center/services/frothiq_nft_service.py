@@ -8,10 +8,12 @@ All system changes go through this service layer — never direct rule editing.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
 import re
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -330,13 +332,132 @@ def _validate_ip_or_cidr(raw: str) -> str | None:
     Returns the normalized string, or None if invalid.
     Both whitelist and blacklist sets have 'flags interval', so CIDR is supported.
     """
-    import ipaddress
     raw = raw.strip()
     try:
         net = ipaddress.ip_network(raw, strict=False)
         return str(net) if net.prefixlen < 32 else str(net.network_address)
     except ValueError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Boot-time persistence file (loaded by frothiq-nft.service)
+#
+# `nft add element` only updates the live kernel set — a service restart
+# re-loads the static file and wipes anything added since the file was last
+# edited. _sync_nft_file() rewrites the `elements = { ... }` blocks from the
+# FrothiqIPEntry table so adds/removes survive frothiq-nft.service restart.
+#
+# Deployment prerequisite: the file must be group-writable by `frothiq`:
+#   sudo chgrp frothiq /etc/nftables.d/frothiq.nft && sudo chmod 664 ...
+# ---------------------------------------------------------------------------
+
+NFT_PERSIST_FILE = "/etc/nftables.d/frothiq.nft"
+
+_SET_ELEMENTS_RE_TEMPLATE = r"(set\s+{name}\s*\{{[\s\S]*?elements\s*=\s*\{{)([^}}]*)(\}})"
+
+
+def _format_nft_elements(ips: list[str], indent: str = "\t\t\t     ") -> str:
+    """Render IPs as the inside of an nft `elements = { ... }` block.
+    Sorted for deterministic output, wrapped to ~75 cols for readability."""
+    if not ips:
+        return " "
+    lines: list[str] = []
+    current = indent
+    for ip in sorted(set(ips)):
+        addition = ip + ", "
+        if current != indent and len(current) + len(addition) > 75:
+            lines.append(current.rstrip())
+            current = indent + addition
+        else:
+            current += addition
+    if current.strip():
+        lines.append(current.rstrip().rstrip(","))
+    return "\n" + "\n".join(lines) + " "
+
+
+async def _sync_nft_file(session: AsyncSession) -> tuple[bool, str]:
+    """Regenerate the `elements = { ... }` blocks in NFT_PERSIST_FILE from
+    the FrothiqIPEntry table.
+
+    Preserves all other file content (sets, chains, rules, comments).
+    Atomic: writes to a temp file in the same directory, validates via
+    `nft -c -f`, then renames. Never raises — logs warnings and returns
+    (success, message) so add/remove handlers can report status without
+    failing the user-visible op.
+    """
+    rows = list(await session.scalars(select(FrothiqIPEntry)))
+    buckets: dict[str, list[str]] = {
+        "whitelist":  [], "whitelist6":  [],
+        "blacklist":  [], "blacklist6":  [],
+    }
+    for r in rows:
+        try:
+            net = ipaddress.ip_network(r.ip, strict=False)
+        except ValueError:
+            logger.warning("_sync_nft_file skipping invalid IP %r", r.ip)
+            continue
+        suffix = "6" if net.version == 6 else ""
+        key = r.list_type + suffix
+        if key in buckets:
+            buckets[key].append(r.ip)
+
+    try:
+        original = open(NFT_PERSIST_FILE).read()
+    except OSError as exc:
+        logger.warning("_sync_nft_file read failed: %s", exc)
+        return False, f"read failed: {exc}"
+
+    new_content = original
+    for set_name, ips in buckets.items():
+        pattern = re.compile(
+            _SET_ELEMENTS_RE_TEMPLATE.format(name=re.escape(set_name)),
+            flags=re.S,
+        )
+        m = pattern.search(new_content)
+        if not m:
+            # Set not defined in the file (e.g. blacklist6 absent) — skip silently
+            continue
+        if not ips:
+            # Empty bucket would yield invalid 'elements = { }' nft syntax.
+            # Skip rewriting this set; live nft already reflects the empty
+            # state via the per-element delete that preceded this sync.
+            # Operator can manually clear the set in the .nft file if desired.
+            logger.info(
+                "_sync_nft_file: %s bucket empty — leaving existing elements untouched",
+                set_name,
+            )
+            continue
+        new_content = (
+            new_content[: m.start(2)]
+            + _format_nft_elements(ips)
+            + new_content[m.end(2) :]
+        )
+
+    if new_content == original:
+        return True, "no changes needed"
+
+    nft_dir = os.path.dirname(NFT_PERSIST_FILE)
+    fd, tmp_path = tempfile.mkstemp(prefix=".frothiq.nft.tmp.", dir=nft_dir)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(new_content)
+        # Validate the new file before swapping (nft needs no sudo with CAP_NET_ADMIN)
+        rc, _, err = await _run(["/usr/sbin/nft", "-c", "-f", tmp_path], sudo=False)
+        if rc != 0:
+            os.unlink(tmp_path)
+            logger.error("_sync_nft_file validation failed: %s", err.strip())
+            return False, f"nft -c rejected new file: {err.strip()}"
+        os.chmod(tmp_path, 0o664)
+        os.rename(tmp_path, NFT_PERSIST_FILE)
+        return True, "synced"
+    except Exception as exc:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        logger.error("_sync_nft_file write failed: %s", exc)
+        return False, f"write failed: {exc}"
 
 
 async def add_ip_entry(
@@ -372,11 +493,21 @@ async def add_ip_entry(
     if rc != 0:
         logger.warning("nft add element %s %s failed: %s", list_type, normalized, nft_err.strip())
 
+    # Mirror to /etc/nftables.d/frothiq.nft so the IP survives service restart
+    file_ok, file_msg = await _sync_nft_file(session)
+    if not file_ok:
+        logger.warning("_sync_nft_file after ADD %s: %s", normalized, file_msg)
+
     await _audit(
         session, user_email, f"ADD_IP_{list_type.upper()}", "ip_list",
-        f"{normalized} — {label} (nft_rc={rc})", ip_address,
+        f"{normalized} — {label} (nft_rc={rc}, file_sync={file_ok})", ip_address,
     )
-    return {"success": True, "id": entry.id, "nft_applied": rc == 0}
+    return {
+        "success": True,
+        "id": entry.id,
+        "nft_applied": rc == 0,
+        "file_synced": file_ok,
+    }
 
 
 async def remove_ip_entry(
@@ -398,8 +529,17 @@ async def remove_ip_entry(
 
     await session.delete(row)
     await session.commit()
-    await _audit(session, user_email, "REMOVE_IP", "ip_list", f"{detail} (nft_rc={rc})", ip_address)
-    return {"success": True, "nft_applied": rc == 0}
+
+    # Mirror to /etc/nftables.d/frothiq.nft so the removal survives service restart
+    file_ok, file_msg = await _sync_nft_file(session)
+    if not file_ok:
+        logger.warning("_sync_nft_file after REMOVE %s: %s", row.ip, file_msg)
+
+    await _audit(
+        session, user_email, "REMOVE_IP", "ip_list",
+        f"{detail} (nft_rc={rc}, file_sync={file_ok})", ip_address,
+    )
+    return {"success": True, "nft_applied": rc == 0, "file_synced": file_ok}
 
 
 # ---------------------------------------------------------------------------
