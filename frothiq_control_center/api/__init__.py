@@ -51,6 +51,7 @@ from .routes_logrotate import router as logrotate_router
 from .routes_packages import router as packages_router
 from .routes_rbl import router as rbl_router
 from .routes_wp_seo import router as wp_seo_router
+from .routes_teleops import router as teleops_router
 
 # All control center routes under /api/v1/cc/
 api_router = APIRouter(prefix="/api/v1/cc")
@@ -141,6 +142,8 @@ api_router.include_router(packages_router)
 api_router.include_router(rbl_router)
 # WordPress SEO & Plugin Compliance — WP-CLI based
 api_router.include_router(wp_seo_router)
+# TeleOps — multi-tenant telephony console (Phase A skeleton; CRUD in A.3/A.4)
+api_router.include_router(teleops_router)
 
 # Public edge registration (no JWT — separate prefix /api/v1/edge/)
 # This is mounted directly on the FastAPI app in main.py
