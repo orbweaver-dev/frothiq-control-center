@@ -593,7 +593,7 @@ async def update_common_config(req: ConfigUpdate, _: str = Depends(require_super
 async def send_test_email(site: str, to: str, _: str = Depends(require_super_admin)) -> dict:
     out, err, rc = _bench(
         ["--site", site, "execute", "frappe.sendmail",
-         "--kwargs", f'{{"recipients": ["{to}"], "subject": "FrothIQ Test Email", "message": "Test from FrothIQ Control Center", "delayed": false}}'],
+         "--kwargs", f'{{"recipients": ["{to}"], "subject": "FrothIQ Test Email", "message": "Test from OrbWeaver MC³", "delayed": false}}'],
         timeout=30,
     )
     return {"site": site, "to": to, "ok": rc == 0, "output": (out + err).strip()}

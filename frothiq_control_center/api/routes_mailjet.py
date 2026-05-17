@@ -53,8 +53,8 @@ async def _get(path: str, params: dict | None = None) -> dict:
 class TestSendRequest(BaseModel):
     to_email: EmailStr
     to_name: str = ""
-    subject: str = "FrothIQ Control Center — Test Message"
-    text: str = "This is a test message sent from the FrothIQ Control Center Mailjet integration."
+    subject: str = "OrbWeaver MC³ — Test Message"
+    text: str = "This is a test message sent from the OrbWeaver MC³ Mailjet integration."
 
 
 # ---------------------------------------------------------------------------

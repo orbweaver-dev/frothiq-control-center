@@ -1,5 +1,5 @@
 """
-FrothIQ Control Center — configuration
+OrbWeaver MC³ — configuration
 
 All settings are loaded from environment variables (and optionally a .env file).
 Secrets are never hard-coded; the defaults here are development-safe only.
@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     # -----------------------------------------------------------------
     # Application
     # -----------------------------------------------------------------
-    app_name: str = "FrothIQ Control Center"
+    app_name: str = "OrbWeaver MC³"
     app_version: str = "1.0.0"
     environment: Literal["development", "staging", "production"] = "development"
     debug: bool = False
