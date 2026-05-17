@@ -11,12 +11,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from frothiq_control_center.auth import create_access_token, create_refresh_token
-from frothiq_control_center.websocket.connection_manager import (
+from mc3.auth import create_access_token, create_refresh_token
+from mc3.websocket.connection_manager import (
     ConnectedClient,
     ConnectionManager,
 )
-from frothiq_control_center.websocket.event_dispatcher import (
+from mc3.websocket.event_dispatcher import (
     CHANNEL_ROLE_MAP,
     publish_event,
     _handle_message,
@@ -167,7 +167,7 @@ class TestEventDispatcher:
             "data": json.dumps({"cluster_id": "cluster-1", "severity": "high"}).encode(),
         }
         with patch(
-            "frothiq_control_center.websocket.event_dispatcher.connection_manager"
+            "mc3.websocket.event_dispatcher.connection_manager"
         ) as mock_manager:
             mock_manager.broadcast = AsyncMock(return_value=1)
             await _handle_message(msg)
@@ -181,7 +181,7 @@ class TestEventDispatcher:
     async def test_handle_non_message_type_skipped(self):
         msg = {"type": "subscribe", "channel": b"frothiq:cc:TEST", "data": None}
         with patch(
-            "frothiq_control_center.websocket.event_dispatcher.connection_manager"
+            "mc3.websocket.event_dispatcher.connection_manager"
         ) as mock_manager:
             mock_manager.broadcast = AsyncMock()
             await _handle_message(msg)
@@ -195,7 +195,7 @@ class TestEventDispatcher:
             "data": b"not valid json",
         }
         with patch(
-            "frothiq_control_center.websocket.event_dispatcher.connection_manager"
+            "mc3.websocket.event_dispatcher.connection_manager"
         ) as mock_manager:
             mock_manager.broadcast = AsyncMock(return_value=0)
             # Should not raise
@@ -216,7 +216,7 @@ class TestEventDispatcher:
         redis = AsyncMock()
         redis.publish = AsyncMock(side_effect=Exception("Redis error"))
         with patch(
-            "frothiq_control_center.websocket.event_dispatcher.connection_manager"
+            "mc3.websocket.event_dispatcher.connection_manager"
         ) as mock_manager:
             mock_manager.broadcast = AsyncMock(return_value=0)
             await publish_event(redis, "SYSTEM_ALERT", {"msg": "test"})
@@ -270,7 +270,7 @@ class TestWebSocketEndpoint:
     @pytest.mark.asyncio
     async def test_ws_token_validation_uses_access_token(self):
         """Verify that decode_token is called during WS auth."""
-        from frothiq_control_center.auth.jwt_handler import decode_token
+        from mc3.auth.jwt_handler import decode_token
         token = create_access_token("user-1", "super_admin")
         payload = decode_token(token)
         assert payload.type == "access"
@@ -278,7 +278,7 @@ class TestWebSocketEndpoint:
     @pytest.mark.asyncio
     async def test_ws_refresh_token_rejected(self):
         """Refresh tokens must not grant WS access."""
-        from frothiq_control_center.auth.jwt_handler import decode_token
+        from mc3.auth.jwt_handler import decode_token
         token = create_refresh_token("user-1", "super_admin")
         payload = decode_token(token)
         assert payload.type == "refresh"

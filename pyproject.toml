@@ -3,9 +3,9 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.backends.legacy:build"
 
 [project]
-name = "frothiq-control-center"
+name = "mc3-backend"
 version = "1.0.0"
-description = "FrothIQ Control Center — standalone command authority for the FrothIQ security platform"
+description = "OrbWeaver MC² — Master Control Console backend"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
 
@@ -22,5 +22,5 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.coverage.run]
-source = ["frothiq_control_center"]
+source = ["mc3"]
 omit = ["*/tests/*", "*/conftest.py"]

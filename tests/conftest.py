@@ -1,5 +1,5 @@
 """
-Pytest configuration and shared fixtures for FrothIQ Control Center tests.
+Pytest configuration and shared fixtures for OrbWeaver MC² tests.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import pytest_asyncio
 from fastapi.testclient import TestClient
 from httpx import AsyncClient, ASGITransport
 
-from frothiq_control_center.auth import (
+from mc3.auth import (
     create_access_token,
     create_refresh_token,
     hash_password,
@@ -40,7 +40,7 @@ def event_loop():
 @pytest.fixture
 def mock_core_client():
     """Mock CoreClient so tests don't need a live frothiq-core."""
-    with patch("frothiq_control_center.services.core_client.core_client") as mock:
+    with patch("mc3.services.core_client.core_client") as mock:
         mock.get = AsyncMock(return_value={})
         mock.post = AsyncMock(return_value={})
         mock.health_check = AsyncMock(return_value={"status": "online", "version": "0.6.0"})
@@ -150,14 +150,14 @@ def app(mock_db, mock_redis, mock_session_factory):
     os.environ.setdefault("CC_ENVIRONMENT", "development")
     os.environ.setdefault("CC_CORE_SERVICE_API_KEY", "test-service-key")
 
-    from frothiq_control_center.config.settings import get_settings
+    from mc3.config.settings import get_settings
     get_settings.cache_clear()
 
     from fastapi import FastAPI
     from fastapi.middleware.cors import CORSMiddleware
-    from frothiq_control_center.api import api_router
-    from frothiq_control_center.middleware import DBSessionMiddleware, IPAllowlistMiddleware
-    from frothiq_control_center.websocket import ws_router
+    from mc3.api import api_router
+    from mc3.middleware import DBSessionMiddleware, IPAllowlistMiddleware
+    from mc3.websocket import ws_router
 
     test_app = FastAPI()
     test_app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])

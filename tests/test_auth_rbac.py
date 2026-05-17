@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from jose import jwt
 
-from frothiq_control_center.auth.jwt_handler import (
+from mc3.auth.jwt_handler import (
     ROLE_LEVEL,
     Role,
     create_access_token,
@@ -20,8 +20,8 @@ from frothiq_control_center.auth.jwt_handler import (
     decode_token,
     role_at_least,
 )
-from frothiq_control_center.auth.password import hash_password, verify_password
-from frothiq_control_center.config import get_settings
+from mc3.auth.password import hash_password, verify_password
+from mc3.config import get_settings
 
 
 # ---------------------------------------------------------------------------

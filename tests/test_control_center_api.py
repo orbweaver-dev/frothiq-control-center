@@ -105,14 +105,14 @@ class TestDefenseMeshAPI:
 
     @pytest.mark.asyncio
     async def test_cluster_detail_404_from_core(self, client, read_only_headers, mock_core_client):
-        from frothiq_control_center.services.core_client import CoreClientError
+        from mc3.services.core_client import CoreClientError
         mock_core_client.get.side_effect = CoreClientError(404, "Cluster not found")
         resp = await client.get("/api/v1/cc/defense/clusters/nonexistent", headers=read_only_headers)
         assert resp.status_code == 404
 
     @pytest.mark.asyncio
     async def test_core_offline_defense_returns_degraded(self, client, read_only_headers, mock_core_client):
-        from frothiq_control_center.services.core_client import CoreClientError
+        from mc3.services.core_client import CoreClientError
         mock_core_client.get.side_effect = CoreClientError(503, "frothiq-core unreachable")
         resp = await client.get("/api/v1/cc/defense/clusters", headers=read_only_headers)
         assert resp.status_code == 200
@@ -156,7 +156,7 @@ class TestPolicyMeshAPI:
 
     @pytest.mark.asyncio
     async def test_policy_rollback_failure_returns_502(self, client, security_analyst_headers, mock_core_client):
-        from frothiq_control_center.services.core_client import CoreClientError
+        from mc3.services.core_client import CoreClientError
         mock_core_client.post.side_effect = CoreClientError(500, "Core error")
         resp = await client.post(
             "/api/v1/cc/policy/policy-xyz/rollback",

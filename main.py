@@ -1,8 +1,8 @@
 """
-FrothIQ Control Center — standalone FastAPI application
+OrbWeaver MC² — standalone FastAPI application
 
 Architecture:
-  This is the central command authority for the FrothIQ security platform.
+  This is the central command authority for OrbWeaver MC² — the parent product
   It is completely decoupled from Frappe and communicates with frothiq-core
   exclusively via signed HTTP API calls.
 
@@ -10,7 +10,7 @@ Run:
   uvicorn main:app --host 0.0.0.0 --port 8002 --workers 2
 
 Environment:
-  See frothiq_control_center/config/settings.py for all CC_* variables.
+  See mc3/config/settings.py for all CC_* variables.
 """
 
 from __future__ import annotations
@@ -27,10 +27,10 @@ from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
-from frothiq_control_center import __version__
-from frothiq_control_center.api import api_router, edge_registration_router
-from frothiq_control_center.config import get_settings
-from frothiq_control_center.integrations import (
+from mc3 import __version__
+from mc3.api import api_router, edge_registration_router
+from mc3.config import get_settings
+from mc3.integrations import (
     close_redis,
     create_tables,
     dispose_engine,
@@ -38,13 +38,13 @@ from frothiq_control_center.integrations import (
     get_pubsub_client,
     get_session_factory,
 )
-from frothiq_control_center.middleware import DBSessionMiddleware, IPAllowlistMiddleware, limiter
-from frothiq_control_center.services.core_client import core_client
-from frothiq_control_center.websocket import start_event_dispatcher, ws_router
-from frothiq_control_center.reconciliation.reconciliation_scheduler import ReconciliationScheduler
-from frothiq_control_center.predictive_sync.predictive_sync_orchestrator import PredictiveSyncScheduler
-from frothiq_control_center.services.enforcement_engine import run_enforcement_loop
-from frothiq_control_center.services.edge_outage_service import detect_offline_nodes
+from mc3.middleware import DBSessionMiddleware, IPAllowlistMiddleware, limiter
+from mc3.services.core_client import core_client
+from mc3.websocket import start_event_dispatcher, ws_router
+from mc3.reconciliation.reconciliation_scheduler import ReconciliationScheduler
+from mc3.predictive_sync.predictive_sync_orchestrator import PredictiveSyncScheduler
+from mc3.services.enforcement_engine import run_enforcement_loop
+from mc3.services.edge_outage_service import detect_offline_nodes
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Application lifespan — startup and shutdown."""
     settings = get_settings()
-    logger.info("Starting FrothIQ Control Center v%s (%s)", __version__, settings.environment)
+    logger.info("Starting OrbWeaver MC² v%s (%s)", __version__, settings.environment)
 
     # Initialize database
     await create_tables()
@@ -139,7 +139,7 @@ async def lifespan(app: FastAPI):
     yield  # Application runs here
 
     # Shutdown
-    logger.info("Shutting down FrothIQ Control Center")
+    logger.info("Shutting down OrbWeaver MC²")
     recovery_task.cancel()
     anomaly_task.cancel()
     outage_task.cancel()
@@ -167,7 +167,7 @@ async def _run_community_blacklist_sync() -> None:
     One-shot startup task: re-apply all DB-tracked community blacklist IPs to the
     live nft set after service restart. Waits 15 s for frothiq-nft to settle first.
     """
-    from frothiq_control_center.services.edge_service import sync_community_ips_to_nft
+    from mc3.services.edge_service import sync_community_ips_to_nft
     await asyncio.sleep(15)
     await sync_community_ips_to_nft()
 
@@ -178,7 +178,7 @@ async def _run_geo_cache_warmup() -> None:
     Rate-limited by the service (1.5 s between batches of 100 IPs).
     Waits 30 s to let the rest of startup complete first.
     """
-    from frothiq_control_center.services.threat_geo_service import geocode_missing
+    from mc3.services.threat_geo_service import geocode_missing
     await asyncio.sleep(30)
     try:
         n = await geocode_missing()
@@ -194,7 +194,7 @@ async def _run_outage_detector_loop() -> None:
     Also closes windows for nodes that have since recovered.
     Runs every 5 minutes starting 90 seconds after startup.
     """
-    from frothiq_control_center.integrations.database import get_session_factory as _gsf
+    from mc3.integrations.database import get_session_factory as _gsf
 
     await asyncio.sleep(90)  # let nodes send their first heartbeat before checking
     interval = 300  # 5 minutes
@@ -214,7 +214,7 @@ async def _run_recovery_loop() -> None:
     Background loop: run all three recovery passes (node resets, IP demotions,
     stale registration cleanup). Runs every 10 minutes starting 150s after startup.
     """
-    from frothiq_control_center.services.rollback_recovery_engine import run_recovery as _run_recovery
+    from mc3.services.rollback_recovery_engine import run_recovery as _run_recovery
 
     await asyncio.sleep(150)
     interval = 600  # 10 minutes
@@ -233,7 +233,7 @@ async def _run_anomaly_scan_loop() -> None:
     Background loop: run all four anomaly detection passes and write new events.
     Runs every 5 minutes starting 120 seconds after startup.
     """
-    from frothiq_control_center.services.anomaly_detection import run_scan as _run_scan
+    from mc3.services.anomaly_detection import run_scan as _run_scan
 
     await asyncio.sleep(120)  # let edges check in before first scan
     interval = 300  # 5 minutes
@@ -252,8 +252,8 @@ async def _run_cidr_analyzer_loop() -> None:
     Background loop: scan the live blacklist for CIDR consolidation opportunities.
     Runs at startup (after a short delay) then every 6 hours.
     """
-    from frothiq_control_center.integrations.database import get_session_factory as _gsf
-    from frothiq_control_center.services import cidr_analyzer
+    from mc3.integrations.database import get_session_factory as _gsf
+    from mc3.services import cidr_analyzer
 
     # Wait for DB and nft to settle after startup
     await asyncio.sleep(60)
@@ -289,8 +289,8 @@ async def _seed_default_flags() -> None:
 
     from sqlalchemy import select
 
-    from frothiq_control_center.integrations.database import get_session_factory as _gsf
-    from frothiq_control_center.models.edge import FeatureFlag
+    from mc3.integrations.database import get_session_factory as _gsf
+    from mc3.models.edge import FeatureFlag
 
     defaults = {
         "PLAN_ENFORCEMENT_ENABLED": (
@@ -333,9 +333,9 @@ def create_app() -> FastAPI:
     settings = get_settings()
 
     app = FastAPI(
-        title="FrothIQ Control Center",
+        title="OrbWeaver MC²",
         description=(
-            "Central command authority for the FrothIQ security platform.\n\n"
+            "Central command authority for OrbWeaver MC² — the parent product.\n\n"
             "**Roles:** super_admin · security_analyst · billing_admin · read_only\n\n"
             "**Auth:** JWT Bearer token — obtain via POST /api/v1/cc/auth/login"
         ),
