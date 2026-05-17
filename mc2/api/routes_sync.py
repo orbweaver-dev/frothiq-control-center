@@ -30,8 +30,8 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from mc3.auth import TokenPayload, require_read_only, require_super_admin
-from mc3.services.core_client import CoreClientError
+from mc2.auth import TokenPayload, require_read_only, require_super_admin
+from mc2.services.core_client import CoreClientError
 
 logger = logging.getLogger(__name__)
 
@@ -268,7 +268,7 @@ async def license_state_bulk(
     Bulk license status for all tenants.
     Derived from CC's own edge_tenants database — no Frappe billing bridge dependency.
     """
-    from mc3.services.license_service import get_all_license_states
+    from mc2.services.license_service import get_all_license_states
     data = await get_all_license_states()
     tenants_edge = data.get("tenants", [])
 
@@ -300,6 +300,6 @@ async def get_license_state(
     License status for a single tenant.
     Derived from CC's own edge_tenants database.
     """
-    from mc3.services.license_service import get_tenant_license
+    from mc2.services.license_service import get_tenant_license
     t = await get_tenant_license(tenant_id)
     return _edge_tenant_to_license(t)

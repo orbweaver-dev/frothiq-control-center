@@ -35,7 +35,7 @@ from fastapi.responses import FileResponse
 from PIL import Image
 from pydantic import BaseModel
 
-from mc3.auth import TokenPayload, require_super_admin
+from mc2.auth import TokenPayload, require_super_admin
 
 logger = logging.getLogger(__name__)
 
@@ -527,7 +527,7 @@ def _load_smtp() -> SMTPSettings:
         except Exception as exc:
             logger.warning("Failed to load smtp_settings.json: %s", exc)
     # Bootstrap defaults from environment / config
-    from mc3.config import get_settings as _gs
+    from mc2.config import get_settings as _gs
     s = _gs()
     return SMTPSettings(
         smtp_host=s.smtp_host,

@@ -6,9 +6,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from mc3.auth import TokenPayload, require_read_only, require_super_admin
-from mc3.services import core_client
-from mc3.services.core_client import CoreClientError
+from mc2.auth import TokenPayload, require_read_only, require_super_admin
+from mc2.services import core_client
+from mc2.services.core_client import CoreClientError
 
 router = APIRouter(prefix="/tenants", tags=["tenants"])
 

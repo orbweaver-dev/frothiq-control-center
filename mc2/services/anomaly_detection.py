@@ -22,8 +22,8 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from mc3.integrations.database import get_session_factory
-from mc3.models.edge import AnomalyEvent, ThreatReport
+from mc2.integrations.database import get_session_factory
+from mc2.models.edge import AnomalyEvent, ThreatReport
 
 logger = logging.getLogger(__name__)
 

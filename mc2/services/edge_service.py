@@ -28,10 +28,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from fastapi import HTTPException
 
-from mc3.config import get_settings
-from mc3.integrations.database import get_session_factory
-from mc3.models.edge import AttackReport, EdgeEulaRecord, EdgeNode, EdgeTenant, EulaVersion, FeatureFlag, ThreatReport
-from mc3.services import frappe_billing_client
+from mc2.config import get_settings
+from mc2.integrations.database import get_session_factory
+from mc2.models.edge import AttackReport, EdgeEulaRecord, EdgeNode, EdgeTenant, EulaVersion, FeatureFlag, ThreatReport
+from mc2.services import frappe_billing_client
 
 logger = logging.getLogger(__name__)
 
@@ -269,7 +269,7 @@ async def touch_edge_node(
             return None
 
         # Close any open heartbeat-miss outage windows — node is alive again.
-        from mc3.services.edge_outage_service import close_open_windows_for_node
+        from mc2.services.edge_outage_service import close_open_windows_for_node
         await close_open_windows_for_node(session, edge_id)
 
         await session.commit()
@@ -311,7 +311,7 @@ async def _auto_promote_to_blacklist(ip: str, reason: str) -> None:
     all DB entries to the live nft set on MC3 startup.
     """
     import ipaddress as _ipmod
-    from mc3.models.defense_settings import FrothiqIPEntry
+    from mc2.models.defense_settings import FrothiqIPEntry
 
     try:
         normalized = str(_ipmod.ip_address(ip))
@@ -356,7 +356,7 @@ async def sync_community_ips_to_nft() -> None:
     nft add element is idempotent for IPs already in the set from frothiq.nft;
     errors (duplicate elements) are silently ignored.
     """
-    from mc3.models.defense_settings import FrothiqIPEntry
+    from mc2.models.defense_settings import FrothiqIPEntry
 
     factory = get_session_factory()
 
@@ -466,7 +466,7 @@ async def get_blocklist(
       pro:        extended feed (score ≥ 70)
       enterprise: full feed (score ≥ 50)
     """
-    from mc3.services.core_client import core_client
+    from mc2.services.core_client import core_client
 
     factory = get_session_factory()
     async with factory() as session:
@@ -987,7 +987,7 @@ def _tenant_to_dict(t: EdgeTenant) -> dict[str, Any]:
 async def _forward_threat_to_core(ip: str, event_type: str, severity: str) -> None:
     """Fire-and-forget: push edge threat event into frothiq-core's campaign correlator."""
     try:
-        from mc3.services.core_client import core_client
+        from mc2.services.core_client import core_client
         await core_client.post(
             "/api/v2/internal/ingest-threat",
             body={"ip": ip, "severity": severity, "event_type": event_type, "attack_vectors": []},

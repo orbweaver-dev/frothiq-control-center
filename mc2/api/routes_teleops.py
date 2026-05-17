@@ -22,9 +22,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
-from mc3.auth import TokenPayload, require_super_admin
-from mc3.integrations.database import get_session_factory
-from mc3.models.teleops import (
+from mc2.auth import TokenPayload, require_super_admin
+from mc2.integrations.database import get_session_factory
+from mc2.models.teleops import (
 	TeleopsCallQueue,
 	TeleopsExtension,
 	TeleopsIvrMenu,
@@ -158,7 +158,7 @@ async def create_voip_account(payload: VoipAccountIn, user: Auth) -> dict:
 			is_active=payload.is_active,
 			notes=payload.notes,
 			last_modified_by=user.email,
-			last_modified_surface="mc3",
+			last_modified_surface="mc2",
 		)
 		session.add(acc)
 		try:
@@ -190,7 +190,7 @@ async def update_voip_account(uid: Annotated[str, Path()], payload: VoipAccountP
 			setattr(acc, field, value)
 		acc.version = (acc.version or 0) + 1
 		acc.last_modified_by = user.email
-		acc.last_modified_surface = "mc3"
+		acc.last_modified_surface = "mc2"
 		await session.commit()
 		await session.refresh(acc)
 		return _voip_to_out(acc)
@@ -309,7 +309,7 @@ async def import_from_twilio(uid: Annotated[str, Path()], user: Auth) -> dict:
 					twiml_app_sid=pn.get("voice_application_sid") or None,
 					date_acquired=date_acquired,
 					last_modified_by=user.email,
-					last_modified_surface="mc3:import",
+					last_modified_surface="mc2:import",
 				))
 				imported += 1
 
@@ -423,7 +423,7 @@ async def create_phone_number(payload: PhoneNumberIn, user: Auth) -> dict:
 		pn = TeleopsPhoneNumber(
 			**payload.model_dump(),
 			last_modified_by=user.email,
-			last_modified_surface="mc3",
+			last_modified_surface="mc2",
 		)
 		session.add(pn)
 		try:
@@ -463,7 +463,7 @@ async def update_phone_number(uid: Annotated[str, Path()], payload: PhoneNumberP
 			setattr(pn, field, value)
 		pn.version = (pn.version or 0) + 1
 		pn.last_modified_by = user.email
-		pn.last_modified_surface = "mc3"
+		pn.last_modified_surface = "mc2"
 		await session.commit()
 		await session.refresh(pn)
 		return _pn_to_out(pn)
@@ -536,7 +536,7 @@ async def create_site(payload: SiteIn, user: Auth) -> dict:
 		s = TeleopsSite(
 			**payload.model_dump(),
 			last_modified_by=user.email,
-			last_modified_surface="mc3",
+			last_modified_surface="mc2",
 		)
 		session.add(s)
 		try:
@@ -568,7 +568,7 @@ async def update_site(uid: Annotated[str, Path()], payload: SitePatch, user: Aut
 			setattr(s, field, value)
 		s.version = (s.version or 0) + 1
 		s.last_modified_by = user.email
-		s.last_modified_surface = "mc3"
+		s.last_modified_surface = "mc2"
 		await session.commit()
 		await session.refresh(s)
 		return _site_to_out(s)
@@ -607,7 +607,7 @@ def _bump_version(obj, user_email: str) -> None:
 	"""Common version-bump applied on every PATCH to keep sync metadata correct."""
 	obj.version = (obj.version or 0) + 1
 	obj.last_modified_by = user_email
-	obj.last_modified_surface = "mc3"
+	obj.last_modified_surface = "mc2"
 
 
 async def _require_site(session, site_uid: str) -> None:
@@ -671,7 +671,7 @@ async def create_voicemail(payload: VoicemailIn, user: Auth) -> dict:
 		vm = TeleopsVoicemail(
 			**payload.model_dump(),
 			last_modified_by=user.email,
-			last_modified_surface="mc3",
+			last_modified_surface="mc2",
 		)
 		session.add(vm)
 		await session.commit()
@@ -781,7 +781,7 @@ async def create_extension(payload: ExtensionIn, user: Auth) -> dict:
 		ext = TeleopsExtension(
 			**payload.model_dump(),
 			last_modified_by=user.email,
-			last_modified_surface="mc3",
+			last_modified_surface="mc2",
 		)
 		session.add(ext)
 		try:
@@ -888,7 +888,7 @@ async def list_ivr_menus(user: Auth, site_uid: str | None = None) -> dict:
 async def create_ivr_menu(payload: IvrMenuIn, user: Auth) -> dict:
 	async with get_session_factory()() as session:
 		await _require_site(session, payload.site_uid)
-		m = TeleopsIvrMenu(**payload.model_dump(), last_modified_by=user.email, last_modified_surface="mc3")
+		m = TeleopsIvrMenu(**payload.model_dump(), last_modified_by=user.email, last_modified_surface="mc2")
 		session.add(m)
 		await session.commit()
 		await session.refresh(m)
@@ -983,7 +983,7 @@ async def create_ivr_option(payload: IvrOptionIn, user: Auth) -> dict:
 	async with get_session_factory()() as session:
 		if not await session.get(TeleopsIvrMenu, payload.ivr_menu_uid):
 			raise HTTPException(status_code=400, detail="ivr_menu_uid does not exist")
-		o = TeleopsIvrOption(**payload.model_dump(), last_modified_by=user.email, last_modified_surface="mc3")
+		o = TeleopsIvrOption(**payload.model_dump(), last_modified_by=user.email, last_modified_surface="mc2")
 		session.add(o)
 		try:
 			await session.commit()
@@ -1082,7 +1082,7 @@ async def list_ring_groups(user: Auth, site_uid: str | None = None) -> dict:
 async def create_ring_group(payload: RingGroupIn, user: Auth) -> dict:
 	async with get_session_factory()() as session:
 		await _require_site(session, payload.site_uid)
-		rg = TeleopsRingGroup(**payload.model_dump(), last_modified_by=user.email, last_modified_surface="mc3")
+		rg = TeleopsRingGroup(**payload.model_dump(), last_modified_by=user.email, last_modified_surface="mc2")
 		session.add(rg)
 		await session.commit()
 		await session.refresh(rg)
@@ -1181,7 +1181,7 @@ async def list_time_rules(user: Auth, site_uid: str | None = None) -> dict:
 async def create_time_rule(payload: TimeRuleIn, user: Auth) -> dict:
 	async with get_session_factory()() as session:
 		await _require_site(session, payload.site_uid)
-		t = TeleopsTimeRule(**payload.model_dump(), last_modified_by=user.email, last_modified_surface="mc3")
+		t = TeleopsTimeRule(**payload.model_dump(), last_modified_by=user.email, last_modified_surface="mc2")
 		session.add(t)
 		await session.commit()
 		await session.refresh(t)
@@ -1277,7 +1277,7 @@ async def list_call_queues(user: Auth, site_uid: str | None = None) -> dict:
 async def create_call_queue(payload: CallQueueIn, user: Auth) -> dict:
 	async with get_session_factory()() as session:
 		await _require_site(session, payload.site_uid)
-		q = TeleopsCallQueue(**payload.model_dump(), last_modified_by=user.email, last_modified_surface="mc3")
+		q = TeleopsCallQueue(**payload.model_dump(), last_modified_by=user.email, last_modified_surface="mc2")
 		session.add(q)
 		await session.commit()
 		await session.refresh(q)

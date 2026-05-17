@@ -1,13 +1,13 @@
 """
 WebOps — Virtual server inventory, connectivity monitoring, and controlled actions.
 
-Server registry is stored in /etc/mc3/webops-servers.json.
+Server registry is stored in /etc/mc2/webops-servers.json.
 Two server types:
   ssh      — remote server accessible via SSH (stop/restart only)
   libvirt  — local KVM/QEMU VM managed via virsh (start/stop/restart)
 
 All actions are whitelisted. No arbitrary command execution.
-Every action is audited to /var/log/mc3-audit.log.
+Every action is audited to /var/log/mc2-audit.log.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ router = APIRouter(prefix="/webops", tags=["webops"])
 # Registry persistence
 # ---------------------------------------------------------------------------
 
-REGISTRY_FILE = Path("/var/lib/mc3/webops-servers.json")
+REGISTRY_FILE = Path("/var/lib/mc2/webops-servers.json")
 
 
 def _load_registry() -> list[dict]:
@@ -59,10 +59,10 @@ def _find_server(server_id: str) -> dict:
 # Audit logger
 # ---------------------------------------------------------------------------
 
-_audit_log = logging.getLogger("mc3.webops.audit")
+_audit_log = logging.getLogger("mc2.webops.audit")
 if not _audit_log.handlers:
     try:
-        _h = logging.FileHandler("/var/log/mc3-audit.log", delay=True)
+        _h = logging.FileHandler("/var/log/mc2-audit.log", delay=True)
         _h.setFormatter(logging.Formatter("%(asctime)s  %(message)s"))
         _audit_log.addHandler(_h)
     except OSError:

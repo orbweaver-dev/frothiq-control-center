@@ -10,8 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mc3.services.core_client import CoreClientError
-from mc3.services import (
+from mc2.services.core_client import CoreClientError
+from mc2.services import (
     defense_service,
     envelope_service,
     flywheel_service,
@@ -20,18 +20,18 @@ from mc3.services import (
     policy_service,
     simulation_service,
 )
-from mc3.services.monetization_service import (
+from mc2.services.monetization_service import (
     _compute_rpi,
     _estimate_paywall_hits,
     _estimate_upgrade_signals,
     _next_plan,
 )
-from mc3.services.defense_service import _severity_to_priority
-from mc3.services.envelope_service import (
+from mc2.services.defense_service import _severity_to_priority
+from mc2.services.envelope_service import (
     _compute_diff,
     _verify_envelope_signature,
 )
-from mc3.services.license_service import (
+from mc2.services.license_service import (
     _derive_license_status,
     _is_sync_healthy,
 )
@@ -45,7 +45,7 @@ class TestDefenseService:
     @pytest.mark.asyncio
     async def test_get_all_clusters_success(self, mock_core_client):
         mock_core_client.get.return_value = {"clusters": [{"severity": "high"}], "total": 1}
-        with patch("mc3.services.defense_service.core_client", mock_core_client):
+        with patch("mc2.services.defense_service.core_client", mock_core_client):
             result = await defense_service.get_all_clusters()
         assert result["success"] is True
         assert result["total"] == 1
@@ -53,7 +53,7 @@ class TestDefenseService:
     @pytest.mark.asyncio
     async def test_get_all_clusters_core_offline(self, mock_core_client):
         mock_core_client.get.side_effect = CoreClientError(503, "Core offline")
-        with patch("mc3.services.defense_service.core_client", mock_core_client):
+        with patch("mc2.services.defense_service.core_client", mock_core_client):
             result = await defense_service.get_all_clusters()
         assert result["success"] is False
         assert result["engine_healthy"] is False
@@ -67,7 +67,7 @@ class TestDefenseService:
                 {"cluster_id": "c3", "severity": "medium", "action": "rate_limit", "auto_apply_eligible": True, "campaign_ids": ["x"]},
             ]
         }
-        with patch("mc3.services.defense_service.core_client", mock_core_client):
+        with patch("mc2.services.defense_service.core_client", mock_core_client):
             actions = await defense_service.get_suggested_actions()
         assert actions[0]["severity"] == "critical"
         assert actions[-1]["severity"] == "low"
@@ -79,7 +79,7 @@ class TestDefenseService:
                 {"cluster_id": "c1", "severity": "high", "action": "block", "auto_apply_eligible": False, "campaign_ids": []},
             ]
         }
-        with patch("mc3.services.defense_service.core_client", mock_core_client):
+        with patch("mc2.services.defense_service.core_client", mock_core_client):
             actions = await defense_service.get_suggested_actions()
         assert len(actions) == 0
 
@@ -90,7 +90,7 @@ class TestDefenseService:
                 {"cluster_id": "cluster-1", "campaign_ids": ["camp-a", "camp-b"], "severity": "high"},
             ]
         }
-        with patch("mc3.services.defense_service.core_client", mock_core_client):
+        with patch("mc2.services.defense_service.core_client", mock_core_client):
             graph = await defense_service.get_propagation_graph()
         assert len(graph["nodes"]) == 1
         assert len(graph["edges"]) == 2
@@ -115,7 +115,7 @@ class TestLicenseService:
                 {"tenant_id": "t1", "plan": "pro", "max_sites": 10, "active_sites": 5},
             ]
         }
-        with patch("mc3.services.license_service.core_client", mock_core_client):
+        with patch("mc2.services.license_service.core_client", mock_core_client):
             result = await license_service.get_all_license_states()
         assert result["success"] is True
         assert result["total"] == 1
@@ -123,14 +123,14 @@ class TestLicenseService:
     @pytest.mark.asyncio
     async def test_get_all_license_states_core_failure(self, mock_core_client):
         mock_core_client.get.side_effect = CoreClientError(503, "Offline")
-        with patch("mc3.services.license_service.core_client", mock_core_client):
+        with patch("mc2.services.license_service.core_client", mock_core_client):
             result = await license_service.get_all_license_states()
         assert result["success"] is False
 
     @pytest.mark.asyncio
     async def test_revoke_license_calls_core(self, mock_core_client):
         mock_core_client.post.return_value = {"revoked": True}
-        with patch("mc3.services.license_service.core_client", mock_core_client):
+        with patch("mc2.services.license_service.core_client", mock_core_client):
             result = await license_service.revoke_license("t1", "Non-payment", "admin@cc.io")
         assert result["success"] is True
         mock_core_client.post.assert_called_once()
@@ -138,7 +138,7 @@ class TestLicenseService:
     @pytest.mark.asyncio
     async def test_revoke_license_core_failure(self, mock_core_client):
         mock_core_client.post.side_effect = CoreClientError(500, "Error")
-        with patch("mc3.services.license_service.core_client", mock_core_client):
+        with patch("mc2.services.license_service.core_client", mock_core_client):
             result = await license_service.revoke_license("t1", "test", "admin")
         assert result["success"] is False
         assert "error" in result
@@ -176,7 +176,7 @@ class TestLicenseService:
             ],
             "total": 2,
         }
-        with patch("mc3.services.license_service.core_client", mock_core_client):
+        with patch("mc2.services.license_service.core_client", mock_core_client):
             result = await license_service.get_sync_health()
         assert result["health_pct"] == 50.0
 
@@ -228,7 +228,7 @@ class TestEnvelopeService:
         mock_core_client.get.return_value = {
             "version": "v1.0", "signature": "sha256:abc123", "sections": {}
         }
-        with patch("mc3.services.envelope_service.core_client", mock_core_client):
+        with patch("mc2.services.envelope_service.core_client", mock_core_client):
             result = await envelope_service.get_tenant_envelope("t1")
         assert result["success"] is True
         assert result["envelope_version"] == "v1.0"
@@ -236,14 +236,14 @@ class TestEnvelopeService:
     @pytest.mark.asyncio
     async def test_get_tenant_envelope_core_failure(self, mock_core_client):
         mock_core_client.get.side_effect = CoreClientError(503, "Offline")
-        with patch("mc3.services.envelope_service.core_client", mock_core_client):
+        with patch("mc2.services.envelope_service.core_client", mock_core_client):
             result = await envelope_service.get_tenant_envelope("t1")
         assert result["success"] is False
 
     @pytest.mark.asyncio
     async def test_verify_all_envelopes_batch(self, mock_core_client):
         mock_core_client.get.return_value = {"version": "v1", "signature": "abc123456789"}
-        with patch("mc3.services.envelope_service.core_client", mock_core_client):
+        with patch("mc2.services.envelope_service.core_client", mock_core_client):
             result = await envelope_service.verify_all_envelopes(["t1", "t2", "t3"])
         assert result["summary"]["total"] == 3
 
@@ -300,7 +300,7 @@ class TestMonetizationService:
                 {"tenant_id": "t2", "plan": "pro", "max_sites": 10, "active_sites": 2},
             ]
         }
-        with patch("mc3.services.monetization_service.core_client", mock_core_client):
+        with patch("mc2.services.monetization_service.core_client", mock_core_client):
             result = await monetization_service.get_monetization_overview()
         assert "plan_breakdown" in result
         assert "revenue_pressure_index" in result
@@ -314,7 +314,7 @@ class TestMonetizationService:
                 {"tenant_id": "t2", "plan": "pro", "max_sites": 10, "active_sites": 9},
             ]
         }
-        with patch("mc3.services.monetization_service.core_client", mock_core_client):
+        with patch("mc2.services.monetization_service.core_client", mock_core_client):
             result = await monetization_service.get_monetization_overview()
         candidates = result["top_upgrade_candidates"]
         if len(candidates) >= 2:
@@ -329,21 +329,21 @@ class TestSimulationService:
     @pytest.mark.asyncio
     async def test_get_scenarios_list(self, mock_core_client):
         mock_core_client.get.return_value = {"scenarios": [{"id": "s1"}, {"id": "s2"}]}
-        with patch("mc3.services.simulation_service.core_client", mock_core_client):
+        with patch("mc2.services.simulation_service.core_client", mock_core_client):
             scenarios = await simulation_service.get_scenarios()
         assert len(scenarios) == 2
 
     @pytest.mark.asyncio
     async def test_run_scenario_success(self, mock_core_client):
         mock_core_client.post.return_value = {"sim_id": "sim-001", "status": "started"}
-        with patch("mc3.services.simulation_service.core_client", mock_core_client):
+        with patch("mc2.services.simulation_service.core_client", mock_core_client):
             result = await simulation_service.run_scenario("s1", "t1", {}, "admin")
         assert result["success"] is True
 
     @pytest.mark.asyncio
     async def test_run_scenario_core_failure(self, mock_core_client):
         mock_core_client.post.side_effect = CoreClientError(500, "Error")
-        with patch("mc3.services.simulation_service.core_client", mock_core_client):
+        with patch("mc2.services.simulation_service.core_client", mock_core_client):
             result = await simulation_service.run_scenario("s1", "t1", {}, "admin")
         assert result["success"] is False
 
@@ -353,7 +353,7 @@ class TestSimulationService:
             "das_avg": 0.7, "dei_avg": 0.6, "pps_avg": 0.8,
             "das_trend": [0.5, 0.7], "dei_trend": [], "pps_trend": [],
         }
-        with patch("mc3.services.simulation_service.core_client", mock_core_client):
+        with patch("mc2.services.simulation_service.core_client", mock_core_client):
             result = await simulation_service.get_metrics(period_days=7)
         assert result["das_avg"] == 0.7
         assert result["success"] is True
@@ -361,7 +361,7 @@ class TestSimulationService:
     @pytest.mark.asyncio
     async def test_get_metrics_core_offline_graceful(self, mock_core_client):
         mock_core_client.get.side_effect = CoreClientError(503, "Offline")
-        with patch("mc3.services.simulation_service.core_client", mock_core_client):
+        with patch("mc2.services.simulation_service.core_client", mock_core_client):
             result = await simulation_service.get_metrics()
         assert result["success"] is False
         assert result["das_avg"] == 0.0
@@ -375,14 +375,14 @@ class TestFlywheelService:
     @pytest.mark.asyncio
     async def test_get_flywheel_state_success(self, mock_core_client):
         mock_core_client.get.return_value = {"phase": "reinforcement", "velocity": 0.87}
-        with patch("mc3.services.flywheel_service.core_client", mock_core_client):
+        with patch("mc2.services.flywheel_service.core_client", mock_core_client):
             result = await flywheel_service.get_flywheel_state()
         assert result["success"] is True
 
     @pytest.mark.asyncio
     async def test_correlation_heatmap_fallback_on_error(self, mock_core_client):
         mock_core_client.get.side_effect = CoreClientError(503, "Offline")
-        with patch("mc3.services.flywheel_service.core_client", mock_core_client):
+        with patch("mc2.services.flywheel_service.core_client", mock_core_client):
             result = await flywheel_service.get_correlation_heatmap()
         assert result["success"] is False
         assert len(result["matrix"]) == len(result["dimensions"])
@@ -392,7 +392,7 @@ class TestFlywheelService:
     @pytest.mark.asyncio
     async def test_flywheel_dashboard_aggregates_all(self, mock_core_client):
         mock_core_client.get.return_value = {}
-        with patch("mc3.services.flywheel_service.core_client", mock_core_client):
+        with patch("mc2.services.flywheel_service.core_client", mock_core_client):
             result = await flywheel_service.get_flywheel_dashboard()
         assert "state" in result
         assert "correlation_heatmap" in result
@@ -403,7 +403,7 @@ class TestFlywheelService:
     async def test_flywheel_dashboard_handles_partial_failure(self, mock_core_client):
         """Flywheel dashboard should not crash if some sub-calls fail."""
         mock_core_client.get.side_effect = CoreClientError(503, "Offline")
-        with patch("mc3.services.flywheel_service.core_client", mock_core_client):
+        with patch("mc2.services.flywheel_service.core_client", mock_core_client):
             result = await flywheel_service.get_flywheel_dashboard()
         # Should return something, not raise
         assert isinstance(result, dict)

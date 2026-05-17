@@ -29,7 +29,7 @@ import time
 import uuid
 from typing import Any
 
-from mc3.predictive_sync.preemptive_state_builder import ProjectedState
+from mc2.predictive_sync.preemptive_state_builder import ProjectedState
 
 
 # ---------------------------------------------------------------------------

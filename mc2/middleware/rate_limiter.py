@@ -11,7 +11,7 @@ from __future__ import annotations
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
-from mc3.config import get_settings
+from mc2.config import get_settings
 
 _settings = get_settings()
 

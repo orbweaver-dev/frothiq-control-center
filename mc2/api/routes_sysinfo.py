@@ -1770,10 +1770,10 @@ async def get_hardware(_: str = Depends(require_super_admin)) -> dict:
 
 import logging as _logging
 
-_audit_log = _logging.getLogger("mc3.audit")
+_audit_log = _logging.getLogger("mc2.audit")
 if not _audit_log.handlers:
     try:
-        _h = _logging.FileHandler("/var/log/mc3-audit.log", delay=True)
+        _h = _logging.FileHandler("/var/log/mc2-audit.log", delay=True)
         _h.setFormatter(_logging.Formatter("%(asctime)s  %(message)s"))
         _audit_log.addHandler(_h)
     except OSError:
@@ -2135,12 +2135,12 @@ async def run_watchdog(_: str = Depends(require_super_admin)) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Audit log — tail /var/log/mc3-audit.log
+# Audit log — tail /var/log/mc2-audit.log
 # ---------------------------------------------------------------------------
 
 import re as _re
 
-_AUDIT_LOG_PATH = Path("/var/log/mc3-audit.log")
+_AUDIT_LOG_PATH = Path("/var/log/mc2-audit.log")
 _AUDIT_PATTERN = _re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)\s+"
     r"(?:user=(?P<user>\S+)\s+)?(?:action=(?P<action>\S+)\s+)?(?:detail=(?P<detail>.*?)\s+)?(?:result=(?P<result>\S+))?$"
@@ -2197,8 +2197,8 @@ import subprocess as _subprocess_backup
 import threading as _threading_backup
 from pathlib import Path as _Path_backup
 
-_BACKUP_JOBS_FILE = _Path_backup("/var/lib/mc3/backup-jobs.json")
-_BACKUP_RUN_DIR = _Path_backup("/var/lib/mc3/backup-runs")
+_BACKUP_JOBS_FILE = _Path_backup("/var/lib/mc2/backup-jobs.json")
+_BACKUP_RUN_DIR = _Path_backup("/var/lib/mc2/backup-runs")
 
 
 def _load_backup_jobs() -> list:
@@ -2422,7 +2422,7 @@ async def delete_ssh_key(
 # Alert thresholds — configurable CPU/mem/disk alert levels
 # ---------------------------------------------------------------------------
 
-_ALERT_THRESHOLDS_FILE = Path("/var/lib/mc3/alert-thresholds.json")
+_ALERT_THRESHOLDS_FILE = Path("/var/lib/mc2/alert-thresholds.json")
 _DEFAULT_THRESHOLDS = {
     "cpu_warn": 80, "cpu_crit": 95,
     "mem_warn": 80, "mem_crit": 95,
@@ -2517,7 +2517,7 @@ async def run_logrotate(force: bool = Query(False), _=Depends(require_super_admi
 # Metrics history — store/retrieve per-minute system metrics
 # ---------------------------------------------------------------------------
 
-_METRICS_DB = Path("/var/lib/mc3/metrics-history.json")
+_METRICS_DB = Path("/var/lib/mc2/metrics-history.json")
 _METRICS_MAX_ENTRIES = 1440  # 24 hours of per-minute data
 
 

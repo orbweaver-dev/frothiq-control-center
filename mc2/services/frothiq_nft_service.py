@@ -21,7 +21,7 @@ from typing import Any
 from sqlalchemy import delete, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from mc3.models.defense_settings import (
+from mc2.models.defense_settings import (
     FrothiqIPEntry,
     FrothiqNftAudit,
     FrothiqNftSetting,

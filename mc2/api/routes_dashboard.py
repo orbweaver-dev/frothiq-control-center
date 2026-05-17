@@ -10,8 +10,8 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, Request
 
-from mc3.auth import TokenPayload, require_read_only
-from mc3.services import (
+from mc2.auth import TokenPayload, require_read_only
+from mc2.services import (
     core_client,
     get_all_clusters,
     get_all_license_states,
@@ -33,8 +33,8 @@ async def system_health(
     Full system health snapshot — core status, cluster counts,
     license health, threat level, key indices, and recent outages.
     """
-    from mc3.integrations.database import get_session_factory as _gsf
-    from mc3.services.edge_outage_service import get_recent_outages
+    from mc2.integrations.database import get_session_factory as _gsf
+    from mc2.services.edge_outage_service import get_recent_outages
 
     (
         core_health,

@@ -16,8 +16,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import text
 
-from mc3.auth.jwt_handler import TokenPayload, get_current_user, require_role
-from mc3.integrations.database import get_session_factory
+from mc2.auth.jwt_handler import TokenPayload, get_current_user, require_role
+from mc2.integrations.database import get_session_factory
 
 router = APIRouter(prefix="/dev/reports", tags=["dev-reports"])
 

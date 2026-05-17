@@ -15,11 +15,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from mc3.billing.subscription_state_machine import (
+from mc2.billing.subscription_state_machine import (
     SubscriptionState,
     validate_transition,
 )
-from mc3.predictive_sync.predictive_signal_detector import (
+from mc2.predictive_sync.predictive_signal_detector import (
     PredictiveSignal,
     SignalType,
 )

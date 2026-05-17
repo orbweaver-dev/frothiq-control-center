@@ -14,8 +14,8 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from mc3.auth.jwt_handler import TokenPayload, get_current_user, require_role
-from mc3.services.anomaly_detection import (
+from mc2.auth.jwt_handler import TokenPayload, get_current_user, require_role
+from mc2.services.anomaly_detection import (
     acknowledge_event,
     get_stats,
     list_events,

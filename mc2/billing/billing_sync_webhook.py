@@ -32,10 +32,10 @@ import logging
 import time
 from typing import Any
 
-from mc3.billing.billing_sync_client import (
+from mc2.billing.billing_sync_client import (
     _apply_and_persist,
 )
-from mc3.integrations.redis_client import get_cache_client
+from mc2.integrations.redis_client import get_cache_client
 
 logger = logging.getLogger(__name__)
 

@@ -22,8 +22,8 @@ from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from mc3.auth import require_read_only, require_super_admin
-from mc3.services.storage_account_service import (
+from mc2.auth import require_read_only, require_super_admin
+from mc2.services.storage_account_service import (
     delete_account,
     get_account,
     load_accounts,

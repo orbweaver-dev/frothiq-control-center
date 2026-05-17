@@ -6,8 +6,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from mc3.auth import TokenPayload, require_read_only, require_security_analyst
-from mc3.services import (
+from mc2.auth import TokenPayload, require_read_only, require_security_analyst
+from mc2.services import (
     get_alerts,
     get_metrics,
     get_recent_runs,
@@ -17,9 +17,9 @@ from mc3.services import (
     get_simulation_status,
     run_scenario,
 )
-from mc3.services.core_client import CoreClientError
-from mc3.services.audit_service import log_action
-from mc3.models.schemas import SimulationRunRequest
+from mc2.services.core_client import CoreClientError
+from mc2.services.audit_service import log_action
+from mc2.models.schemas import SimulationRunRequest
 
 router = APIRouter(prefix="/simulation", tags=["simulation"])
 

@@ -23,18 +23,18 @@ import logging
 import time
 from typing import Any
 
-from mc3.billing.license_state_cache import get_billing_state
-from mc3.predictive_sync.predictive_signal_detector import (
+from mc2.billing.license_state_cache import get_billing_state
+from mc2.predictive_sync.predictive_signal_detector import (
     detect_signals_all_tenants,
     detect_signals_for_tenant,
 )
-from mc3.predictive_sync.preemptive_state_builder import (
+from mc2.predictive_sync.preemptive_state_builder import (
     build_projected_state,
 )
-from mc3.predictive_sync.preemptive_contract_generator import (
+from mc2.predictive_sync.preemptive_contract_generator import (
     generate_staged_contract,
 )
-from mc3.predictive_sync.staged_contract_dispatcher import (
+from mc2.predictive_sync.staged_contract_dispatcher import (
     dispatch_staged_contract,
     get_staged_contract,
 )
@@ -80,7 +80,7 @@ async def run_for_tenant(tenant_id: str) -> list[dict[str, Any]]:
         )
         return results
 
-    from mc3.config import get_settings
+    from mc2.config import get_settings
     signing_key = get_settings().gateway_signing_key
 
     contract = generate_staged_contract(projected, signing_key)
@@ -120,7 +120,7 @@ async def run_all_tenants() -> dict[str, Any]:
         by_tenant.setdefault(s.tenant_id, []).append(s)
 
     # Record collisions (Rule 7)
-    from mc3.predictive_sync.prediction_accuracy_tracker import (
+    from mc2.predictive_sync.prediction_accuracy_tracker import (
         record_collision,
     )
     collision_tenants = [t for t, sigs in by_tenant.items() if len(sigs) > 1]
@@ -151,7 +151,7 @@ def _select_best_signal(signals: list[Any]) -> Any:
       2. Tie-break: more restrictive transition (higher RESTRICTIVE_ORDER rank)
       3. Tie-break: earliest expected window start (smallest timestamp)
     """
-    from mc3.predictive_sync.preemptive_contract_generator import (
+    from mc2.predictive_sync.preemptive_contract_generator import (
         RESTRICTIVE_ORDER,
     )
 

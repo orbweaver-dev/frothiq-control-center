@@ -19,16 +19,16 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from mc3.auth import require_super_admin
+from mc2.auth import require_super_admin
 
 router = APIRouter(prefix="/updates", tags=["autoupdate"])
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 
 _PLUGIN_SRC = Path("/home/frothiq/frothiq-wordpress")
-_MC3_BACKEND_SRC = Path("/home/frothiq/frothiq-control-center/mc3")
+_MC3_BACKEND_SRC = Path("/home/frothiq/frothiq-control-center/mc2")
 _MC3_BACKEND_MAIN = Path("/home/frothiq/frothiq-control-center/main.py")
-_MC3_BACKEND_DEPLOY = Path("/usr/lib/frothiq-control-center/backend/mc3")
+_MC3_BACKEND_DEPLOY = Path("/usr/lib/frothiq-control-center/backend/mc2")
 _MC3_BACKEND_DEPLOY_MAIN = Path("/usr/lib/frothiq-control-center/backend/main.py")
 _MC3_UI_SRC = Path("/home/frothiq/frothiq-control-center-ui")
 _MC3_UI_DEPLOY = Path("/usr/lib/frothiq-control-center/ui")
@@ -56,7 +56,7 @@ def _read_version_from_php(path: Path) -> str:
 
 
 def _read_mc3_backend_version() -> str:
-    init_src = _PLUGIN_SRC.parent / "frothiq-control-center" / "mc3" / "__init__.py"
+    init_src = _PLUGIN_SRC.parent / "frothiq-control-center" / "mc2" / "__init__.py"
     try:
         content = init_src.read_text()
         m = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', content)
@@ -229,7 +229,7 @@ def _deploy_mc3_backend() -> dict:
     steps = []
     errors = []
 
-    # Sync mc3 package
+    # Sync mc2 package
     _, err, rc = _run(
         ["sudo", "rsync", "-a", "--delete",
          str(_MC3_BACKEND_SRC) + "/",
@@ -237,9 +237,9 @@ def _deploy_mc3_backend() -> dict:
         timeout=30,
     )
     if rc != 0:
-        errors.append(f"rsync mc3: {err.strip()}")
+        errors.append(f"rsync mc2: {err.strip()}")
     else:
-        steps.append("Synced mc3 package")
+        steps.append("Synced mc2 package")
 
     # Sync main.py
     _, err, rc = _run(
@@ -275,7 +275,7 @@ def _deploy_mc3_backend() -> dict:
     }
 
 
-@router.post("/deploy/mc3/backend")
+@router.post("/deploy/mc2/backend")
 async def deploy_mc3_backend(_: str = Depends(require_super_admin)) -> dict:
     return await asyncio.to_thread(_deploy_mc3_backend)
 
@@ -343,7 +343,7 @@ def _deploy_mc3_frontend() -> dict:
     }
 
 
-@router.post("/deploy/mc3/frontend")
+@router.post("/deploy/mc2/frontend")
 async def deploy_mc3_frontend(_: str = Depends(require_super_admin)) -> dict:
     # npm run build has a cwd requirement
     import subprocess as _sp

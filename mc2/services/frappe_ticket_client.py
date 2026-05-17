@@ -17,7 +17,7 @@ from typing import Optional
 
 import httpx
 
-from mc3.config import get_settings
+from mc2.config import get_settings
 
 logger = logging.getLogger(__name__)
 

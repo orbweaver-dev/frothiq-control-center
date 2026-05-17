@@ -6,8 +6,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 
-from mc3.auth import TokenPayload, require_read_only, require_security_analyst
-from mc3.services import (
+from mc2.auth import TokenPayload, require_read_only, require_security_analyst
+from mc2.services import (
     get_correlation_heatmap,
     get_flywheel_dashboard,
     get_flywheel_state,

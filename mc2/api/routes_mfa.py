@@ -26,7 +26,7 @@ from jose import JWTError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from mc3.auth import (
+from mc2.auth import (
     TokenPayload,
     create_access_token,
     create_refresh_token,
@@ -34,16 +34,16 @@ from mc3.auth import (
     get_current_user,
     verify_password,
 )
-from mc3.auth.jwt_handler import create_mfa_challenge_token
-from mc3.models.schemas import (
+from mc2.auth.jwt_handler import create_mfa_challenge_token
+from mc2.models.schemas import (
     MFAChallengeRequest,
     TOTPDisableRequest,
     TOTPSetupResponse,
     TOTPVerifySetupRequest,
     TokenResponse,
 )
-from mc3.models.user import CCUser
-from mc3.services.audit_service import log_action
+from mc2.models.user import CCUser
+from mc2.services.audit_service import log_action
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth/2fa", tags=["2fa"])

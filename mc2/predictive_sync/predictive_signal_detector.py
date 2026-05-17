@@ -28,7 +28,7 @@ from typing import Any
 
 import httpx
 
-from mc3.billing.license_state_cache import (
+from mc2.billing.license_state_cache import (
     get_all_billing_states,
     get_billing_state,
 )

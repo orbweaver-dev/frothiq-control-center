@@ -23,10 +23,10 @@ from typing import Sequence
 from sqlalchemy import select, and_, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from mc3.config import get_settings
-from mc3.models.edge import EdgeNode, EdgeTenant
-from mc3.models.outage import EdgeOutageEvent
-from mc3.services import frappe_ticket_client as _ftc
+from mc2.config import get_settings
+from mc2.models.edge import EdgeNode, EdgeTenant
+from mc2.models.outage import EdgeOutageEvent
+from mc2.services import frappe_ticket_client as _ftc
 
 logger = logging.getLogger(__name__)
 
@@ -408,7 +408,7 @@ async def _send_outage_alert(
             f"This may indicate a plugin issue, server problem, or an incorrect",
             f"firewall rule. Please check your site immediately.",
             f"",
-            f"FrothIQ Dashboard: https://mc3.orbweaver.dev",
+            f"FrothIQ Dashboard: https://mc2.orbweaver.dev",
         ]
 
     body_lines += [

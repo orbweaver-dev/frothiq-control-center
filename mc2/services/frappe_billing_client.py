@@ -30,7 +30,7 @@ from typing import Any
 
 import httpx
 
-from mc3.config import get_settings
+from mc2.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -258,8 +258,8 @@ async def _store_erpnext_refs(
     if not customer and not subscription:
         return
     try:
-        from mc3.integrations.database import get_session_factory
-        from mc3.models.edge import EdgeTenant
+        from mc2.integrations.database import get_session_factory
+        from mc2.models.edge import EdgeTenant
         from sqlalchemy import select
 
         factory = get_session_factory()

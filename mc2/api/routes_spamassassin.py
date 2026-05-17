@@ -15,7 +15,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from mc3.auth import TokenPayload, require_super_admin
+from mc2.auth import TokenPayload, require_super_admin
 
 router = APIRouter(prefix="/sysinfo/spamassassin", tags=["spamassassin"])
 

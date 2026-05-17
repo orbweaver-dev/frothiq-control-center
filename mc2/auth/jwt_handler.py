@@ -22,7 +22,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel
 
-from mc3.config import get_settings
+from mc2.config import get_settings
 
 logger = logging.getLogger(__name__)
 

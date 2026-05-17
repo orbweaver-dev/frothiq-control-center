@@ -31,9 +31,9 @@ from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import func, select
 
-from mc3.integrations.database import get_session_factory
-from mc3.integrations.redis_client import get_cache_client
-from mc3.models.predictive_sync import PredictionRecord
+from mc2.integrations.database import get_session_factory
+from mc2.integrations.redis_client import get_cache_client
+from mc2.models.predictive_sync import PredictionRecord
 
 logger = logging.getLogger(__name__)
 

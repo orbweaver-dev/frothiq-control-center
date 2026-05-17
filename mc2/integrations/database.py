@@ -8,17 +8,17 @@ import logging
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from mc3.config import get_settings
-from mc3.models.user import Base
+from mc2.config import get_settings
+from mc2.models.user import Base
 # Import all models so Base.metadata has them registered before create_all()
-import mc3.models.edge     # noqa: F401
-import mc3.models.billing          # noqa: F401
-import mc3.models.reconciliation   # noqa: F401
-import mc3.models.predictive_sync  # noqa: F401
-import mc3.models.enrollment       # noqa: F401
-import mc3.models.defense_settings  # noqa: F401  (also registers FrothiqCidrRecommendation)
-import mc3.models.outage           # noqa: F401
-import mc3.models.teleops          # noqa: F401
+import mc2.models.edge     # noqa: F401
+import mc2.models.billing          # noqa: F401
+import mc2.models.reconciliation   # noqa: F401
+import mc2.models.predictive_sync  # noqa: F401
+import mc2.models.enrollment       # noqa: F401
+import mc2.models.defense_settings  # noqa: F401  (also registers FrothiqCidrRecommendation)
+import mc2.models.outage           # noqa: F401
+import mc2.models.teleops          # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +128,7 @@ async def _seed_admin_ip() -> None:
     import uuid as _uuid
     from datetime import datetime
     from sqlalchemy import select, text
-    from mc3.models.enrollment import IPAllowlist
+    from mc2.models.enrollment import IPAllowlist
 
     engine = get_engine()
     async with async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)() as session:

@@ -1,6 +1,6 @@
 """WebOps Analytics — Microsoft Bing Webmaster Tools API integration.
 
-API key stored at /var/lib/mc3/bing-api-key.txt (plain text, single line).
+API key stored at /var/lib/mc2/bing-api-key.txt (plain text, single line).
 Obtain from: https://www.bing.com/webmasters/api.aspx
 """
 import datetime
@@ -17,7 +17,7 @@ from .routes_auth import require_super_admin
 
 router = APIRouter(prefix="/analytics/bing", tags=["analytics-bing"])
 
-BING_KEY_FILE = Path("/var/lib/mc3/bing-api-key.txt")
+BING_KEY_FILE = Path("/var/lib/mc2/bing-api-key.txt")
 BING_BASE = "https://ssl.bing.com/webmaster/api.svc/json"
 
 

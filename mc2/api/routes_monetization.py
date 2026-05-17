@@ -6,8 +6,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
 
-from mc3.auth import TokenPayload, require_billing_admin, require_read_only
-from mc3.services import (
+from mc2.auth import TokenPayload, require_billing_admin, require_read_only
+from mc2.services import (
     get_monetization_overview,
     get_paywall_analytics,
     get_revenue_heatmap,

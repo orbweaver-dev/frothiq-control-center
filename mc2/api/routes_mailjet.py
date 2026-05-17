@@ -16,8 +16,8 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, EmailStr
 
-from mc3.auth import TokenPayload, require_super_admin
-from mc3.config import get_settings
+from mc2.auth import TokenPayload, require_super_admin
+from mc2.config import get_settings
 
 router = APIRouter(prefix="/mailjet", tags=["mailjet"])
 

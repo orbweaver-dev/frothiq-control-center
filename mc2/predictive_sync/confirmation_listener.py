@@ -21,15 +21,15 @@ import logging
 import time
 from typing import Any
 
-from mc3.predictive_sync.preemptive_contract_generator import (
+from mc2.predictive_sync.preemptive_contract_generator import (
     make_activation_message,
     make_invalidation_message,
 )
-from mc3.predictive_sync.staged_contract_dispatcher import (
+from mc2.predictive_sync.staged_contract_dispatcher import (
     get_staged_contract,
     invalidate_staged_contract,
 )
-from mc3.predictive_sync.prediction_accuracy_tracker import (
+from mc2.predictive_sync.prediction_accuracy_tracker import (
     record_outcome,
     OutcomeType,
 )
@@ -199,7 +199,7 @@ def _estimate_latency_saved(staged: dict[str, Any]) -> float:
 
 async def _broadcast_to_edges(tenant_id: str, message: dict[str, Any]) -> None:
     """Send activation or invalidation message to all edge nodes."""
-    from mc3.billing.billing_event_publisher import (
+    from mc2.billing.billing_event_publisher import (
         _get_edge_nodes,
         _build_edge_billing_url,
     )
@@ -225,7 +225,7 @@ async def _broadcast_to_edges(tenant_id: str, message: dict[str, Any]) -> None:
 async def _publish_ws(tenant_id: str, message: dict[str, Any]) -> None:
     """Publish activation/invalidation event to the WS pub/sub channel."""
     import json
-    from mc3.integrations.redis_client import get_pubsub_client
+    from mc2.integrations.redis_client import get_pubsub_client
     channel = f"frothiq:billing:events:{tenant_id}"
     try:
         redis = await get_pubsub_client()
@@ -242,8 +242,8 @@ async def _update_staged_status(
 ) -> None:
     """Update the StagedContractRecord in DB after resolution."""
     from sqlalchemy import update
-    from mc3.models.predictive_sync import StagedContractRecord
-    from mc3.models.user import _utcnow
+    from mc2.models.predictive_sync import StagedContractRecord
+    from mc2.models.user import _utcnow
     try:
         async with get_session_factory()() as session:
             await session.execute(
@@ -264,5 +264,5 @@ async def _update_staged_status(
 
 
 def get_session_factory():
-    from mc3.integrations.database import get_session_factory as _gsf
+    from mc2.integrations.database import get_session_factory as _gsf
     return _gsf()

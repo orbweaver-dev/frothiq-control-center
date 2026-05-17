@@ -6,8 +6,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from mc3.auth import TokenPayload, require_read_only, require_super_admin
-from mc3.services import (
+from mc2.auth import TokenPayload, require_read_only, require_super_admin
+from mc2.services import (
     deregister_license,
     force_sync,
     get_all_license_states,
@@ -16,8 +16,8 @@ from mc3.services import (
     restore_license,
     revoke_license,
 )
-from mc3.services.core_client import CoreClientError
-from mc3.services.audit_service import log_action
+from mc2.services.core_client import CoreClientError
+from mc2.services.audit_service import log_action
 
 from pydantic import BaseModel
 

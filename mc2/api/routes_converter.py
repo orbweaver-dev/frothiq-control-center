@@ -23,8 +23,8 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from mc3.auth import require_super_admin
-from mc3.api.routes_frappe import _bench, _sudo_cat, SITES_DIR
+from mc2.auth import require_super_admin
+from mc2.api.routes_frappe import _bench, _sudo_cat, SITES_DIR
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/converter", tags=["converter"])

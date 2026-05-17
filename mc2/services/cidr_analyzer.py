@@ -32,7 +32,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from mc3.models.defense_settings import FrothiqCidrRecommendation
+from mc2.models.defense_settings import FrothiqCidrRecommendation
 
 logger = logging.getLogger(__name__)
 
@@ -281,8 +281,8 @@ async def apply_recommendation(
       3. Remove covered IPs from frothiq_ip_list DB table
       4. Mark recommendation as applied
     """
-    from mc3.models.defense_settings import FrothiqIPEntry
-    from mc3.services.frothiq_nft_service import _run
+    from mc2.models.defense_settings import FrothiqIPEntry
+    from mc2.services.frothiq_nft_service import _run
 
     row = await session.get(FrothiqCidrRecommendation, rec_id)
     if not row:

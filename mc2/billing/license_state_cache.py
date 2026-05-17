@@ -18,9 +18,9 @@ from typing import Any
 from sqlalchemy import select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 
-from mc3.integrations.database import get_session_factory
-from mc3.integrations.redis_client import get_cache_client
-from mc3.models.billing import TenantBillingState
+from mc2.integrations.database import get_session_factory
+from mc2.integrations.redis_client import get_cache_client
+from mc2.models.billing import TenantBillingState
 
 logger = logging.getLogger(__name__)
 

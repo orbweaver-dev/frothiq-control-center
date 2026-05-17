@@ -15,8 +15,8 @@ from typing import Any
 
 from sqlalchemy import func, select, update
 
-from mc3.integrations.database import get_session_factory
-from mc3.models.edge import EdgeNode, EdgeTenant
+from mc2.integrations.database import get_session_factory
+from mc2.models.edge import EdgeNode, EdgeTenant
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +146,7 @@ async def get_tenant_license(tenant_id: str) -> dict[str, Any]:
         )
         tenant = tenant_result.scalar_one_or_none()
         if tenant is None:
-            from mc3.services.core_client import CoreClientError
+            from mc2.services.core_client import CoreClientError
             raise CoreClientError(404, f"Tenant {tenant_id} not found")
 
         nodes_result = await session.execute(

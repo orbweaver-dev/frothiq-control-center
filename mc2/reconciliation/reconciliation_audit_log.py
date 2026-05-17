@@ -19,8 +19,8 @@ from typing import Any
 
 from sqlalchemy import delete, select
 
-from mc3.integrations.database import get_session_factory
-from mc3.models.reconciliation import ReconciliationAuditLog
+from mc2.integrations.database import get_session_factory
+from mc2.models.reconciliation import ReconciliationAuditLog
 
 logger = logging.getLogger(__name__)
 

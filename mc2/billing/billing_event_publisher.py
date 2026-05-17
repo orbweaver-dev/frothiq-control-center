@@ -23,9 +23,9 @@ from typing import Any
 import httpx
 from sqlalchemy import select
 
-from mc3.integrations.redis_client import get_pubsub_client
-from mc3.integrations.database import get_session_factory
-from mc3.models.edge import EdgeNode, EdgeTenant
+from mc2.integrations.redis_client import get_pubsub_client
+from mc2.integrations.database import get_session_factory
+from mc2.models.edge import EdgeNode, EdgeTenant
 
 logger = logging.getLogger(__name__)
 

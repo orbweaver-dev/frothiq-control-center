@@ -28,14 +28,14 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
-from mc3.auth import (
+from mc2.auth import (
     TokenPayload,
     require_read_only,
     require_security_analyst,
     require_super_admin,
 )
-from mc3.services.audit_service import log_action
-from mc3.services.core_client import CoreClientError, core_client
+from mc2.services.audit_service import log_action
+from mc2.services.core_client import CoreClientError, core_client
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/propagation", tags=["threat-propagation"])
@@ -112,7 +112,7 @@ async def _push_envelope_to_edge(tenant_id: str, wire: dict) -> bool:
     and deliver the envelope via HTTP POST.
     Returns True on success, False on failure.
     """
-    from mc3.services.edge_service import get_edge_endpoint
+    from mc2.services.edge_service import get_edge_endpoint
 
     try:
         endpoint = await get_edge_endpoint(tenant_id)

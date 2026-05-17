@@ -31,10 +31,10 @@ from typing import Any
 import httpx
 from sqlalchemy import select, update
 
-from mc3.integrations.database import get_session_factory
-from mc3.integrations.redis_client import get_cache_client
-from mc3.models.predictive_sync import StagedContractRecord
-from mc3.predictive_sync.preemptive_state_builder import ProjectedState
+from mc2.integrations.database import get_session_factory
+from mc2.integrations.redis_client import get_cache_client
+from mc2.models.predictive_sync import StagedContractRecord
+from mc2.predictive_sync.preemptive_state_builder import ProjectedState
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ async def _retire_existing_contract(tenant_id: str) -> dict[str, Any] | None:
 
     # 1. Send INVALIDATE to edges (before inserting new contract)
     if old_id:
-        from mc3.predictive_sync.preemptive_contract_generator import (
+        from mc2.predictive_sync.preemptive_contract_generator import (
             make_invalidation_message,
         )
         inv_msg = make_invalidation_message(
@@ -110,7 +110,7 @@ async def _retire_existing_contract(tenant_id: str) -> dict[str, Any] | None:
     )
 
     # Increment replacement metric
-    from mc3.predictive_sync.prediction_accuracy_tracker import (
+    from mc2.predictive_sync.prediction_accuracy_tracker import (
         record_replacement,
     )
     await record_replacement(tenant_id)
@@ -298,7 +298,7 @@ async def expire_stale_contracts() -> int:
 
 async def _push_to_edges(tenant_id: str, contract: dict[str, Any]) -> list[str]:
     """HTTP POST staged contract to each active edge node."""
-    from mc3.billing.billing_event_publisher import (
+    from mc2.billing.billing_event_publisher import (
         _get_edge_nodes,
         _build_edge_billing_url,
     )
@@ -335,7 +335,7 @@ async def _broadcast_control_message(
     tenant_id: str, message: dict[str, Any]
 ) -> None:
     """Send an activate or invalidate control message to all edge nodes."""
-    from mc3.billing.billing_event_publisher import (
+    from mc2.billing.billing_event_publisher import (
         _get_edge_nodes,
         _build_edge_billing_url,
     )

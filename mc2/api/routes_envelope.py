@@ -6,14 +6,14 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
 
-from mc3.auth import TokenPayload, require_read_only, require_security_analyst
-from mc3.services import (
+from mc2.auth import TokenPayload, require_read_only, require_security_analyst
+from mc2.services import (
     get_envelope_diff,
     get_envelope_history,
     get_tenant_envelope,
     verify_all_envelopes,
 )
-from mc3.services.core_client import CoreClientError
+from mc2.services.core_client import CoreClientError
 from fastapi import HTTPException
 
 from pydantic import BaseModel

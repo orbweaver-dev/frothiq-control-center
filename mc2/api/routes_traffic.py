@@ -19,7 +19,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, Query, Request
 
-from mc3.auth import TokenPayload, require_security_analyst
+from mc2.auth import TokenPayload, require_security_analyst
 
 router = APIRouter(prefix="/traffic", tags=["traffic"])
 
@@ -427,7 +427,7 @@ async def get_server_feed(
     _: TokenPayload = Depends(require_security_analyst),
 ):
     """
-    Combined whole-server traffic feed: gateway audit stream (mc3) + nginx access log
+    Combined whole-server traffic feed: gateway audit stream (mc2) + nginx access log
     (all Frappe sites). Entries sorted newest first. Annotated with security_action.
     """
     redis = request.state.redis
@@ -673,7 +673,7 @@ async def get_enforcement_log(
     Recent automatic enforcement actions taken by the policy enforcement engine.
     Returns newest-first list of temp-ban events with IP, reason, and timestamp.
     """
-    from mc3.services.enforcement_engine import (
+    from mc2.services.enforcement_engine import (
         LOG_STREAM, SCAN_INTERVAL, WINDOW_SECONDS, RATE_THRESHOLD, ERROR_RATE_THRESHOLD,
     )
     redis = request.state.redis
@@ -747,7 +747,7 @@ async def get_ip_info(
     Return geolocation, hostname, ISP, and bot/human classification for a list of IPs.
     Results are cached in Redis for 24 hours to minimise external API calls.
     """
-    from mc3.services.ip_enrichment import enrich_ips
+    from mc2.services.ip_enrichment import enrich_ips
     ip_list = [ip.strip() for ip in ips.split(",") if ip.strip()][:50]
     if not ip_list:
         return {}

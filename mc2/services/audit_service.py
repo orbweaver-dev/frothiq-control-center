@@ -71,7 +71,7 @@ async def log_action(
     # Write to database
     if db is not None:
         try:
-            from mc3.models.user import AuditLog
+            from mc2.models.user import AuditLog
             log_row = AuditLog(**entry)
             db.add(log_row)
             await db.commit()
@@ -108,7 +108,7 @@ async def get_recent_audit_log(
     Fetch paginated audit log entries from PostgreSQL.
     """
     from sqlalchemy import desc, select
-    from mc3.models.user import AuditLog
+    from mc2.models.user import AuditLog
 
     offset = (page - 1) * page_size
     q = select(AuditLog).order_by(desc(AuditLog.created_at)).offset(offset).limit(page_size)

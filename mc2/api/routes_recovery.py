@@ -10,8 +10,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from mc3.auth.jwt_handler import TokenPayload, get_current_user, require_role
-from mc3.services.rollback_recovery_engine import (
+from mc2.auth.jwt_handler import TokenPayload, get_current_user, require_role
+from mc2.services.rollback_recovery_engine import (
     get_recovery_stats,
     list_recovery_events,
     recover_node,

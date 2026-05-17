@@ -13,7 +13,7 @@ import subprocess
 
 from fastapi import APIRouter, Depends
 
-from mc3.auth import TokenPayload, require_super_admin
+from mc2.auth import TokenPayload, require_super_admin
 
 router = APIRouter(prefix="/sysinfo/mail", tags=["mail"])
 

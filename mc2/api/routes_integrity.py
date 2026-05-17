@@ -11,8 +11,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from mc3.auth.jwt_handler import TokenPayload, get_current_user
-from mc3.services.integrity_service import (
+from mc2.auth.jwt_handler import TokenPayload, get_current_user
+from mc2.services.integrity_service import (
     get_fleet_stats,
     score_fleet,
     score_node,

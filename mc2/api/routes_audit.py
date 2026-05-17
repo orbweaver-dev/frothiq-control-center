@@ -6,8 +6,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query, Request
 
-from mc3.auth import TokenPayload, require_security_analyst
-from mc3.services.audit_service import get_recent_audit_log
+from mc2.auth import TokenPayload, require_security_analyst
+from mc2.services.audit_service import get_recent_audit_log
 
 router = APIRouter(prefix="/audit", tags=["audit"])
 

@@ -23,7 +23,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
-from mc3.security.encryption import EncryptedText
+from mc2.security.encryption import EncryptedText
 
 from .user import Base, _utcnow
 

@@ -10,7 +10,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends
 
-from mc3.auth import TokenPayload, require_super_admin
+from mc2.auth import TokenPayload, require_super_admin
 
 router = APIRouter(prefix="/bandwidth", tags=["bandwidth"])
 Auth = Annotated[TokenPayload, Depends(require_super_admin)]

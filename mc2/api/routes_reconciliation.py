@@ -20,29 +20,29 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from pydantic import BaseModel
 
-from mc3.auth import (
+from mc2.auth import (
     require_billing_admin,
     require_read_only,
     require_super_admin,
 )
-from mc3.billing.license_state_cache import (
+from mc2.billing.license_state_cache import (
     get_all_billing_states,
     get_billing_state,
 )
-from mc3.reconciliation.drift_detector import (
+from mc2.reconciliation.drift_detector import (
     DriftReport,
     detect_drift,
     detect_all_drift,
 )
-from mc3.reconciliation.edge_ack_tracker import (
+from mc2.reconciliation.edge_ack_tracker import (
     get_tenant_ack_status,
     record_ack,
 )
-from mc3.reconciliation.reconciliation_audit_log import (
+from mc2.reconciliation.reconciliation_audit_log import (
     get_log_stats,
     get_recent_log,
 )
-from mc3.reconciliation.reconciliation_engine import (
+from mc2.reconciliation.reconciliation_engine import (
     reconcile_all,
     reconcile_tenant,
 )
@@ -62,7 +62,7 @@ async def get_all_drift(
     Return current drift status for all known tenants.
     Compares MC3 cache against a fresh ERPNext pull for each tenant.
     """
-    from mc3.billing.billing_sync_client import pull_tenant_state
+    from mc2.billing.billing_sync_client import pull_tenant_state
 
     all_states = await get_all_billing_states()
     tenant_ids = [s["tenant_id"] for s in all_states]
@@ -96,7 +96,7 @@ async def get_tenant_drift(
     _user: Any = Depends(require_read_only),
 ) -> dict[str, Any]:
     """Return drift status for a single tenant."""
-    from mc3.billing.billing_sync_client import pull_tenant_state
+    from mc2.billing.billing_sync_client import pull_tenant_state
 
     mc3_state  = await get_billing_state(tenant_id)
     erp_state  = await pull_tenant_state(tenant_id)
@@ -267,7 +267,7 @@ async def receive_edge_ack(
     This endpoint is intentionally public (no JWT) because edge plugins
     authenticate via HMAC signature on the payload, not session tokens.
     """
-    from mc3.config import get_settings
+    from mc2.config import get_settings
     settings = get_settings()
     signing_secret = getattr(settings, "gateway_signing_key", "")
 

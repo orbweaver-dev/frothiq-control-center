@@ -12,7 +12,7 @@ Implementation uses asyncio.sleep loops launched as named tasks in main.py
 lifespan — no external scheduler dependency needed.
 
 Usage (from main.py lifespan):
-    from mc3.reconciliation.reconciliation_scheduler import (
+    from mc2.reconciliation.reconciliation_scheduler import (
         ReconciliationScheduler
     )
     scheduler = ReconciliationScheduler()
@@ -29,12 +29,12 @@ import random
 import time
 from datetime import datetime, timezone
 
-from mc3.billing.license_state_cache import get_all_billing_states
-from mc3.reconciliation.reconciliation_engine import (
+from mc2.billing.license_state_cache import get_all_billing_states
+from mc2.reconciliation.reconciliation_engine import (
     reconcile_all,
     reconcile_tenant,
 )
-from mc3.reconciliation.reconciliation_audit_log import (
+from mc2.reconciliation.reconciliation_audit_log import (
     prune_old_entries,
 )
 

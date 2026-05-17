@@ -33,9 +33,9 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 
-from mc3.integrations.database import get_session_factory
-from mc3.models.reconciliation import EdgeAckRecord
-from mc3.models.user import _utcnow
+from mc2.integrations.database import get_session_factory
+from mc2.models.reconciliation import EdgeAckRecord
+from mc2.models.user import _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +83,7 @@ async def record_ack(
         retry_count=0,           # reset on successful ACK
     )
 
-    from mc3.reconciliation.reconciliation_audit_log import log_edge_ack
+    from mc2.reconciliation.reconciliation_audit_log import log_edge_ack
     await log_edge_ack(
         tenant_id=tenant_id,
         edge_id=edge_id,

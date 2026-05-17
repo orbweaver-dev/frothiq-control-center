@@ -21,12 +21,12 @@ from typing import Any
 
 import httpx
 
-from mc3.billing.license_state_cache import (
+from mc2.billing.license_state_cache import (
     get_billing_state,
     get_all_billing_states,
     set_billing_state,
 )
-from mc3.billing.subscription_state_machine import (
+from mc2.billing.subscription_state_machine import (
     SubscriptionState,
     apply_event,
     erpnext_status_to_state,

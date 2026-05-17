@@ -25,8 +25,8 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from mc3.integrations.database import get_session_factory
-from mc3.models.edge import EdgeEulaRecord, EdgeNode
+from mc2.integrations.database import get_session_factory
+from mc2.models.edge import EdgeEulaRecord, EdgeNode
 
 # Must stay in sync with routes_edge.py LATEST_PLUGIN_VERSION
 CURRENT_PLUGIN_VERSION = "0.25.4"

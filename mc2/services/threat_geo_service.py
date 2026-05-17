@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 import httpx
 from sqlalchemy import text
 
-from mc3.integrations.database import get_session_factory
+from mc2.integrations.database import get_session_factory
 
 logger = logging.getLogger(__name__)
 

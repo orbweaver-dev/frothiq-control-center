@@ -14,9 +14,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from mc3.auth import TokenPayload, require_super_admin
-from mc3.integrations.database import get_session_factory
-from mc3.services import frothiq_nft_service as svc
+from mc2.auth import TokenPayload, require_super_admin
+from mc2.integrations.database import get_session_factory
+from mc2.services import frothiq_nft_service as svc
 
 router = APIRouter(prefix="/frothiq-nft", tags=["frothiq-nft"])
 
@@ -348,7 +348,7 @@ async def list_cidr_recommendations(
     Each recommendation represents a CIDR range that could replace multiple
     individual IP blacklist entries, reducing list size and improving coverage.
     """
-    from mc3.services import cidr_analyzer
+    from mc2.services import cidr_analyzer
     recs = await cidr_analyzer.list_recommendations(session, status)
 
     pending = [r for r in recs if r["status"] == "pending"]
@@ -370,7 +370,7 @@ async def trigger_cidr_scan(
     Trigger an immediate CIDR consolidation scan of the live blacklist.
     Results are persisted as recommendations for operator review.
     """
-    from mc3.services import cidr_analyzer
+    from mc2.services import cidr_analyzer
     result = await cidr_analyzer.run_scan(session)
     return result
 
@@ -388,7 +388,7 @@ async def apply_cidr_recommendation(
     - Removes individual IPs now covered by the CIDR from nftables
     - Removes covered IPs from the frothiq_ip_list DB table
     """
-    from mc3.services import cidr_analyzer
+    from mc2.services import cidr_analyzer
     result = await cidr_analyzer.apply_recommendation(session, rec_id, token.email)
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error"))
@@ -403,7 +403,7 @@ async def dismiss_cidr_recommendation(
     session: AsyncSession = Depends(_db),
 ):
     """Dismiss a pending CIDR recommendation without applying it."""
-    from mc3.services import cidr_analyzer
+    from mc2.services import cidr_analyzer
     result = await cidr_analyzer.dismiss_recommendation(session, rec_id, token.email)
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error"))

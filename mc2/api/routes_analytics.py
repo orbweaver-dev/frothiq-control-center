@@ -17,7 +17,7 @@ from .routes_auth import require_super_admin
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
-SA_KEY_FILE = Path("/var/lib/mc3/gsc-sa-key.json")
+SA_KEY_FILE = Path("/var/lib/mc2/gsc-sa-key.json")
 GSC_BASE = "https://searchconsole.googleapis.com/webmasters/v3"
 GSC_V1_BASE = "https://searchconsole.googleapis.com/v1"
 
@@ -26,7 +26,7 @@ GSC_V1_BASE = "https://searchconsole.googleapis.com/v1"
 
 def _get_sa_token(scope: str) -> str:
     if not SA_KEY_FILE.exists():
-        raise HTTPException(503, "GSC service account key not configured at /var/lib/mc3/gsc-sa-key.json")
+        raise HTTPException(503, "GSC service account key not configured at /var/lib/mc2/gsc-sa-key.json")
     key_data = json.loads(SA_KEY_FILE.read_text())
     private_key = serialization.load_pem_private_key(key_data["private_key"].encode(), password=None)
     now = int(time.time())

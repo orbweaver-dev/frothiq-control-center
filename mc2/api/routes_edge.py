@@ -28,8 +28,8 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
-from mc3.auth.jwt_handler import TokenPayload, get_current_user, require_role
-from mc3.services.edge_service import (
+from mc2.auth.jwt_handler import TokenPayload, get_current_user, require_role
+from mc2.services.edge_service import (
     auto_compile_attack_report,
     get_blocklist,
     get_eula_version,
@@ -620,8 +620,8 @@ async def report_outage(body: EdgeOutageRequest) -> dict[str, Any]:
     if not _verify_license_token(body.edge_id, body.license_token):
         raise HTTPException(status_code=401, detail="Invalid license token")
 
-    from mc3.integrations.database import get_session_factory as _gsf
-    from mc3.services.edge_outage_service import receive_plugin_outage
+    from mc2.integrations.database import get_session_factory as _gsf
+    from mc2.services.edge_outage_service import receive_plugin_outage
 
     factory = _gsf()
     async with factory() as session:
@@ -654,8 +654,8 @@ async def list_outages(
     current_user: TokenPayload = Depends(require_role("read_only")),
 ) -> dict[str, Any]:
     """Return recent outage events across all edge nodes. read_only+ required."""
-    from mc3.integrations.database import get_session_factory as _gsf
-    from mc3.services.edge_outage_service import get_recent_outages
+    from mc2.integrations.database import get_session_factory as _gsf
+    from mc2.services.edge_outage_service import get_recent_outages
 
     factory = _gsf()
     async with factory() as session:
@@ -688,7 +688,7 @@ async def submit_ticket(body: EdgeTicketRequest) -> dict[str, Any]:
     if not _verify_license_token(body.edge_id, body.license_token):
         raise HTTPException(status_code=401, detail="Invalid license token")
 
-    from mc3.services import frappe_ticket_client as _ftc
+    from mc2.services import frappe_ticket_client as _ftc
 
     ref_tag = f"edge:{body.edge_id[:24]}"
     existing = await _ftc.find_open_issue(ref_tag)
@@ -743,7 +743,7 @@ async def list_tickets(
     if not _verify_license_token(edge_id, license_token):
         raise HTTPException(status_code=401, detail="Invalid license token")
 
-    from mc3.services import frappe_ticket_client as _ftc
+    from mc2.services import frappe_ticket_client as _ftc
 
     tickets = await _ftc.get_issues_for_edge(edge_id, limit=20)
     return {"ok": True, "tickets": tickets, "count": len(tickets)}
@@ -760,7 +760,7 @@ async def list_edge_attack_reports(
     if not _verify_license_token(edge_id, license_token):
         raise HTTPException(status_code=401, detail="Invalid license token")
 
-    from mc3.services.edge_service import list_attack_reports
+    from mc2.services.edge_service import list_attack_reports
     result = await list_attack_reports(limit=min(limit, 100), offset=offset, edge_id=edge_id)
     return {"ok": True, **result}
 

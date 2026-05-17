@@ -31,12 +31,12 @@ from pydantic import BaseModel, EmailStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from mc3.auth import verify_password
-from mc3.config import get_settings
-from mc3.middleware.ip_allowlist import build_allowlist, _ip_in_allowlist, _LOCALHOST_IPS
-from mc3.models.enrollment import IPAllowlist, IPEnrollmentPending
-from mc3.models.user import CCUser
-from mc3.services.audit_service import log_action
+from mc2.auth import verify_password
+from mc2.config import get_settings
+from mc2.middleware.ip_allowlist import build_allowlist, _ip_in_allowlist, _LOCALHOST_IPS
+from mc2.models.enrollment import IPAllowlist, IPEnrollmentPending
+from mc2.models.user import CCUser
+from mc2.services.audit_service import log_action
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["enrollment"])
@@ -115,7 +115,7 @@ async def _send_approval_email(ip: str, user_email: str, raw_token: str) -> None
     smtp_from = smtp_cfg.get("smtp_from", settings.smtp_from)
     sender_name = smtp_cfg.get("sender_name", "OrbWeaver MC²")
 
-    approval_url = f"https://mc3.orbweaver.dev/api/v1/cc/auth/approve-ip/{raw_token}"
+    approval_url = f"https://mc2.orbweaver.dev/api/v1/cc/auth/approve-ip/{raw_token}"
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     html = f"""<!DOCTYPE html>
@@ -176,7 +176,7 @@ def _approval_html(success: bool, ip: str = "", message: str = "") -> str:
     <div style="font-size:48px;margin-bottom:16px">{"✅" if success else "❌"}</div>
     <h2 style="color:{color};margin:0 0 12px">{title}</h2>
     <p style="color:#94a3b8;margin:0 0 24px">{body}</p>
-    <a href="https://mc3.orbweaver.dev" style="color:#4f8ef7;text-decoration:none;font-size:14px">← Return to MC²</a>
+    <a href="https://mc2.orbweaver.dev" style="color:#4f8ef7;text-decoration:none;font-size:14px">← Return to MC²</a>
   </div>
 </body>
 </html>"""

@@ -34,26 +34,26 @@ import logging
 import time
 from typing import Any
 
-from mc3.billing.billing_event_publisher import publish_billing_update
-from mc3.billing.billing_sync_client import pull_tenant_state
-from mc3.billing.billing_sync_client import _apply_and_persist
-from mc3.billing.license_state_cache import (
+from mc2.billing.billing_event_publisher import publish_billing_update
+from mc2.billing.billing_sync_client import pull_tenant_state
+from mc2.billing.billing_sync_client import _apply_and_persist
+from mc2.billing.license_state_cache import (
     get_billing_state,
     invalidate_cache,
 )
-from mc3.reconciliation.drift_detector import (
+from mc2.reconciliation.drift_detector import (
     DriftReport,
     DriftType,
     DriftSeverity,
     detect_drift,
 )
-from mc3.reconciliation.reconciliation_audit_log import (
+from mc2.reconciliation.reconciliation_audit_log import (
     log_deferred,
     log_drift_detected,
     log_error,
     log_reconciled,
 )
-from mc3.reconciliation.edge_ack_tracker import (
+from mc2.reconciliation.edge_ack_tracker import (
     record_push,
     record_push_failure,
 )
@@ -324,8 +324,8 @@ async def _push_contract_to_edges(
     Returns True if at least one edge was reached.
     """
     import httpx
-    from mc3.reconciliation.edge_ack_tracker import record_push, record_push_failure
-    from mc3.billing.billing_event_publisher import _get_edge_nodes, _build_edge_billing_url
+    from mc2.reconciliation.edge_ack_tracker import record_push, record_push_failure
+    from mc2.billing.billing_event_publisher import _get_edge_nodes, _build_edge_billing_url
 
     nodes = await _get_edge_nodes(tenant_id)
     if not nodes:

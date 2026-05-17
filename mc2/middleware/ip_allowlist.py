@@ -30,7 +30,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from mc3.config import get_settings
+from mc2.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +116,7 @@ async def build_allowlist(redis, db) -> list[str]:
 async def _load_db_ips(db) -> list[str]:
     """Query the cc_ip_allowlist table. Returns empty list on error."""
     try:
-        from mc3.models.enrollment import IPAllowlist
+        from mc2.models.enrollment import IPAllowlist
         result = await db.execute(select(IPAllowlist.ip))
         return [row[0] for row in result.all()]
     except Exception as exc:

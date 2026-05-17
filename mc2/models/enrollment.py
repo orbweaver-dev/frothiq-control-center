@@ -7,7 +7,7 @@ from datetime import datetime
 
 from sqlalchemy import Boolean, Column, DateTime, String, Text
 
-from mc3.models.user import Base
+from mc2.models.user import Base
 
 
 class IPAllowlist(Base):

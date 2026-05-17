@@ -26,26 +26,26 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from mc3.auth import (
+from mc2.auth import (
     require_billing_admin,
     require_read_only,
     require_super_admin,
 )
-from mc3.billing.billing_event_publisher import publish_billing_update
-from mc3.billing.billing_sync_client import (
+from mc2.billing.billing_event_publisher import publish_billing_update
+from mc2.billing.billing_sync_client import (
     pull_all_tenants,
     pull_tenant_state,
 )
-from mc3.billing.billing_sync_webhook import (
+from mc2.billing.billing_sync_webhook import (
     WebhookValidationError,
     process_webhook,
 )
-from mc3.billing.license_state_cache import (
+from mc2.billing.license_state_cache import (
     get_all_billing_states,
     get_billing_state,
     invalidate_cache,
 )
-from mc3.config import get_settings
+from mc2.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +102,7 @@ async def webhook_subscription(
             # It checks whether any staged (pre-predicted) contract matches
             # the confirmed state and activates or invalidates it on edges.
             try:
-                from mc3.predictive_sync.confirmation_listener import (
+                from mc2.predictive_sync.confirmation_listener import (
                     on_billing_confirmed,
                 )
                 asyncio.create_task(
@@ -258,7 +258,7 @@ async def billing_sync_health(
     Return health metrics for the billing sync subsystem.
     Checks Redis connectivity and DB row count.
     """
-    from mc3.integrations.redis_client import get_cache_client
+    from mc2.integrations.redis_client import get_cache_client
 
     redis_ok = False
     cache_key_count = 0

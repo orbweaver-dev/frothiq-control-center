@@ -24,9 +24,9 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from mc3.integrations.database import get_session_factory
-from mc3.models.defense_settings import FrothiqIPEntry
-from mc3.models.edge import EdgeNode, ThreatReport
+from mc2.integrations.database import get_session_factory
+from mc2.models.defense_settings import FrothiqIPEntry
+from mc2.models.edge import EdgeNode, ThreatReport
 
 logger = logging.getLogger(__name__)
 

@@ -19,7 +19,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
-from mc3.auth import TokenPayload, require_super_admin
+from mc2.auth import TokenPayload, require_super_admin
 
 router = APIRouter(prefix="/wp-seo", tags=["wp-seo"])
 Auth = Annotated[TokenPayload, Depends(require_super_admin)]

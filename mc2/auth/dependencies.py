@@ -2,7 +2,7 @@
 FastAPI dependency injection for authentication + authorization.
 
 Usage:
-  from mc3.auth.dependencies import (
+  from mc2.auth.dependencies import (
       get_current_user, require_role, require_super_admin,
       require_security_analyst, require_billing_admin,
   )
@@ -94,7 +94,7 @@ async def get_api_key_service(request: Request) -> str:
     Validates a static service-to-service API key.
     Used by internal endpoints called from frothiq-core or other services.
     """
-    from mc3.config import get_settings
+    from mc2.config import get_settings
 
     settings = get_settings()
     key = request.headers.get("X-Service-Key") or request.headers.get("X-API-Key")

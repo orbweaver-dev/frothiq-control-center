@@ -6,17 +6,17 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from mc3.auth import TokenPayload, get_current_user, require_read_only, require_security_analyst
-from mc3.services import (
+from mc2.auth import TokenPayload, get_current_user, require_read_only, require_security_analyst
+from mc2.services import (
     get_all_clusters,
     get_cluster_detail,
     get_engine_status,
     get_propagation_graph,
     get_suggested_actions,
 )
-from mc3.services.core_client import CoreClientError
-from mc3.services.audit_service import log_action
-from mc3.services.threat_geo_service import get_threat_overview
+from mc2.services.core_client import CoreClientError
+from mc2.services.audit_service import log_action
+from mc2.services.threat_geo_service import get_threat_overview
 
 router = APIRouter(prefix="/defense", tags=["defense-mesh"])
 

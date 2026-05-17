@@ -29,8 +29,8 @@ from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
 
-from mc3.auth import require_read_only, require_super_admin
-from mc3.services.storage_account_service import (
+from mc2.auth import require_read_only, require_super_admin
+from mc2.services.storage_account_service import (
     get_account,
     s3_client,
 )

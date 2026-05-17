@@ -34,8 +34,8 @@ import time
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from mc3.auth.jwt_handler import decode_token
-from mc3.config import get_settings
+from mc2.auth.jwt_handler import decode_token
+from mc2.config import get_settings
 from .connection_manager import connection_manager
 
 logger = logging.getLogger(__name__)

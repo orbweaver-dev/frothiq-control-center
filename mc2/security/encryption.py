@@ -23,7 +23,7 @@ _DOMAIN_TAG = b"teleops-encryption-v1"
 
 @lru_cache(maxsize=1)
 def _fernet() -> Fernet:
-	from mc3.config import get_settings
+	from mc2.config import get_settings
 
 	seed = get_settings().secret_key.encode("utf-8")
 	key = base64.urlsafe_b64encode(hashlib.sha256(seed + _DOMAIN_TAG).digest())

@@ -27,10 +27,10 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from mc3.auth.dependencies import require_role
-from mc3.auth.jwt_handler import TokenPayload as TokenData
-from mc3.config import get_settings
-from mc3.services.audit_service import log_action
+from mc2.auth.dependencies import require_role
+from mc2.auth.jwt_handler import TokenPayload as TokenData
+from mc2.config import get_settings
+from mc2.services.audit_service import log_action
 
 logger = logging.getLogger(__name__)
 

@@ -44,7 +44,7 @@ router = APIRouter(prefix="/vultr", tags=["vultr"])
 # Settings persistence
 # ---------------------------------------------------------------------------
 
-_SETTINGS_FILE = Path(os.environ.get("CC_VULTR_SETTINGS", "/var/lib/mc3/vultr-settings.json"))
+_SETTINGS_FILE = Path(os.environ.get("CC_VULTR_SETTINGS", "/var/lib/mc2/vultr-settings.json"))
 
 
 def _load_settings() -> dict:

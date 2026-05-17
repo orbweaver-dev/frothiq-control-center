@@ -20,25 +20,25 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from mc3.auth import (
+from mc2.auth import (
     require_billing_admin,
     require_read_only,
     require_super_admin,
 )
-from mc3.predictive_sync.predictive_signal_detector import (
+from mc2.predictive_sync.predictive_signal_detector import (
     detect_signals_all_tenants,
     detect_signals_for_tenant,
 )
-from mc3.predictive_sync.staged_contract_dispatcher import (
+from mc2.predictive_sync.staged_contract_dispatcher import (
     get_all_staged_contracts,
     get_staged_contract,
     invalidate_staged_contract,
 )
-from mc3.predictive_sync.prediction_accuracy_tracker import (
+from mc2.predictive_sync.prediction_accuracy_tracker import (
     get_accuracy_metrics,
     get_accuracy_history,
 )
-from mc3.predictive_sync.predictive_sync_orchestrator import (
+from mc2.predictive_sync.predictive_sync_orchestrator import (
     run_all_tenants,
     run_for_tenant,
 )

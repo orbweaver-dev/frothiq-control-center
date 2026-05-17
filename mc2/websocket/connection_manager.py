@@ -22,7 +22,7 @@ from typing import Any
 
 from fastapi import WebSocket
 
-from mc3.auth.jwt_handler import ROLE_LEVEL
+from mc2.auth.jwt_handler import ROLE_LEVEL
 
 logger = logging.getLogger(__name__)
 
