@@ -52,15 +52,33 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
 
 
 async def create_tables() -> None:
-    """Create all tables if they don't exist. Idempotent (uses checkfirst=True)."""
-    engine = get_engine()
-    async with engine.begin() as conn:
-        await conn.run_sync(lambda c: Base.metadata.create_all(c, checkfirst=True))
-    await _migrate_totp_columns()
-    await _migrate_threat_reports()
-    await _migrate_outage_ticket_column()
-    await _seed_admin_ip()
-    logger.info("Database tables ready")
+    """Create all tables if they don't exist. Idempotent (uses checkfirst=True).
+
+    Gated behind an fcntl exclusive file lock so when uvicorn starts multiple
+    workers, only one runs the migrations at a time. Without this, the workers
+    race on CREATE TABLE and the loser logs "Table already exists" errors on
+    every new model added.
+    """
+    import fcntl
+    import os
+
+    lockfile = "/run/mc2/create-tables.lock" if os.path.isdir("/run/mc2") else "/tmp/mc2-create-tables.lock"
+    fd = os.open(lockfile, os.O_CREAT | os.O_WRONLY, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        engine = get_engine()
+        async with engine.begin() as conn:
+            await conn.run_sync(lambda c: Base.metadata.create_all(c, checkfirst=True))
+        await _migrate_totp_columns()
+        await _migrate_threat_reports()
+        await _migrate_outage_ticket_column()
+        await _seed_admin_ip()
+        logger.info("Database tables ready")
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 async def _migrate_totp_columns() -> None:
