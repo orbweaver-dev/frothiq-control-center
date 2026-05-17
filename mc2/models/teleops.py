@@ -315,3 +315,79 @@ class TeleopsNodePosition(Base, SyncMixin):
 	node_uid: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
 	x: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
 	y: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE C — Trust layer: Locks + History (sync ingest is endpoint-level only)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TeleopsRecordLock(Base):
+	"""Per-record edit lock. Keyed by the record's uid (NOT auto-generated).
+
+	A single row per locked record. Absence of a row OR expires_at < now means
+	the record is unlocked.
+	"""
+
+	__tablename__ = "teleops_record_locks"
+
+	uid: Mapped[str] = mapped_column(String(36), primary_key=True)
+	locked_by_user: Mapped[str] = mapped_column(String(255), nullable=False)
+	locked_by_surface: Mapped[str] = mapped_column(String(64), nullable=False)
+	locked_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+	expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+	last_heartbeat_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+
+
+class TeleopsRecordHistory(Base):
+	"""Append-only audit + undo log. Every save by either surface writes a row."""
+
+	__tablename__ = "teleops_record_history"
+
+	id: Mapped[str] = mapped_column(
+		String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+	)
+	record_uid: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+	record_type: Mapped[str] = mapped_column(String(32), nullable=False)
+	version_after: Mapped[int] = mapped_column(Integer, nullable=False)
+	change_type: Mapped[str] = mapped_column(String(16), nullable=False)
+	changed_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False, index=True)
+	changed_by: Mapped[str] = mapped_column(String(255), nullable=False)
+	surface: Mapped[str] = mapped_column(String(64), nullable=False)
+	payload_before: Mapped[str | None] = mapped_column(Text, nullable=True)
+	payload_after: Mapped[str | None] = mapped_column(Text, nullable=True)
+	change_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+	parent_history_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+	lock_uid: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE E — Call logs (CDR pulled from Twilio)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TeleopsCallLog(Base):
+	"""Twilio call detail record, normalized + linked to MC² registry where possible."""
+
+	__tablename__ = "teleops_call_logs"
+
+	twilio_call_sid: Mapped[str] = mapped_column(String(64), primary_key=True)
+	voip_account_uid: Mapped[str] = mapped_column(
+		String(36), ForeignKey("teleops_voip_accounts.uid"), nullable=False, index=True
+	)
+	phone_number_uid: Mapped[str | None] = mapped_column(
+		String(36), ForeignKey("teleops_phone_numbers.uid"), nullable=True, index=True
+	)
+	site_uid: Mapped[str | None] = mapped_column(
+		String(36), ForeignKey("teleops_sites.uid"), nullable=True, index=True
+	)
+	direction: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+	status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+	from_number: Mapped[str | None] = mapped_column(String(32), nullable=True)
+	to_number: Mapped[str | None] = mapped_column(String(32), nullable=True)
+	duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+	cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+	started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+	ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+	raw_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+	imported_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)

@@ -1698,3 +1698,620 @@ async def apply_routing(user: Auth, site_uid: str, dry_run: bool = True) -> dict
 			"plan": plan,
 			"note": "Apply-to-Twilio is not yet implemented; this endpoint currently only returns a plan. Phase B.2 wires up Twilio API writes.",
 		}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE C — Trust layer (Locks + Sync ingest + History/Revert)
+# ═════════════════════════════════════════════════════════════════════════════
+
+import hmac as _hmac
+import hashlib
+from datetime import timedelta as _td
+from mc2.models.teleops import TeleopsRecordLock, TeleopsRecordHistory
+
+
+_LOCK_TTL_MINUTES = 15
+_LOCK_HEARTBEAT_EXTEND_MINUTES = 15
+
+
+def _now() -> datetime:
+	return datetime.utcnow()
+
+
+# ── LOCKS ────────────────────────────────────────────────────────────────────
+
+class _LockAcquireIn(BaseModel):
+	uid: str
+	surface: str = "mc2"
+
+
+def _lock_to_out(L: TeleopsRecordLock) -> dict:
+	return {
+		"uid": L.uid,
+		"locked_by_user": L.locked_by_user,
+		"locked_by_surface": L.locked_by_surface,
+		"locked_at": L.locked_at.isoformat(),
+		"expires_at": L.expires_at.isoformat(),
+		"last_heartbeat_at": L.last_heartbeat_at.isoformat(),
+	}
+
+
+@router.post("/locks/acquire")
+async def lock_acquire(payload: _LockAcquireIn, user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		L = await session.get(TeleopsRecordLock, payload.uid)
+		now = _now()
+		if L and L.expires_at > now:
+			# Held by someone — refuse unless it's the SAME user reacquiring
+			if L.locked_by_user != user.email or L.locked_by_surface != payload.surface:
+				raise HTTPException(status_code=409, detail={
+					"reason": "locked_by_other",
+					"lock": _lock_to_out(L),
+				})
+			# Same user — refresh expiry (heartbeat semantics)
+			L.last_heartbeat_at = now
+			L.expires_at = now + _td(minutes=_LOCK_TTL_MINUTES)
+			await session.commit()
+			return {"ok": True, "lock": _lock_to_out(L), "reacquired": True}
+
+		if L:
+			# Expired — overwrite
+			L.locked_by_user = user.email
+			L.locked_by_surface = payload.surface
+			L.locked_at = now
+			L.last_heartbeat_at = now
+			L.expires_at = now + _td(minutes=_LOCK_TTL_MINUTES)
+		else:
+			L = TeleopsRecordLock(
+				uid=payload.uid,
+				locked_by_user=user.email,
+				locked_by_surface=payload.surface,
+				locked_at=now,
+				last_heartbeat_at=now,
+				expires_at=now + _td(minutes=_LOCK_TTL_MINUTES),
+			)
+			session.add(L)
+		await session.commit()
+		return {"ok": True, "lock": _lock_to_out(L), "reacquired": False}
+
+
+@router.post("/locks/heartbeat")
+async def lock_heartbeat(payload: _LockAcquireIn, user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		L = await session.get(TeleopsRecordLock, payload.uid)
+		if not L:
+			raise HTTPException(status_code=404, detail="No lock to heartbeat")
+		if L.locked_by_user != user.email:
+			raise HTTPException(status_code=403, detail="Lock held by another user")
+		L.last_heartbeat_at = _now()
+		L.expires_at = _now() + _td(minutes=_LOCK_HEARTBEAT_EXTEND_MINUTES)
+		await session.commit()
+		return {"ok": True, "lock": _lock_to_out(L)}
+
+
+@router.post("/locks/release")
+async def lock_release(payload: _LockAcquireIn, user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		L = await session.get(TeleopsRecordLock, payload.uid)
+		if not L:
+			return {"ok": True, "already_released": True}
+		if L.locked_by_user != user.email:
+			raise HTTPException(status_code=403, detail="Lock held by another user; use /locks/force-release")
+		await session.delete(L)
+		await session.commit()
+		return {"ok": True}
+
+
+@router.get("/locks/state")
+async def lock_state(user: Auth, uid: str) -> dict:
+	async with get_session_factory()() as session:
+		L = await session.get(TeleopsRecordLock, uid)
+		if not L or L.expires_at < _now():
+			return {"locked": False}
+		return {"locked": True, "lock": _lock_to_out(L)}
+
+
+@router.post("/locks/force-release")
+async def lock_force_release(payload: _LockAcquireIn, user: Auth) -> dict:
+	"""super_admin only (already gated by Auth dep). Writes a history note."""
+	async with get_session_factory()() as session:
+		L = await session.get(TeleopsRecordLock, payload.uid)
+		if not L:
+			return {"ok": True, "already_released": True}
+		prev = _lock_to_out(L)
+		await session.delete(L)
+		# Write force-release entry to history
+		session.add(TeleopsRecordHistory(
+			record_uid=payload.uid,
+			record_type="(unknown)",
+			version_after=0,
+			change_type="force_unlock",
+			changed_by=user.email,
+			surface="mc2",
+			change_summary=f"force-released lock held by {prev['locked_by_user']} ({prev['locked_by_surface']})",
+		))
+		await session.commit()
+		return {"ok": True, "force_released_from": prev}
+
+
+# ── SYNC INGEST (Site → MC²) ─────────────────────────────────────────────────
+
+class _SyncIngestIn(BaseModel):
+	uid: str
+	record_type: str
+	version: int
+	data: dict
+	last_modified_at: str | None = None
+	last_modified_by: str | None = None
+	surface: str = "site"
+
+
+@router.post("/sync/ingest")
+async def sync_ingest(payload: _SyncIngestIn, user: Auth) -> dict:
+	"""Receive a push from a per-site orbweaver_pbx. Writes a history row +
+	updates the corresponding MC² record (currently logs only; full upsert
+	per record_type is wired up alongside Phase D)."""
+	async with get_session_factory()() as session:
+		import json as _json
+		session.add(TeleopsRecordHistory(
+			record_uid=payload.uid,
+			record_type=payload.record_type,
+			version_after=payload.version,
+			change_type="update",
+			changed_by=payload.last_modified_by or user.email,
+			surface=payload.surface,
+			payload_after=_json.dumps(payload.data, default=str),
+			change_summary=f"sync ingest from {payload.surface}",
+		))
+		# Update mc3_synced_at on the corresponding record. For Phase C we only
+		# acknowledge — Phase D's per-record dispatcher applies the data.
+		await session.commit()
+		return {"ok": True, "received": True}
+
+
+# ── HISTORY / REVERT ─────────────────────────────────────────────────────────
+
+
+def _hist_to_out(h: TeleopsRecordHistory) -> dict:
+	return {
+		"id": h.id,
+		"record_uid": h.record_uid,
+		"record_type": h.record_type,
+		"version_after": h.version_after,
+		"change_type": h.change_type,
+		"changed_at": h.changed_at.isoformat() if h.changed_at else None,
+		"changed_by": h.changed_by,
+		"surface": h.surface,
+		"change_summary": h.change_summary,
+		"parent_history_id": h.parent_history_id,
+		"has_payload": bool(h.payload_after),
+	}
+
+
+@router.get("/history")
+async def history_list(user: Auth, uid: str | None = None, limit: int = 100) -> dict:
+	async with get_session_factory()() as session:
+		stmt = select(TeleopsRecordHistory).order_by(TeleopsRecordHistory.changed_at.desc()).limit(min(limit, 500))
+		if uid:
+			stmt = stmt.where(TeleopsRecordHistory.record_uid == uid)
+		rows = (await session.execute(stmt)).scalars().all()
+		return {"history": [_hist_to_out(h) for h in rows], "count": len(rows)}
+
+
+@router.get("/history/{id}")
+async def history_get(id: Annotated[str, Path()], user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		h = await session.get(TeleopsRecordHistory, id)
+		if not h:
+			raise HTTPException(status_code=404, detail="History entry not found")
+		out = _hist_to_out(h)
+		out["payload_before"] = h.payload_before
+		out["payload_after"] = h.payload_after
+		out["lock_uid"] = h.lock_uid
+		return out
+
+
+@router.post("/history/{id}/revert")
+async def history_revert(id: Annotated[str, Path()], user: Auth) -> dict:
+	"""Apply payload_before of a history entry as the new state of the record.
+	Writes a new history row of change_type='restore' with parent_history_id."""
+	async with get_session_factory()() as session:
+		h = await session.get(TeleopsRecordHistory, id)
+		if not h:
+			raise HTTPException(status_code=404, detail="History entry not found")
+		if not h.payload_before:
+			raise HTTPException(status_code=400, detail="No payload_before to revert to")
+		# Write a restore-marker history entry. The actual record application is
+		# the responsibility of the per-record dispatcher (paired with Phase D).
+		session.add(TeleopsRecordHistory(
+			record_uid=h.record_uid,
+			record_type=h.record_type,
+			version_after=h.version_after + 1,
+			change_type="restore",
+			changed_by=user.email,
+			surface="mc2",
+			payload_after=h.payload_before,
+			change_summary=f"reverted to history entry {h.id[:8]}",
+			parent_history_id=h.id,
+		))
+		await session.commit()
+		return {"ok": True, "restored_from": h.id, "note": "Restore queued — per-record application is handled by the Phase D dispatcher"}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE E — Call Logs (CDR) + Billing rollups
+# ═════════════════════════════════════════════════════════════════════════════
+
+from mc2.models.teleops import TeleopsCallLog
+
+
+def _cdr_to_out(c: TeleopsCallLog) -> dict:
+	return {
+		"twilio_call_sid": c.twilio_call_sid,
+		"voip_account_uid": c.voip_account_uid,
+		"phone_number_uid": c.phone_number_uid,
+		"site_uid": c.site_uid,
+		"direction": c.direction,
+		"status": c.status,
+		"from_number": c.from_number,
+		"to_number": c.to_number,
+		"duration_seconds": c.duration_seconds,
+		"cost_usd": c.cost_usd,
+		"started_at": c.started_at.isoformat() if c.started_at else None,
+		"ended_at": c.ended_at.isoformat() if c.ended_at else None,
+	}
+
+
+@router.post("/cdr/refresh")
+async def cdr_refresh(user: Auth, voip_account_uid: str, days: int = 7) -> dict:
+	"""Pull recent calls from Twilio's API and upsert into teleops_call_logs."""
+	async with get_session_factory()() as session:
+		acc = await session.get(TeleopsVoipAccount, voip_account_uid)
+		if not acc:
+			raise HTTPException(status_code=404, detail="VOIP Account not found")
+		if acc.provider != "twilio":
+			raise HTTPException(status_code=400, detail=f"CDR refresh not supported for provider {acc.provider}")
+		if not acc.auth_token:
+			raise HTTPException(status_code=400, detail="auth_token required to pull CDR")
+
+		# Build StartTime>=N days ago filter for Twilio
+		from datetime import timezone as _tz
+		start_after = datetime.utcnow() - _td(days=max(1, min(days, 90)))
+		start_str = start_after.strftime("%Y-%m-%d")
+		path = f"/Calls.json?StartTime%3E={start_str}&PageSize=100"
+
+		# E.164 → phone_number_uid lookup
+		pns = (await session.execute(
+			select(TeleopsPhoneNumber).where(TeleopsPhoneNumber.voip_account_uid == voip_account_uid)
+		)).scalars().all()
+		pn_by_e164 = {p.e164: p for p in pns}
+
+		imported = 0
+		updated = 0
+		while path:
+			data = await _twilio_get(acc.account_sid, acc.auth_token, path)
+			for call in data.get("calls", []):
+				sid = call.get("sid")
+				if not sid:
+					continue
+				existing = await session.get(TeleopsCallLog, sid)
+				direction = (call.get("direction") or "").replace("-", "_")
+				direction = "inbound" if direction.startswith("inbound") else "outbound" if direction.startswith("outbound") else direction or "unknown"
+				from_n = call.get("from")
+				to_n = call.get("to")
+				matched_pn = pn_by_e164.get(from_n) or pn_by_e164.get(to_n)
+				started_at = None
+				ended_at = None
+				try:
+					if call.get("start_time"):
+						started_at = datetime.strptime(call["start_time"], "%a, %d %b %Y %H:%M:%S %z").replace(tzinfo=None)
+					if call.get("end_time"):
+						ended_at = datetime.strptime(call["end_time"], "%a, %d %b %Y %H:%M:%S %z").replace(tzinfo=None)
+				except (ValueError, TypeError):
+					pass
+				price_raw = call.get("price")
+				cost_usd = None
+				try:
+					if price_raw is not None:
+						cost_usd = abs(float(price_raw))
+				except (ValueError, TypeError):
+					pass
+
+				if existing:
+					existing.status = call.get("status") or existing.status
+					existing.duration_seconds = int(call.get("duration") or 0) or existing.duration_seconds
+					existing.cost_usd = cost_usd if cost_usd is not None else existing.cost_usd
+					existing.ended_at = ended_at or existing.ended_at
+					updated += 1
+				else:
+					session.add(TeleopsCallLog(
+						twilio_call_sid=sid,
+						voip_account_uid=acc.uid,
+						phone_number_uid=matched_pn.uid if matched_pn else None,
+						site_uid=matched_pn.site_uid if matched_pn else None,
+						direction=direction,
+						status=call.get("status") or "unknown",
+						from_number=from_n,
+						to_number=to_n,
+						duration_seconds=int(call.get("duration") or 0) or None,
+						cost_usd=cost_usd,
+						started_at=started_at,
+						ended_at=ended_at,
+					))
+					imported += 1
+
+			next_uri = data.get("next_page_uri")
+			if next_uri and next_uri.startswith("/2010-04-01"):
+				next_uri = next_uri[len("/2010-04-01"):]
+			acct_prefix = f"/Accounts/{acc.account_sid}"
+			if next_uri and next_uri.startswith(acct_prefix):
+				next_uri = next_uri[len(acct_prefix):]
+			path = next_uri or None
+
+		await session.commit()
+		return {"imported": imported, "updated": updated, "days_pulled": days}
+
+
+@router.get("/cdr")
+async def cdr_list(
+	user: Auth,
+	site_uid: str | None = None,
+	voip_account_uid: str | None = None,
+	direction: str | None = None,
+	limit: int = 200,
+) -> dict:
+	async with get_session_factory()() as session:
+		stmt = select(TeleopsCallLog).order_by(TeleopsCallLog.started_at.desc()).limit(min(limit, 1000))
+		if site_uid:
+			stmt = stmt.where(TeleopsCallLog.site_uid == site_uid)
+		if voip_account_uid:
+			stmt = stmt.where(TeleopsCallLog.voip_account_uid == voip_account_uid)
+		if direction:
+			stmt = stmt.where(TeleopsCallLog.direction == direction)
+		rows = (await session.execute(stmt)).scalars().all()
+		return {"calls": [_cdr_to_out(c) for c in rows], "count": len(rows)}
+
+
+@router.get("/billing/rollup")
+async def billing_rollup(user: Auth, year: int, month: int) -> dict:
+	"""Aggregate teleops_call_logs cost by site + voip_account + phone number for a given month."""
+	from sqlalchemy import func
+	from datetime import date as _date
+	if not (1 <= month <= 12):
+		raise HTTPException(status_code=400, detail="month must be 1-12")
+	start = datetime(year, month, 1)
+	end = datetime(year + (month // 12), (month % 12) + 1, 1)
+
+	async with get_session_factory()() as session:
+		# By site
+		by_site_q = select(
+			TeleopsCallLog.site_uid,
+			func.count(TeleopsCallLog.twilio_call_sid).label("calls"),
+			func.coalesce(func.sum(TeleopsCallLog.duration_seconds), 0).label("seconds"),
+			func.coalesce(func.sum(TeleopsCallLog.cost_usd), 0.0).label("cost"),
+		).where(
+			TeleopsCallLog.started_at >= start, TeleopsCallLog.started_at < end
+		).group_by(TeleopsCallLog.site_uid)
+		by_site = [{"site_uid": r[0], "calls": int(r[1]), "seconds": int(r[2]), "cost_usd": float(r[3])} for r in (await session.execute(by_site_q)).all()]
+
+		# By account
+		by_acc_q = select(
+			TeleopsCallLog.voip_account_uid,
+			func.count(TeleopsCallLog.twilio_call_sid).label("calls"),
+			func.coalesce(func.sum(TeleopsCallLog.cost_usd), 0.0).label("cost"),
+		).where(
+			TeleopsCallLog.started_at >= start, TeleopsCallLog.started_at < end
+		).group_by(TeleopsCallLog.voip_account_uid)
+		by_account = [{"voip_account_uid": r[0], "calls": int(r[1]), "cost_usd": float(r[2])} for r in (await session.execute(by_acc_q)).all()]
+
+		# By phone number
+		by_pn_q = select(
+			TeleopsCallLog.phone_number_uid,
+			func.count(TeleopsCallLog.twilio_call_sid).label("calls"),
+			func.coalesce(func.sum(TeleopsCallLog.cost_usd), 0.0).label("cost"),
+		).where(
+			TeleopsCallLog.started_at >= start, TeleopsCallLog.started_at < end
+		).group_by(TeleopsCallLog.phone_number_uid)
+		by_number = [{"phone_number_uid": r[0], "calls": int(r[1]), "cost_usd": float(r[2])} for r in (await session.execute(by_pn_q)).all()]
+
+		# Totals
+		total_q = select(
+			func.count(TeleopsCallLog.twilio_call_sid),
+			func.coalesce(func.sum(TeleopsCallLog.duration_seconds), 0),
+			func.coalesce(func.sum(TeleopsCallLog.cost_usd), 0.0),
+		).where(TeleopsCallLog.started_at >= start, TeleopsCallLog.started_at < end)
+		total_row = (await session.execute(total_q)).one()
+		totals = {"calls": int(total_row[0]), "seconds": int(total_row[1]), "cost_usd": float(total_row[2])}
+
+		return {
+			"year": year, "month": month,
+			"window": {"start": start.isoformat(), "end": end.isoformat()},
+			"totals": totals,
+			"by_site": by_site, "by_account": by_account, "by_number": by_number,
+		}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE F — Twilio Provisioning Automation
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+async def _twilio_post(account_sid: str, auth_token: str, path: str, form: dict) -> dict:
+	"""Authenticated POST to Twilio REST API with form-encoded body."""
+	url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}{path}"
+	creds = base64.b64encode(f"{account_sid}:{auth_token}".encode()).decode("ascii")
+	async with httpx.AsyncClient(timeout=30.0) as client:
+		resp = await client.post(
+			url,
+			headers={"Authorization": f"Basic {creds}", "Content-Type": "application/x-www-form-urlencoded"},
+			data=form,
+		)
+		if resp.status_code == 401:
+			raise HTTPException(status_code=400, detail="Twilio rejected the auth token")
+		if resp.status_code >= 400:
+			raise HTTPException(status_code=502, detail=f"Twilio API error {resp.status_code}: {resp.text[:300]}")
+		return resp.json()
+
+
+class _SubaccountIn(BaseModel):
+	friendly_name: str
+
+
+@router.post("/twilio/{voip_account_uid}/subaccount")
+async def twilio_create_subaccount(voip_account_uid: Annotated[str, Path()], payload: _SubaccountIn, user: Auth) -> dict:
+	"""Create a Twilio Subaccount under the given (master) account, and register
+	it as a new VOIP Account in MC² with parent_account_sid set."""
+	async with get_session_factory()() as session:
+		acc = await session.get(TeleopsVoipAccount, voip_account_uid)
+		if not acc:
+			raise HTTPException(status_code=404, detail="VOIP Account not found")
+		if acc.parent_account_sid:
+			raise HTTPException(status_code=400, detail="Cannot create a Subaccount under another Subaccount")
+		if not acc.auth_token:
+			raise HTTPException(status_code=400, detail="auth_token required")
+
+		data = await _twilio_post(acc.account_sid, acc.auth_token, ".json".replace(".", ".json", 0) and "/../Accounts.json", {"FriendlyName": payload.friendly_name}) if False else None
+		# Twilio: POST /2010-04-01/Accounts.json (NOT under master) — special endpoint
+		# We have to make a non-Account-prefixed call. Inline that:
+		url = "https://api.twilio.com/2010-04-01/Accounts.json"
+		creds = base64.b64encode(f"{acc.account_sid}:{acc.auth_token}".encode()).decode("ascii")
+		async with httpx.AsyncClient(timeout=30.0) as client:
+			resp = await client.post(url, headers={"Authorization": f"Basic {creds}"}, data={"FriendlyName": payload.friendly_name})
+		if resp.status_code >= 400:
+			raise HTTPException(status_code=502, detail=f"Twilio API {resp.status_code}: {resp.text[:200]}")
+		data = resp.json()
+
+		new_sid = data["sid"]
+		new_token = data.get("auth_token")
+		# Register subaccount in MC²
+		sub = TeleopsVoipAccount(
+			provider="twilio",
+			account_sid=new_sid,
+			parent_account_sid=acc.account_sid,
+			friendly_name=payload.friendly_name,
+			auth_token=new_token,
+			is_active=True,
+			last_modified_by=user.email,
+			last_modified_surface="mc2",
+		)
+		session.add(sub)
+		await session.commit()
+		await session.refresh(sub)
+		return {"created": True, "voip_account": _voip_to_out(sub)}
+
+
+class _TwimlAppIn(BaseModel):
+	friendly_name: str
+	voice_url: str | None = None
+	voice_method: str = "POST"
+	status_callback: str | None = None
+
+
+@router.post("/twilio/{voip_account_uid}/twiml-app")
+async def twilio_create_twiml_app(voip_account_uid: Annotated[str, Path()], payload: _TwimlAppIn, user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		acc = await session.get(TeleopsVoipAccount, voip_account_uid)
+		if not acc:
+			raise HTTPException(status_code=404, detail="VOIP Account not found")
+		if not acc.auth_token:
+			raise HTTPException(status_code=400, detail="auth_token required")
+		form = {"FriendlyName": payload.friendly_name, "VoiceMethod": payload.voice_method}
+		if payload.voice_url:
+			form["VoiceUrl"] = payload.voice_url
+		if payload.status_callback:
+			form["StatusCallback"] = payload.status_callback
+		data = await _twilio_post(acc.account_sid, acc.auth_token, "/Applications.json", form)
+		return {"created": True, "twiml_app_sid": data["sid"], "friendly_name": data["friendly_name"]}
+
+
+@router.get("/twilio/{voip_account_uid}/available-numbers")
+async def twilio_available_numbers(
+	voip_account_uid: Annotated[str, Path()],
+	user: Auth,
+	country: str = "US",
+	area_code: str | None = None,
+	contains: str | None = None,
+	limit: int = 20,
+) -> dict:
+	async with get_session_factory()() as session:
+		acc = await session.get(TeleopsVoipAccount, voip_account_uid)
+		if not acc:
+			raise HTTPException(status_code=404, detail="VOIP Account not found")
+		if not acc.auth_token:
+			raise HTTPException(status_code=400, detail="auth_token required")
+		params = {"PageSize": min(limit, 30)}
+		if area_code:
+			params["AreaCode"] = area_code
+		if contains:
+			params["Contains"] = contains
+		from urllib.parse import urlencode
+		qs = urlencode(params)
+		data = await _twilio_get(acc.account_sid, acc.auth_token, f"/AvailablePhoneNumbers/{country}/Local.json?{qs}")
+		return {"country": country, "available": data.get("available_phone_numbers", [])}
+
+
+class _BuyNumberIn(BaseModel):
+	phone_number: str
+	friendly_name: str | None = None
+
+
+@router.post("/twilio/{voip_account_uid}/buy-number")
+async def twilio_buy_number(voip_account_uid: Annotated[str, Path()], payload: _BuyNumberIn, user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		acc = await session.get(TeleopsVoipAccount, voip_account_uid)
+		if not acc:
+			raise HTTPException(status_code=404, detail="VOIP Account not found")
+		if not acc.auth_token:
+			raise HTTPException(status_code=400, detail="auth_token required")
+		form = {"PhoneNumber": payload.phone_number}
+		if payload.friendly_name:
+			form["FriendlyName"] = payload.friendly_name
+		data = await _twilio_post(acc.account_sid, acc.auth_token, "/IncomingPhoneNumbers.json", form)
+		# Register in MC²
+		pn = TeleopsPhoneNumber(
+			e164=data["phone_number"],
+			voip_account_uid=acc.uid,
+			friendly_name=data.get("friendly_name"),
+			country=data.get("iso_country") or "US",
+			status="Active",
+			voice_method="POST",
+			status_callback_method="POST",
+			sms_method="POST",
+			last_modified_by=user.email,
+			last_modified_surface="mc2:purchase",
+		)
+		session.add(pn)
+		await session.commit()
+		await session.refresh(pn)
+		return {"purchased": True, "phone_number": _pn_to_out(pn)}
+
+
+class _TransferNumberIn(BaseModel):
+	target_voip_account_uid: str
+
+
+@router.post("/phone-numbers/{phone_uid}/transfer")
+async def twilio_transfer_number(phone_uid: Annotated[str, Path()], payload: _TransferNumberIn, user: Auth) -> dict:
+	"""Transfer a number between Twilio (sub)accounts. Free operation."""
+	async with get_session_factory()() as session:
+		pn = await session.get(TeleopsPhoneNumber, phone_uid)
+		if not pn:
+			raise HTTPException(status_code=404, detail="Phone Number not found")
+		src = await session.get(TeleopsVoipAccount, pn.voip_account_uid)
+		dst = await session.get(TeleopsVoipAccount, payload.target_voip_account_uid)
+		if not src or not dst:
+			raise HTTPException(status_code=400, detail="source or destination account not found")
+		if not src.auth_token:
+			raise HTTPException(status_code=400, detail="source account requires auth_token")
+		# Find Twilio's PN sid by looking up the number
+		data = await _twilio_get(src.account_sid, src.auth_token, f"/IncomingPhoneNumbers.json?PhoneNumber={pn.e164}")
+		nums = data.get("incoming_phone_numbers", [])
+		if not nums:
+			raise HTTPException(status_code=404, detail=f"Number {pn.e164} not found on source account")
+		twilio_pn_sid = nums[0]["sid"]
+		await _twilio_post(src.account_sid, src.auth_token, f"/IncomingPhoneNumbers/{twilio_pn_sid}.json", {"AccountSid": dst.account_sid})
+		# Update MC² record
+		pn.voip_account_uid = dst.uid
+		_bump_version(pn, user.email)
+		await session.commit()
+		return {"transferred": True, "from": src.friendly_name, "to": dst.friendly_name}
