@@ -595,3 +595,724 @@ async def delete_site(uid: Annotated[str, Path()], user: Auth) -> dict:
 		await session.delete(s)
 		await session.commit()
 		return {"deleted": uid}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE A.4 — Extensions, Voicemails, IVR Menus + Options,
+#             Ring Groups, Time Rules, Call Queues
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def _bump_version(obj, user_email: str) -> None:
+	"""Common version-bump applied on every PATCH to keep sync metadata correct."""
+	obj.version = (obj.version or 0) + 1
+	obj.last_modified_by = user_email
+	obj.last_modified_surface = "mc3"
+
+
+async def _require_site(session, site_uid: str) -> None:
+	if not await session.get(TeleopsSite, site_uid):
+		raise HTTPException(status_code=400, detail="site_uid does not exist")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# VOICEMAILS (defined BEFORE Extensions because Extension.voicemail_uid is FK to it)
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class VoicemailIn(BaseModel):
+	site_uid: str
+	name: str = Field(..., min_length=1, max_length=255)
+	greeting_url: str | None = None
+	greeting_text: str | None = None
+	notify_email: str | None = None
+	transcription_enabled: bool = True
+
+
+class VoicemailPatch(BaseModel):
+	site_uid: str | None = None
+	name: str | None = None
+	greeting_url: str | None = None
+	greeting_text: str | None = None
+	notify_email: str | None = None
+	transcription_enabled: bool | None = None
+
+
+def _vm_to_out(v: TeleopsVoicemail) -> dict:
+	return {
+		"uid": v.uid,
+		"site_uid": v.site_uid,
+		"name": v.name,
+		"greeting_url": v.greeting_url,
+		"greeting_text": v.greeting_text,
+		"notify_email": v.notify_email,
+		"transcription_enabled": v.transcription_enabled,
+		"version": v.version,
+		"last_modified_at": v.last_modified_at.isoformat() if v.last_modified_at else None,
+		"last_modified_by": v.last_modified_by,
+		"created_at": v.created_at.isoformat() if v.created_at else None,
+	}
+
+
+@router.get("/voicemails")
+async def list_voicemails(user: Auth, site_uid: str | None = None) -> dict:
+	async with get_session_factory()() as session:
+		stmt = select(TeleopsVoicemail).order_by(TeleopsVoicemail.name)
+		if site_uid:
+			stmt = stmt.where(TeleopsVoicemail.site_uid == site_uid)
+		rows = (await session.execute(stmt)).scalars().all()
+		return {"voicemails": [_vm_to_out(r) for r in rows], "count": len(rows)}
+
+
+@router.post("/voicemails", status_code=201)
+async def create_voicemail(payload: VoicemailIn, user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		await _require_site(session, payload.site_uid)
+		vm = TeleopsVoicemail(
+			**payload.model_dump(),
+			last_modified_by=user.email,
+			last_modified_surface="mc3",
+		)
+		session.add(vm)
+		await session.commit()
+		await session.refresh(vm)
+		return _vm_to_out(vm)
+
+
+@router.get("/voicemails/{uid}")
+async def get_voicemail(uid: Annotated[str, Path()], user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		vm = await session.get(TeleopsVoicemail, uid)
+		if not vm:
+			raise HTTPException(status_code=404, detail="Voicemail not found")
+		return _vm_to_out(vm)
+
+
+@router.patch("/voicemails/{uid}")
+async def update_voicemail(uid: Annotated[str, Path()], payload: VoicemailPatch, user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		vm = await session.get(TeleopsVoicemail, uid)
+		if not vm:
+			raise HTTPException(status_code=404, detail="Voicemail not found")
+		updates = payload.model_dump(exclude_unset=True)
+		if "site_uid" in updates and updates["site_uid"]:
+			await _require_site(session, updates["site_uid"])
+		for k, v in updates.items():
+			setattr(vm, k, v)
+		_bump_version(vm, user.email)
+		await session.commit()
+		await session.refresh(vm)
+		return _vm_to_out(vm)
+
+
+@router.delete("/voicemails/{uid}")
+async def delete_voicemail(uid: Annotated[str, Path()], user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		vm = await session.get(TeleopsVoicemail, uid)
+		if not vm:
+			raise HTTPException(status_code=404, detail="Voicemail not found")
+		# Block delete if any Extension references this voicemail
+		ref = (await session.execute(
+			select(TeleopsExtension).where(TeleopsExtension.voicemail_uid == uid).limit(1)
+		)).scalar_one_or_none()
+		if ref:
+			raise HTTPException(status_code=409, detail="Voicemail attached to extension(s); reassign first")
+		await session.delete(vm)
+		await session.commit()
+		return {"deleted": uid}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# EXTENSIONS
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class ExtensionIn(BaseModel):
+	site_uid: str
+	ext_number: str = Field(..., min_length=1, max_length=16)
+	display_name: str = Field(..., min_length=1, max_length=255)
+	frappe_user_email: str | None = None
+	voicemail_uid: str | None = None
+	presence: str = "Offline"
+	notes: str | None = None
+
+
+class ExtensionPatch(BaseModel):
+	display_name: str | None = None
+	frappe_user_email: str | None = None
+	voicemail_uid: str | None = None
+	presence: str | None = None
+	notes: str | None = None
+
+
+def _ext_to_out(e: TeleopsExtension) -> dict:
+	return {
+		"uid": e.uid,
+		"site_uid": e.site_uid,
+		"ext_number": e.ext_number,
+		"display_name": e.display_name,
+		"frappe_user_email": e.frappe_user_email,
+		"voicemail_uid": e.voicemail_uid,
+		"presence": e.presence,
+		"notes": e.notes,
+		"version": e.version,
+		"last_modified_at": e.last_modified_at.isoformat() if e.last_modified_at else None,
+		"last_modified_by": e.last_modified_by,
+		"created_at": e.created_at.isoformat() if e.created_at else None,
+	}
+
+
+@router.get("/extensions")
+async def list_extensions(user: Auth, site_uid: str | None = None) -> dict:
+	async with get_session_factory()() as session:
+		stmt = select(TeleopsExtension).order_by(TeleopsExtension.site_uid, TeleopsExtension.ext_number)
+		if site_uid:
+			stmt = stmt.where(TeleopsExtension.site_uid == site_uid)
+		rows = (await session.execute(stmt)).scalars().all()
+		return {"extensions": [_ext_to_out(r) for r in rows], "count": len(rows)}
+
+
+@router.post("/extensions", status_code=201)
+async def create_extension(payload: ExtensionIn, user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		await _require_site(session, payload.site_uid)
+		if payload.voicemail_uid and not await session.get(TeleopsVoicemail, payload.voicemail_uid):
+			raise HTTPException(status_code=400, detail="voicemail_uid does not exist")
+		ext = TeleopsExtension(
+			**payload.model_dump(),
+			last_modified_by=user.email,
+			last_modified_surface="mc3",
+		)
+		session.add(ext)
+		try:
+			await session.commit()
+		except IntegrityError:
+			raise HTTPException(status_code=409, detail=f"Extension {payload.ext_number} already exists on this site")
+		await session.refresh(ext)
+		return _ext_to_out(ext)
+
+
+@router.get("/extensions/{uid}")
+async def get_extension(uid: Annotated[str, Path()], user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		ext = await session.get(TeleopsExtension, uid)
+		if not ext:
+			raise HTTPException(status_code=404, detail="Extension not found")
+		return _ext_to_out(ext)
+
+
+@router.patch("/extensions/{uid}")
+async def update_extension(uid: Annotated[str, Path()], payload: ExtensionPatch, user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		ext = await session.get(TeleopsExtension, uid)
+		if not ext:
+			raise HTTPException(status_code=404, detail="Extension not found")
+		updates = payload.model_dump(exclude_unset=True)
+		if "voicemail_uid" in updates and updates["voicemail_uid"]:
+			if not await session.get(TeleopsVoicemail, updates["voicemail_uid"]):
+				raise HTTPException(status_code=400, detail="voicemail_uid does not exist")
+		for k, v in updates.items():
+			setattr(ext, k, v)
+		_bump_version(ext, user.email)
+		await session.commit()
+		await session.refresh(ext)
+		return _ext_to_out(ext)
+
+
+@router.delete("/extensions/{uid}")
+async def delete_extension(uid: Annotated[str, Path()], user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		ext = await session.get(TeleopsExtension, uid)
+		if not ext:
+			raise HTTPException(status_code=404, detail="Extension not found")
+		await session.delete(ext)
+		await session.commit()
+		return {"deleted": uid}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# IVR MENUS
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class IvrMenuIn(BaseModel):
+	site_uid: str
+	name: str = Field(..., min_length=1, max_length=255)
+	greeting_url: str | None = None
+	greeting_text: str | None = None
+	timeout_sec: int = 5
+	retries: int = 3
+	on_invalid_target_type: str | None = None
+	on_invalid_target_uid: str | None = None
+
+
+class IvrMenuPatch(BaseModel):
+	name: str | None = None
+	greeting_url: str | None = None
+	greeting_text: str | None = None
+	timeout_sec: int | None = None
+	retries: int | None = None
+	on_invalid_target_type: str | None = None
+	on_invalid_target_uid: str | None = None
+
+
+def _ivr_to_out(m: TeleopsIvrMenu) -> dict:
+	return {
+		"uid": m.uid,
+		"site_uid": m.site_uid,
+		"name": m.name,
+		"greeting_url": m.greeting_url,
+		"greeting_text": m.greeting_text,
+		"timeout_sec": m.timeout_sec,
+		"retries": m.retries,
+		"on_invalid_target_type": m.on_invalid_target_type,
+		"on_invalid_target_uid": m.on_invalid_target_uid,
+		"version": m.version,
+		"last_modified_at": m.last_modified_at.isoformat() if m.last_modified_at else None,
+		"last_modified_by": m.last_modified_by,
+		"created_at": m.created_at.isoformat() if m.created_at else None,
+	}
+
+
+@router.get("/ivr-menus")
+async def list_ivr_menus(user: Auth, site_uid: str | None = None) -> dict:
+	async with get_session_factory()() as session:
+		stmt = select(TeleopsIvrMenu).order_by(TeleopsIvrMenu.name)
+		if site_uid:
+			stmt = stmt.where(TeleopsIvrMenu.site_uid == site_uid)
+		rows = (await session.execute(stmt)).scalars().all()
+		return {"ivr_menus": [_ivr_to_out(r) for r in rows], "count": len(rows)}
+
+
+@router.post("/ivr-menus", status_code=201)
+async def create_ivr_menu(payload: IvrMenuIn, user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		await _require_site(session, payload.site_uid)
+		m = TeleopsIvrMenu(**payload.model_dump(), last_modified_by=user.email, last_modified_surface="mc3")
+		session.add(m)
+		await session.commit()
+		await session.refresh(m)
+		return _ivr_to_out(m)
+
+
+@router.get("/ivr-menus/{uid}")
+async def get_ivr_menu(uid: Annotated[str, Path()], user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		m = await session.get(TeleopsIvrMenu, uid)
+		if not m:
+			raise HTTPException(status_code=404, detail="IVR Menu not found")
+		return _ivr_to_out(m)
+
+
+@router.patch("/ivr-menus/{uid}")
+async def update_ivr_menu(uid: Annotated[str, Path()], payload: IvrMenuPatch, user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		m = await session.get(TeleopsIvrMenu, uid)
+		if not m:
+			raise HTTPException(status_code=404, detail="IVR Menu not found")
+		for k, v in payload.model_dump(exclude_unset=True).items():
+			setattr(m, k, v)
+		_bump_version(m, user.email)
+		await session.commit()
+		await session.refresh(m)
+		return _ivr_to_out(m)
+
+
+@router.delete("/ivr-menus/{uid}")
+async def delete_ivr_menu(uid: Annotated[str, Path()], user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		m = await session.get(TeleopsIvrMenu, uid)
+		if not m:
+			raise HTTPException(status_code=404, detail="IVR Menu not found")
+		# Cascade: delete options first
+		opts = (await session.execute(select(TeleopsIvrOption).where(TeleopsIvrOption.ivr_menu_uid == uid))).scalars().all()
+		for o in opts:
+			await session.delete(o)
+		await session.delete(m)
+		await session.commit()
+		return {"deleted": uid, "cascaded_options": len(opts)}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# IVR OPTIONS
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class IvrOptionIn(BaseModel):
+	ivr_menu_uid: str
+	digit: str = Field(..., min_length=1, max_length=2)
+	label: str | None = None
+	target_type: str
+	target_uid: str
+
+
+class IvrOptionPatch(BaseModel):
+	digit: str | None = None
+	label: str | None = None
+	target_type: str | None = None
+	target_uid: str | None = None
+
+
+def _opt_to_out(o: TeleopsIvrOption) -> dict:
+	return {
+		"uid": o.uid,
+		"ivr_menu_uid": o.ivr_menu_uid,
+		"digit": o.digit,
+		"label": o.label,
+		"target_type": o.target_type,
+		"target_uid": o.target_uid,
+		"version": o.version,
+		"last_modified_at": o.last_modified_at.isoformat() if o.last_modified_at else None,
+		"last_modified_by": o.last_modified_by,
+		"created_at": o.created_at.isoformat() if o.created_at else None,
+	}
+
+
+@router.get("/ivr-options")
+async def list_ivr_options(user: Auth, ivr_menu_uid: str | None = None) -> dict:
+	async with get_session_factory()() as session:
+		stmt = select(TeleopsIvrOption).order_by(TeleopsIvrOption.digit)
+		if ivr_menu_uid:
+			stmt = stmt.where(TeleopsIvrOption.ivr_menu_uid == ivr_menu_uid)
+		rows = (await session.execute(stmt)).scalars().all()
+		return {"options": [_opt_to_out(r) for r in rows], "count": len(rows)}
+
+
+@router.post("/ivr-options", status_code=201)
+async def create_ivr_option(payload: IvrOptionIn, user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		if not await session.get(TeleopsIvrMenu, payload.ivr_menu_uid):
+			raise HTTPException(status_code=400, detail="ivr_menu_uid does not exist")
+		o = TeleopsIvrOption(**payload.model_dump(), last_modified_by=user.email, last_modified_surface="mc3")
+		session.add(o)
+		try:
+			await session.commit()
+		except IntegrityError:
+			raise HTTPException(status_code=409, detail=f"Digit {payload.digit} already mapped on this IVR menu")
+		await session.refresh(o)
+		return _opt_to_out(o)
+
+
+@router.get("/ivr-options/{uid}")
+async def get_ivr_option(uid: Annotated[str, Path()], user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		o = await session.get(TeleopsIvrOption, uid)
+		if not o:
+			raise HTTPException(status_code=404, detail="IVR Option not found")
+		return _opt_to_out(o)
+
+
+@router.patch("/ivr-options/{uid}")
+async def update_ivr_option(uid: Annotated[str, Path()], payload: IvrOptionPatch, user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		o = await session.get(TeleopsIvrOption, uid)
+		if not o:
+			raise HTTPException(status_code=404, detail="IVR Option not found")
+		for k, v in payload.model_dump(exclude_unset=True).items():
+			setattr(o, k, v)
+		_bump_version(o, user.email)
+		await session.commit()
+		await session.refresh(o)
+		return _opt_to_out(o)
+
+
+@router.delete("/ivr-options/{uid}")
+async def delete_ivr_option(uid: Annotated[str, Path()], user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		o = await session.get(TeleopsIvrOption, uid)
+		if not o:
+			raise HTTPException(status_code=404, detail="IVR Option not found")
+		await session.delete(o)
+		await session.commit()
+		return {"deleted": uid}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# RING GROUPS
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class RingGroupIn(BaseModel):
+	site_uid: str
+	name: str = Field(..., min_length=1, max_length=255)
+	strategy: str = "simultaneous"
+	ring_seconds: int = 25
+	members_json: str | None = None
+	on_no_answer_target_type: str | None = None
+	on_no_answer_target_uid: str | None = None
+
+
+class RingGroupPatch(BaseModel):
+	name: str | None = None
+	strategy: str | None = None
+	ring_seconds: int | None = None
+	members_json: str | None = None
+	on_no_answer_target_type: str | None = None
+	on_no_answer_target_uid: str | None = None
+
+
+def _rg_to_out(rg: TeleopsRingGroup) -> dict:
+	return {
+		"uid": rg.uid,
+		"site_uid": rg.site_uid,
+		"name": rg.name,
+		"strategy": rg.strategy,
+		"ring_seconds": rg.ring_seconds,
+		"members_json": rg.members_json,
+		"on_no_answer_target_type": rg.on_no_answer_target_type,
+		"on_no_answer_target_uid": rg.on_no_answer_target_uid,
+		"version": rg.version,
+		"last_modified_at": rg.last_modified_at.isoformat() if rg.last_modified_at else None,
+		"last_modified_by": rg.last_modified_by,
+		"created_at": rg.created_at.isoformat() if rg.created_at else None,
+	}
+
+
+@router.get("/ring-groups")
+async def list_ring_groups(user: Auth, site_uid: str | None = None) -> dict:
+	async with get_session_factory()() as session:
+		stmt = select(TeleopsRingGroup).order_by(TeleopsRingGroup.name)
+		if site_uid:
+			stmt = stmt.where(TeleopsRingGroup.site_uid == site_uid)
+		rows = (await session.execute(stmt)).scalars().all()
+		return {"ring_groups": [_rg_to_out(r) for r in rows], "count": len(rows)}
+
+
+@router.post("/ring-groups", status_code=201)
+async def create_ring_group(payload: RingGroupIn, user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		await _require_site(session, payload.site_uid)
+		rg = TeleopsRingGroup(**payload.model_dump(), last_modified_by=user.email, last_modified_surface="mc3")
+		session.add(rg)
+		await session.commit()
+		await session.refresh(rg)
+		return _rg_to_out(rg)
+
+
+@router.get("/ring-groups/{uid}")
+async def get_ring_group(uid: Annotated[str, Path()], user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		rg = await session.get(TeleopsRingGroup, uid)
+		if not rg:
+			raise HTTPException(status_code=404, detail="Ring Group not found")
+		return _rg_to_out(rg)
+
+
+@router.patch("/ring-groups/{uid}")
+async def update_ring_group(uid: Annotated[str, Path()], payload: RingGroupPatch, user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		rg = await session.get(TeleopsRingGroup, uid)
+		if not rg:
+			raise HTTPException(status_code=404, detail="Ring Group not found")
+		for k, v in payload.model_dump(exclude_unset=True).items():
+			setattr(rg, k, v)
+		_bump_version(rg, user.email)
+		await session.commit()
+		await session.refresh(rg)
+		return _rg_to_out(rg)
+
+
+@router.delete("/ring-groups/{uid}")
+async def delete_ring_group(uid: Annotated[str, Path()], user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		rg = await session.get(TeleopsRingGroup, uid)
+		if not rg:
+			raise HTTPException(status_code=404, detail="Ring Group not found")
+		await session.delete(rg)
+		await session.commit()
+		return {"deleted": uid}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TIME RULES
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class TimeRuleIn(BaseModel):
+	site_uid: str
+	name: str = Field(..., min_length=1, max_length=255)
+	timezone: str = "UTC"
+	rule_json: str | None = None
+	in_hours_target_type: str | None = None
+	in_hours_target_uid: str | None = None
+	out_of_hours_target_type: str | None = None
+	out_of_hours_target_uid: str | None = None
+
+
+class TimeRulePatch(BaseModel):
+	name: str | None = None
+	timezone: str | None = None
+	rule_json: str | None = None
+	in_hours_target_type: str | None = None
+	in_hours_target_uid: str | None = None
+	out_of_hours_target_type: str | None = None
+	out_of_hours_target_uid: str | None = None
+
+
+def _tr_to_out(t: TeleopsTimeRule) -> dict:
+	return {
+		"uid": t.uid,
+		"site_uid": t.site_uid,
+		"name": t.name,
+		"timezone": t.timezone,
+		"rule_json": t.rule_json,
+		"in_hours_target_type": t.in_hours_target_type,
+		"in_hours_target_uid": t.in_hours_target_uid,
+		"out_of_hours_target_type": t.out_of_hours_target_type,
+		"out_of_hours_target_uid": t.out_of_hours_target_uid,
+		"version": t.version,
+		"last_modified_at": t.last_modified_at.isoformat() if t.last_modified_at else None,
+		"last_modified_by": t.last_modified_by,
+		"created_at": t.created_at.isoformat() if t.created_at else None,
+	}
+
+
+@router.get("/time-rules")
+async def list_time_rules(user: Auth, site_uid: str | None = None) -> dict:
+	async with get_session_factory()() as session:
+		stmt = select(TeleopsTimeRule).order_by(TeleopsTimeRule.name)
+		if site_uid:
+			stmt = stmt.where(TeleopsTimeRule.site_uid == site_uid)
+		rows = (await session.execute(stmt)).scalars().all()
+		return {"time_rules": [_tr_to_out(r) for r in rows], "count": len(rows)}
+
+
+@router.post("/time-rules", status_code=201)
+async def create_time_rule(payload: TimeRuleIn, user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		await _require_site(session, payload.site_uid)
+		t = TeleopsTimeRule(**payload.model_dump(), last_modified_by=user.email, last_modified_surface="mc3")
+		session.add(t)
+		await session.commit()
+		await session.refresh(t)
+		return _tr_to_out(t)
+
+
+@router.get("/time-rules/{uid}")
+async def get_time_rule(uid: Annotated[str, Path()], user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		t = await session.get(TeleopsTimeRule, uid)
+		if not t:
+			raise HTTPException(status_code=404, detail="Time Rule not found")
+		return _tr_to_out(t)
+
+
+@router.patch("/time-rules/{uid}")
+async def update_time_rule(uid: Annotated[str, Path()], payload: TimeRulePatch, user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		t = await session.get(TeleopsTimeRule, uid)
+		if not t:
+			raise HTTPException(status_code=404, detail="Time Rule not found")
+		for k, v in payload.model_dump(exclude_unset=True).items():
+			setattr(t, k, v)
+		_bump_version(t, user.email)
+		await session.commit()
+		await session.refresh(t)
+		return _tr_to_out(t)
+
+
+@router.delete("/time-rules/{uid}")
+async def delete_time_rule(uid: Annotated[str, Path()], user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		t = await session.get(TeleopsTimeRule, uid)
+		if not t:
+			raise HTTPException(status_code=404, detail="Time Rule not found")
+		await session.delete(t)
+		await session.commit()
+		return {"deleted": uid}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CALL QUEUES
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class CallQueueIn(BaseModel):
+	site_uid: str
+	name: str = Field(..., min_length=1, max_length=255)
+	twilio_workflow_sid: str | None = None
+	hold_music_url: str | None = None
+	max_wait_seconds: int = 600
+	on_overflow_target_type: str | None = None
+	on_overflow_target_uid: str | None = None
+
+
+class CallQueuePatch(BaseModel):
+	name: str | None = None
+	twilio_workflow_sid: str | None = None
+	hold_music_url: str | None = None
+	max_wait_seconds: int | None = None
+	on_overflow_target_type: str | None = None
+	on_overflow_target_uid: str | None = None
+
+
+def _cq_to_out(q: TeleopsCallQueue) -> dict:
+	return {
+		"uid": q.uid,
+		"site_uid": q.site_uid,
+		"name": q.name,
+		"twilio_workflow_sid": q.twilio_workflow_sid,
+		"hold_music_url": q.hold_music_url,
+		"max_wait_seconds": q.max_wait_seconds,
+		"on_overflow_target_type": q.on_overflow_target_type,
+		"on_overflow_target_uid": q.on_overflow_target_uid,
+		"version": q.version,
+		"last_modified_at": q.last_modified_at.isoformat() if q.last_modified_at else None,
+		"last_modified_by": q.last_modified_by,
+		"created_at": q.created_at.isoformat() if q.created_at else None,
+	}
+
+
+@router.get("/call-queues")
+async def list_call_queues(user: Auth, site_uid: str | None = None) -> dict:
+	async with get_session_factory()() as session:
+		stmt = select(TeleopsCallQueue).order_by(TeleopsCallQueue.name)
+		if site_uid:
+			stmt = stmt.where(TeleopsCallQueue.site_uid == site_uid)
+		rows = (await session.execute(stmt)).scalars().all()
+		return {"call_queues": [_cq_to_out(r) for r in rows], "count": len(rows)}
+
+
+@router.post("/call-queues", status_code=201)
+async def create_call_queue(payload: CallQueueIn, user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		await _require_site(session, payload.site_uid)
+		q = TeleopsCallQueue(**payload.model_dump(), last_modified_by=user.email, last_modified_surface="mc3")
+		session.add(q)
+		await session.commit()
+		await session.refresh(q)
+		return _cq_to_out(q)
+
+
+@router.get("/call-queues/{uid}")
+async def get_call_queue(uid: Annotated[str, Path()], user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		q = await session.get(TeleopsCallQueue, uid)
+		if not q:
+			raise HTTPException(status_code=404, detail="Call Queue not found")
+		return _cq_to_out(q)
+
+
+@router.patch("/call-queues/{uid}")
+async def update_call_queue(uid: Annotated[str, Path()], payload: CallQueuePatch, user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		q = await session.get(TeleopsCallQueue, uid)
+		if not q:
+			raise HTTPException(status_code=404, detail="Call Queue not found")
+		for k, v in payload.model_dump(exclude_unset=True).items():
+			setattr(q, k, v)
+		_bump_version(q, user.email)
+		await session.commit()
+		await session.refresh(q)
+		return _cq_to_out(q)
+
+
+@router.delete("/call-queues/{uid}")
+async def delete_call_queue(uid: Annotated[str, Path()], user: Auth) -> dict:
+	async with get_session_factory()() as session:
+		q = await session.get(TeleopsCallQueue, uid)
+		if not q:
+			raise HTTPException(status_code=404, detail="Call Queue not found")
+		await session.delete(q)
+		await session.commit()
+		return {"deleted": uid}
