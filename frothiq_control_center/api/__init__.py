@@ -21,6 +21,8 @@ from .routes_billing import router as billing_router
 from .routes_reconciliation import router as reconciliation_router
 from .routes_predictive import router as predictive_router
 from .routes_sysinfo import router as sysinfo_router
+from .routes_storage_accounts import router as storage_accounts_router
+from .routes_object_storage import router as object_storage_router
 from .routes_server_detail import router as server_detail_router
 from .routes_tools import router as tools_router
 from .routes_wireguard import router as wireguard_router
@@ -81,6 +83,8 @@ api_router.include_router(reconciliation_router)
 api_router.include_router(predictive_router)
 # ServOps — host system metrics (super_admin only)
 api_router.include_router(sysinfo_router)
+api_router.include_router(storage_accounts_router)
+api_router.include_router(object_storage_router)
 # ServOps — per-server structured detail panels
 api_router.include_router(server_detail_router)
 # ServOps — system tools (terminal, file manager, network tools)
