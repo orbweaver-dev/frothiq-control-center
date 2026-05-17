@@ -289,3 +289,29 @@ class TeleopsRoute(Base, SyncMixin):
 	# Canvas position of the SOURCE node (target's position is wherever it lives elsewhere)
 	source_position_x: Mapped[float | None] = mapped_column(Float, nullable=True)
 	source_position_y: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Routing Designer canvas — node positions
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TeleopsNodePosition(Base, SyncMixin):
+	"""Per-site canvas position for any routing primitive.
+
+	Keyed by (site_uid, node_uid) — one position per node per site. node_type
+	is denormalized for fast filtering when rendering the canvas.
+	"""
+
+	__tablename__ = "teleops_node_positions"
+	__table_args__ = (
+		UniqueConstraint("site_uid", "node_uid", name="uq_teleops_pos_site_node"),
+	)
+
+	site_uid: Mapped[str] = mapped_column(
+		String(36), ForeignKey("teleops_sites.uid"), nullable=False, index=True
+	)
+	node_type: Mapped[str] = mapped_column(String(32), nullable=False)
+	node_uid: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+	x: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+	y: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)

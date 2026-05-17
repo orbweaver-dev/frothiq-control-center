@@ -1316,3 +1316,385 @@ async def delete_call_queue(uid: Annotated[str, Path()], user: Auth) -> dict:
 		await session.delete(q)
 		await session.commit()
 		return {"deleted": uid}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE B — Routing Designer (canvas state + apply to Twilio)
+# ═════════════════════════════════════════════════════════════════════════════
+
+from mc2.models.teleops import TeleopsNodePosition
+
+
+class _NodeOut(BaseModel):
+	uid: str
+	node_type: str
+	label: str
+	x: float
+	y: float
+	data: dict
+
+
+class _EdgeOut(BaseModel):
+	uid: str
+	source_uid: str
+	target_uid: str
+	source_type: str
+	target_type: str
+	label: str | None
+
+
+@router.get("/routing-graph")
+async def get_routing_graph(user: Auth, site_uid: str) -> dict:
+	"""Return all routing primitives for a site as a node graph + edges.
+
+	Used by the Routing Designer canvas to bootstrap the visualization.
+	"""
+	async with get_session_factory()() as session:
+		# Verify site
+		site = await session.get(TeleopsSite, site_uid)
+		if not site:
+			raise HTTPException(status_code=404, detail="Site not found")
+
+		nodes: list[dict] = []
+
+		# Phone numbers (entry points)
+		pns = (await session.execute(
+			select(TeleopsPhoneNumber).where(TeleopsPhoneNumber.site_uid == site_uid)
+		)).scalars().all()
+		for p in pns:
+			nodes.append({
+				"uid": p.uid, "node_type": "phone_number",
+				"label": p.friendly_name or p.e164,
+				"x": 0.0, "y": 0.0,
+				"data": {"e164": p.e164, "status": p.status, "voice_url": p.voice_url},
+			})
+
+		# Extensions (terminal)
+		exts = (await session.execute(
+			select(TeleopsExtension).where(TeleopsExtension.site_uid == site_uid)
+		)).scalars().all()
+		for e in exts:
+			nodes.append({
+				"uid": e.uid, "node_type": "extension",
+				"label": f"Ext {e.ext_number}",
+				"x": 0.0, "y": 0.0,
+				"data": {"ext_number": e.ext_number, "display_name": e.display_name, "presence": e.presence},
+			})
+
+		# Voicemails (terminal)
+		vms = (await session.execute(
+			select(TeleopsVoicemail).where(TeleopsVoicemail.site_uid == site_uid)
+		)).scalars().all()
+		for v in vms:
+			nodes.append({
+				"uid": v.uid, "node_type": "voicemail",
+				"label": v.name, "x": 0.0, "y": 0.0,
+				"data": {"name": v.name, "transcription_enabled": v.transcription_enabled},
+			})
+
+		# IVR Menus
+		menus = (await session.execute(
+			select(TeleopsIvrMenu).where(TeleopsIvrMenu.site_uid == site_uid)
+		)).scalars().all()
+		for m in menus:
+			nodes.append({
+				"uid": m.uid, "node_type": "ivr_menu",
+				"label": m.name, "x": 0.0, "y": 0.0,
+				"data": {"timeout_sec": m.timeout_sec, "retries": m.retries},
+			})
+
+		# Ring Groups
+		rgs = (await session.execute(
+			select(TeleopsRingGroup).where(TeleopsRingGroup.site_uid == site_uid)
+		)).scalars().all()
+		for rg in rgs:
+			nodes.append({
+				"uid": rg.uid, "node_type": "ring_group",
+				"label": rg.name, "x": 0.0, "y": 0.0,
+				"data": {"strategy": rg.strategy, "ring_seconds": rg.ring_seconds},
+			})
+
+		# Time Rules
+		trs = (await session.execute(
+			select(TeleopsTimeRule).where(TeleopsTimeRule.site_uid == site_uid)
+		)).scalars().all()
+		for t in trs:
+			nodes.append({
+				"uid": t.uid, "node_type": "time_rule",
+				"label": t.name, "x": 0.0, "y": 0.0,
+				"data": {"timezone": t.timezone},
+			})
+
+		# Call Queues
+		cqs = (await session.execute(
+			select(TeleopsCallQueue).where(TeleopsCallQueue.site_uid == site_uid)
+		)).scalars().all()
+		for cq in cqs:
+			nodes.append({
+				"uid": cq.uid, "node_type": "call_queue",
+				"label": cq.name, "x": 0.0, "y": 0.0,
+				"data": {"max_wait_seconds": cq.max_wait_seconds},
+			})
+
+		# Overlay saved positions
+		positions = (await session.execute(
+			select(TeleopsNodePosition).where(TeleopsNodePosition.site_uid == site_uid)
+		)).scalars().all()
+		pos_by_node = {p.node_uid: (p.x, p.y) for p in positions}
+		for n in nodes:
+			if n["uid"] in pos_by_node:
+				n["x"], n["y"] = pos_by_node[n["uid"]]
+
+		# Edges from teleops_routes
+		edges_rows = (await session.execute(
+			select(TeleopsRoute).where(TeleopsRoute.site_uid == site_uid)
+		)).scalars().all()
+		edges = [{
+			"uid": r.uid,
+			"source_uid": r.source_uid,
+			"target_uid": r.target_uid,
+			"source_type": r.source_type,
+			"target_type": r.target_type,
+			"label": r.label,
+		} for r in edges_rows]
+
+		return {
+			"site_uid": site_uid,
+			"site_name": site.name,
+			"nodes": nodes,
+			"edges": edges,
+			"counts": {"nodes": len(nodes), "edges": len(edges)},
+		}
+
+
+class _NodePositionIn(BaseModel):
+	node_uid: str
+	node_type: str
+	x: float
+	y: float
+
+
+class _EdgeIn(BaseModel):
+	source_uid: str
+	source_type: str
+	target_uid: str
+	target_type: str
+	label: str | None = None
+
+
+class _RoutingGraphIn(BaseModel):
+	site_uid: str
+	positions: list[_NodePositionIn]
+	edges: list[_EdgeIn]
+	# Replace mode: if true, edges are fully replaced for this site.
+	# If false, edges are upserted only (no deletions).
+	replace_edges: bool = True
+
+
+@router.post("/routing-graph")
+async def save_routing_graph(payload: _RoutingGraphIn, user: Auth) -> dict:
+	"""Persist canvas state: upserts node positions, optionally replaces edges."""
+	async with get_session_factory()() as session:
+		site = await session.get(TeleopsSite, payload.site_uid)
+		if not site:
+			raise HTTPException(status_code=404, detail="Site not found")
+
+		# Upsert positions
+		existing_pos = (await session.execute(
+			select(TeleopsNodePosition).where(TeleopsNodePosition.site_uid == payload.site_uid)
+		)).scalars().all()
+		pos_by_node = {p.node_uid: p for p in existing_pos}
+
+		pos_updated = 0
+		pos_created = 0
+		for p in payload.positions:
+			if p.node_uid in pos_by_node:
+				obj = pos_by_node[p.node_uid]
+				obj.x = p.x
+				obj.y = p.y
+				_bump_version(obj, user.email)
+				pos_updated += 1
+			else:
+				session.add(TeleopsNodePosition(
+					site_uid=payload.site_uid,
+					node_type=p.node_type,
+					node_uid=p.node_uid,
+					x=p.x, y=p.y,
+					last_modified_by=user.email,
+					last_modified_surface="mc2",
+				))
+				pos_created += 1
+
+		# Edges
+		edges_created = 0
+		edges_kept = 0
+		edges_deleted = 0
+		if payload.replace_edges:
+			# Delete existing edges for site
+			to_del = (await session.execute(
+				select(TeleopsRoute).where(TeleopsRoute.site_uid == payload.site_uid)
+			)).scalars().all()
+			for r in to_del:
+				await session.delete(r)
+				edges_deleted += 1
+			# Insert all incoming
+			for e in payload.edges:
+				session.add(TeleopsRoute(
+					site_uid=payload.site_uid,
+					source_type=e.source_type,
+					source_uid=e.source_uid,
+					target_type=e.target_type,
+					target_uid=e.target_uid,
+					label=e.label,
+					last_modified_by=user.email,
+					last_modified_surface="mc2",
+				))
+				edges_created += 1
+		else:
+			# Upsert mode: keep existing, only add new
+			existing = (await session.execute(
+				select(TeleopsRoute).where(TeleopsRoute.site_uid == payload.site_uid)
+			)).scalars().all()
+			existing_keys = {(r.source_uid, r.target_uid) for r in existing}
+			edges_kept = len(existing)
+			for e in payload.edges:
+				if (e.source_uid, e.target_uid) not in existing_keys:
+					session.add(TeleopsRoute(
+						site_uid=payload.site_uid,
+						source_type=e.source_type,
+						source_uid=e.source_uid,
+						target_type=e.target_type,
+						target_uid=e.target_uid,
+						label=e.label,
+						last_modified_by=user.email,
+						last_modified_surface="mc2",
+					))
+					edges_created += 1
+
+		await session.commit()
+		return {
+			"positions": {"created": pos_created, "updated": pos_updated},
+			"edges": {"created": edges_created, "kept": edges_kept, "deleted": edges_deleted},
+		}
+
+
+@router.post("/validate-routing")
+async def validate_routing(user: Auth, site_uid: str) -> dict:
+	"""Run validation checks on the saved routing for a site.
+
+	Returns warnings + errors. Does not modify anything.
+	"""
+	async with get_session_factory()() as session:
+		site = await session.get(TeleopsSite, site_uid)
+		if not site:
+			raise HTTPException(status_code=404, detail="Site not found")
+
+		edges = (await session.execute(
+			select(TeleopsRoute).where(TeleopsRoute.site_uid == site_uid)
+		)).scalars().all()
+
+		# Build adjacency
+		adj: dict[str, list[str]] = {}
+		for e in edges:
+			adj.setdefault(e.source_uid, []).append(e.target_uid)
+
+		warnings: list[str] = []
+		errors: list[str] = []
+
+		# Cycle detection (DFS)
+		WHITE, GRAY, BLACK = 0, 1, 2
+		color: dict[str, int] = {n: WHITE for n in adj}
+
+		def visit(n: str, path: list[str]) -> bool:
+			if color.get(n, WHITE) == GRAY:
+				cycle_start = path.index(n) if n in path else 0
+				errors.append("Cycle detected: " + " → ".join(path[cycle_start:] + [n]))
+				return True
+			if color.get(n, WHITE) == BLACK:
+				return False
+			color[n] = GRAY
+			path.append(n)
+			for nb in adj.get(n, []):
+				if visit(nb, path):
+					pass
+			path.pop()
+			color[n] = BLACK
+			return False
+
+		for n in list(adj.keys()):
+			if color.get(n, WHITE) == WHITE:
+				visit(n, [])
+
+		# Orphan check: phone numbers without outbound edges
+		pns = (await session.execute(
+			select(TeleopsPhoneNumber).where(TeleopsPhoneNumber.site_uid == site_uid)
+		)).scalars().all()
+		for p in pns:
+			if p.uid not in adj:
+				warnings.append(f"Phone number {p.e164} has no outbound route — calls to this number will hit the default voice URL")
+
+		# Missing target check: edges pointing at non-existent nodes
+		all_uids: set[str] = set()
+		for tbl in (TeleopsPhoneNumber, TeleopsExtension, TeleopsVoicemail, TeleopsIvrMenu, TeleopsRingGroup, TeleopsTimeRule, TeleopsCallQueue):
+			rows = (await session.execute(select(tbl).where(tbl.site_uid == site_uid))).scalars().all()
+			for r in rows:
+				all_uids.add(r.uid)
+		for e in edges:
+			if e.target_uid not in all_uids:
+				errors.append(f"Edge {e.source_type}→{e.target_type} target {e.target_uid[:8]}… not found")
+
+		return {
+			"site_uid": site_uid,
+			"ok": len(errors) == 0,
+			"errors": errors,
+			"warnings": warnings,
+			"counts": {"edges": len(edges), "nodes": len(all_uids)},
+		}
+
+
+# Apply-to-Twilio is a Phase B.2 stub: it rewrites the voice_url of any
+# Phone Number whose outbound edge points at an Extension|IVR|RingGroup|etc.
+# Inbound webhook URLs are built off the OrbWeaver_PBX site that owns the
+# extension. For now this is a placeholder that returns a plan, not changes.
+@router.post("/apply-routing")
+async def apply_routing(user: Auth, site_uid: str, dry_run: bool = True) -> dict:
+	"""Generate a plan of what would change on Twilio if this routing were applied.
+
+	With dry_run=true (default), no changes are made — just the plan is returned.
+	With dry_run=false, would update Twilio (not implemented yet — Phase B.2 deferred).
+	"""
+	async with get_session_factory()() as session:
+		site = await session.get(TeleopsSite, site_uid)
+		if not site:
+			raise HTTPException(status_code=404, detail="Site not found")
+
+		pns = (await session.execute(
+			select(TeleopsPhoneNumber).where(TeleopsPhoneNumber.site_uid == site_uid)
+		)).scalars().all()
+		edges = (await session.execute(
+			select(TeleopsRoute).where(TeleopsRoute.site_uid == site_uid)
+		)).scalars().all()
+		edges_by_source = {}
+		for e in edges:
+			edges_by_source.setdefault(e.source_uid, []).append(e)
+
+		plan: list[dict] = []
+		for p in pns:
+			target_voice_url = None
+			if site.frappe_site_url and site.has_orbweaver_pbx:
+				# Convention: per-site orbweaver_pbx handles the inbound webhook
+				target_voice_url = f"{site.frappe_site_url.rstrip('/')}/api/method/orbweaver_pbx.api.voice.inbound"
+			plan.append({
+				"phone_number": p.e164,
+				"current_voice_url": p.voice_url,
+				"target_voice_url": target_voice_url,
+				"changes_needed": (target_voice_url is not None and target_voice_url != p.voice_url),
+				"outbound_edges": len(edges_by_source.get(p.uid, [])),
+			})
+
+		return {
+			"site_uid": site_uid,
+			"dry_run": dry_run,
+			"plan": plan,
+			"note": "Apply-to-Twilio is not yet implemented; this endpoint currently only returns a plan. Phase B.2 wires up Twilio API writes.",
+		}
