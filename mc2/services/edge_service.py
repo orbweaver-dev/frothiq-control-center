@@ -414,11 +414,10 @@ async def sync_community_ips_to_nft() -> None:
     )
 
 
-async def _read_nft_blacklist(set_name: str = "blacklist") -> list[str]:
+async def _read_nft_set(set_name: str) -> list[str]:
     """
     Read the live nftables `inet frothiq <set_name>` set and return all IP/CIDR entries.
 
-    This is the canonical MC3 blacklist — the same IPs the firewall enforces.
     Runs as a non-blocking asyncio subprocess (no event loop blocking).
     Returns empty list on any failure.
     """
@@ -445,8 +444,27 @@ async def _read_nft_blacklist(set_name: str = "blacklist") -> list[str]:
                 entries.append(ip_part)
         return entries
     except Exception as exc:
-        logger.debug("edge_service: _read_nft_blacklist(%s) failed: %s", set_name, exc)
+        logger.debug("edge_service: _read_nft_set(%s) failed: %s", set_name, exc)
         return []
+
+
+async def _read_nft_blacklist(set_name: str = "blacklist") -> list[str]:
+    """
+    Read the canonical MC3 blacklist set (same IPs the firewall enforces).
+    Thin wrapper around _read_nft_set retained for call-site compatibility.
+    """
+    return await _read_nft_set(set_name)
+
+
+async def _read_nft_whitelist() -> set[str]:
+    """
+    Return the operator whitelist (v4 + v6) as a set.
+    Whitelisted IPs must never be redistributed to edge nodes as blocked,
+    even if they appear in the blacklist set or community threat pool.
+    """
+    v4 = await _read_nft_set("whitelist")
+    v6 = await _read_nft_set("whitelist6")
+    return set(v4) | set(v6)
 
 
 async def get_blocklist(
@@ -518,12 +536,23 @@ async def get_blocklist(
     except Exception as exc:
         logger.debug("edge_service: get_blocklist core feed unavailable: %s", exc)
 
+    # Operator whitelist — subtract from all three sources before redistribution.
+    # The kernel firewall honors @whitelist before @blacklist drop (see frothiq.nft chain order),
+    # but edge plugins enforce at the application layer using only this list, so they need the
+    # already-filtered version. Without this step, a whitelisted operator IP that lands in
+    # @blacklist (manual add, LFD escalation, etc.) is still pushed to every WP plugin as blocked.
+    whitelist = await _read_nft_whitelist()
+    if whitelist:
+        nft_ips       = [ip for ip in nft_ips       if ip not in whitelist]
+        community_ips = [ip for ip in community_ips if ip not in whitelist]
+        core_ips      = [ip for ip in core_ips      if ip not in whitelist]
+
     # Merge: nft (canonical) first so it's never filtered out, then community, then core
     ips = list(dict.fromkeys(nft_ips + community_ips + core_ips))
 
     logger.info(
-        "edge_service: blocklist plan=%s threshold=%d nft=%d community=%d core=%d total=%d",
-        plan, score_threshold, len(nft_ips), len(community_ips), len(core_ips), len(ips),
+        "edge_service: blocklist plan=%s threshold=%d nft=%d community=%d core=%d whitelist=%d total=%d",
+        plan, score_threshold, len(nft_ips), len(community_ips), len(core_ips), len(whitelist), len(ips),
     )
     return {"ips": ips, "plan": plan}
 
