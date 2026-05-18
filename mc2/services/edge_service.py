@@ -31,6 +31,7 @@ from fastapi import HTTPException
 from mc2.config import get_settings
 from mc2.integrations.database import get_session_factory
 from mc2.models.edge import AttackReport, EdgeEulaRecord, EdgeNode, EdgeTenant, EulaVersion, FeatureFlag, ThreatReport
+from mc2.models.defense_settings import FrothiqIPEntry
 from mc2.services import frappe_billing_client
 
 logger = logging.getLogger(__name__)
@@ -456,15 +457,25 @@ async def _read_nft_blacklist(set_name: str = "blacklist") -> list[str]:
     return await _read_nft_set(set_name)
 
 
-async def _read_nft_whitelist() -> set[str]:
+async def _read_operator_whitelist() -> set[str]:
     """
-    Return the operator whitelist (v4 + v6) as a set.
+    Return the operator whitelist as a set of IPs.
+
+    Sourced from frothiq_ip_list (list_type='whitelist'). The DB row is the
+    authoritative record — the nftables `inet frothiq whitelist` set is just
+    its kernel-side mirror and isn't readable from an unprivileged service user.
     Whitelisted IPs must never be redistributed to edge nodes as blocked,
     even if they appear in the blacklist set or community threat pool.
     """
-    v4 = await _read_nft_set("whitelist")
-    v6 = await _read_nft_set("whitelist6")
-    return set(v4) | set(v6)
+    try:
+        async with get_session_factory()() as session:
+            result = await session.execute(
+                select(FrothiqIPEntry.ip).where(FrothiqIPEntry.list_type == "whitelist")
+            )
+            return {row[0] for row in result.fetchall()}
+    except Exception as exc:
+        logger.warning("edge_service: _read_operator_whitelist DB read failed: %s", exc)
+        return set()
 
 
 async def get_blocklist(
@@ -541,7 +552,7 @@ async def get_blocklist(
     # but edge plugins enforce at the application layer using only this list, so they need the
     # already-filtered version. Without this step, a whitelisted operator IP that lands in
     # @blacklist (manual add, LFD escalation, etc.) is still pushed to every WP plugin as blocked.
-    whitelist = await _read_nft_whitelist()
+    whitelist = await _read_operator_whitelist()
     if whitelist:
         nft_ips       = [ip for ip in nft_ips       if ip not in whitelist]
         community_ips = [ip for ip in community_ips if ip not in whitelist]
