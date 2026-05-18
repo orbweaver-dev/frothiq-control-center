@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
@@ -43,33 +44,47 @@ _LOG_RE = re.compile(
 )
 
 
+def _sudo_ls(dir_path: str) -> list[str]:
+    """List files in a privileged log directory via sudo. Returns basenames."""
+    r = subprocess.run(
+        ["sudo", "ls", "-1", dir_path],
+        capture_output=True, text=True, timeout=10,
+    )
+    if r.returncode != 0:
+        return []
+    return [line.strip() for line in r.stdout.splitlines() if line.strip()]
+
+
+def _sudo_cat(path: str) -> str | None:
+    """Read a privileged log file via sudo. None on failure."""
+    r = subprocess.run(
+        ["sudo", "cat", path],
+        capture_output=True, text=True, timeout=30,
+    )
+    return r.stdout if r.returncode == 0 else None
+
+
 def _candidate_logs_for_domain(domain: str) -> list[str]:
     out: list[str] = []
     for d in LOG_DIRS:
-        if not os.path.isdir(d):
-            continue
+        files = _sudo_ls(d)
         for suffix in LOG_SUFFIXES:
-            p = os.path.join(d, domain + suffix)
-            if os.path.isfile(p):
-                out.append(p)
+            target = domain + suffix
+            if target in files:
+                out.append(os.path.join(d, target))
     return out
 
 
 def _enumerate_domains() -> list[str]:
     found: set[str] = set()
     for d in LOG_DIRS:
-        if not os.path.isdir(d):
-            continue
-        try:
-            for f in os.listdir(d):
-                for suffix in LOG_SUFFIXES:
-                    if f.endswith(suffix):
-                        name = f[: -len(suffix)]
-                        if "." in name and not name.startswith("."):
-                            found.add(name)
-                        break
-        except (OSError, PermissionError):
-            continue
+        for f in _sudo_ls(d):
+            for suffix in LOG_SUFFIXES:
+                if f.endswith(suffix) and not f.endswith(".gz"):
+                    name = f[: -len(suffix)]
+                    if "." in name and not name.startswith("."):
+                        found.add(name)
+                    break
     return sorted(found)
 
 
@@ -80,26 +95,26 @@ def _scan_log(path: str, since: datetime) -> dict:
     status_counts: dict[str, int] = defaultdict(int)
     top_paths: dict[str, int] = defaultdict(int)
 
-    try:
-        with open(path, errors="replace") as f:
-            for line in f:
-                m = _LOG_RE.match(line)
-                if not m:
-                    continue
-                try:
-                    ts = datetime.strptime(m.group("ts").split()[0], "%d/%b/%Y:%H:%M:%S")
-                except ValueError:
-                    continue
-                if ts < since:
-                    continue
-                b = m.group("bytes")
-                bytes_total += int(b) if b.isdigit() else 0
-                requests += 1
-                unique_ips.add(m.group("ip"))
-                status_counts[m.group("status")] += 1
-                top_paths[m.group("path")] += 1
-    except (OSError, PermissionError):
+    content = _sudo_cat(path)
+    if content is None:
         return {"error": "log not readable"}
+
+    for line in content.splitlines():
+        m = _LOG_RE.match(line)
+        if not m:
+            continue
+        try:
+            ts = datetime.strptime(m.group("ts").split()[0], "%d/%b/%Y:%H:%M:%S")
+        except ValueError:
+            continue
+        if ts < since:
+            continue
+        b = m.group("bytes")
+        bytes_total += int(b) if b.isdigit() else 0
+        requests += 1
+        unique_ips.add(m.group("ip"))
+        status_counts[m.group("status")] += 1
+        top_paths[m.group("path")] += 1
 
     return {
         "bytes": bytes_total,
@@ -156,26 +171,25 @@ def detail(domain: str, _: Auth, days: int = 7):
     top_paths: dict[str, int] = defaultdict(int)
 
     for log_path in logs:
-        try:
-            with open(log_path, errors="replace") as f:
-                for line in f:
-                    m = _LOG_RE.match(line)
-                    if not m:
-                        continue
-                    try:
-                        ts = datetime.strptime(m.group("ts").split()[0], "%d/%b/%Y:%H:%M:%S")
-                    except ValueError:
-                        continue
-                    if ts < since:
-                        continue
-                    b = m.group("bytes")
-                    merged_bytes += int(b) if b.isdigit() else 0
-                    merged_requests += 1
-                    merged_uniques.add(m.group("ip"))
-                    status_counts[m.group("status")] += 1
-                    top_paths[m.group("path")] += 1
-        except (OSError, PermissionError):
+        content = _sudo_cat(log_path)
+        if content is None:
             continue
+        for line in content.splitlines():
+            m = _LOG_RE.match(line)
+            if not m:
+                continue
+            try:
+                ts = datetime.strptime(m.group("ts").split()[0], "%d/%b/%Y:%H:%M:%S")
+            except ValueError:
+                continue
+            if ts < since:
+                continue
+            b = m.group("bytes")
+            merged_bytes += int(b) if b.isdigit() else 0
+            merged_requests += 1
+            merged_uniques.add(m.group("ip"))
+            status_counts[m.group("status")] += 1
+            top_paths[m.group("path")] += 1
 
     return {
         "domain": domain,

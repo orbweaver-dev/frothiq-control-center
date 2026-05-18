@@ -59,6 +59,7 @@ from .routes_usermin import router as usermin_router
 from .routes_traceroute import router as traceroute_router
 from .routes_proftpd import router as proftpd_router
 from .routes_domain_bandwidth import router as domain_bandwidth_router
+from .routes_awstats import router as awstats_router
 
 # All control center routes under /api/v1/cc/
 api_router = APIRouter(prefix="/api/v1/cc")
@@ -165,6 +166,8 @@ api_router.include_router(traceroute_router)
 api_router.include_router(proftpd_router)
 # Per-Domain Bandwidth Reports — Apache access log aggregation per virtualmin domain
 api_router.include_router(domain_bandwidth_router)
+# AWStats per-domain web analytics — parses /etc/awstats/awstats.*.conf data files
+api_router.include_router(awstats_router)
 
 # Public edge registration (no JWT — separate prefix /api/v1/edge/)
 # This is mounted directly on the FastAPI app in main.py

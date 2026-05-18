@@ -143,7 +143,8 @@ def parse_traceroute(raw: str) -> list[dict]:
             host = first
         elif re.match(r"^\d+\.\d+\.\d+\.\d+$", first):
             ip = first
-            host = None
+            # If paren contains a non-IP token, treat it as the resolved hostname
+            host = paren if paren and not re.match(r"^\d+\.\d+\.\d+\.\d+$", paren) else None
         else:
             ip = None
             host = first
