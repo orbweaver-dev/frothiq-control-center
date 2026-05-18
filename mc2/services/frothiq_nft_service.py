@@ -476,6 +476,29 @@ async def add_ip_entry(
     if normalized is None:
         return {"success": False, "error": f"Invalid IP address or CIDR: {ip!r}"}
 
+    # Whitelist protection — refuse to insert a blacklist row for an IP that's
+    # already on the whitelist. Caller must remove from whitelist first if they
+    # really want to flip the classification. Symmetric check on whitelist adds
+    # against existing blacklist rows would be wrong: a manual whitelist add is
+    # an explicit override of any previous block.
+    if list_type == "blacklist":
+        already_whitelisted = await session.scalar(
+            select(FrothiqIPEntry.id).where(
+                FrothiqIPEntry.ip == normalized,
+                FrothiqIPEntry.list_type == "whitelist",
+            )
+        )
+        if already_whitelisted is not None:
+            await _audit(
+                session, user_email, "WHITELIST_PROTECT", "ip_list",
+                f"{normalized} — refused to blacklist (already on whitelist; label={label.strip()!r})",
+                ip_address,
+            )
+            return {
+                "success": False,
+                "error": f"{normalized} is already on the operator whitelist — remove the whitelist entry first if you want to blacklist this IP",
+            }
+
     entry = FrothiqIPEntry(
         id=str(uuid.uuid4()),
         ip=normalized,

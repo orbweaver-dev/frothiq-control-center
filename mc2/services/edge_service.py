@@ -310,9 +310,17 @@ async def _auto_promote_to_blacklist(ip: str, reason: str) -> None:
 
     Persistence: DB record survives reboots; sync_community_ips_to_nft() re-applies
     all DB entries to the live nft set on MC3 startup.
+
+    Whitelist protection: if the IP is on the operator whitelist, the promotion is
+    silently dropped and an audit entry is written. Without this, an operator IP
+    that gets reported by tenants (curl tests, scanner-pattern UA, etc.) would
+    land in the blacklist set despite kernel-level acceptance via the whitelist
+    chain rule, and would be redistributed to every edge plugin until #67's
+    subtraction filter caught it on the way out.
     """
     import ipaddress as _ipmod
     from mc2.models.defense_settings import FrothiqIPEntry
+    from mc2.services import audit_service
 
     try:
         normalized = str(_ipmod.ip_address(ip))
@@ -321,6 +329,31 @@ async def _auto_promote_to_blacklist(ip: str, reason: str) -> None:
 
     factory = get_session_factory()
     async with factory() as session:
+        on_whitelist = await session.scalar(
+            select(FrothiqIPEntry.id).where(
+                FrothiqIPEntry.ip == normalized,
+                FrothiqIPEntry.list_type == "whitelist",
+            )
+        )
+        if on_whitelist is not None:
+            logger.warning(
+                "community_promote: refusing to blacklist whitelisted IP %s (reason=%s)",
+                normalized, reason[:80] if reason else "",
+            )
+            try:
+                await audit_service.log_action(
+                    action="whitelist_protect",
+                    user_id=None,
+                    user_email="system",
+                    resource=f"ip:{normalized}",
+                    detail=f"Defense Mesh blocked from blacklisting whitelisted IP. Reason: {reason[:200]}",
+                    status="denied",
+                    db=session,
+                )
+            except Exception as exc:
+                logger.debug("audit log_action whitelist_protect failed: %s", exc)
+            return
+
         existing = await session.execute(
             select(FrothiqIPEntry).where(
                 FrothiqIPEntry.ip == normalized,
