@@ -56,6 +56,9 @@ from .routes_mailman import router as mailman_router
 from .routes_autoresponder import router as autoresponder_router
 from .routes_ftp_users import router as ftp_users_router
 from .routes_usermin import router as usermin_router
+from .routes_traceroute import router as traceroute_router
+from .routes_proftpd import router as proftpd_router
+from .routes_domain_bandwidth import router as domain_bandwidth_router
 
 # All control center routes under /api/v1/cc/
 api_router = APIRouter(prefix="/api/v1/cc")
@@ -156,6 +159,12 @@ api_router.include_router(autoresponder_router)
 api_router.include_router(ftp_users_router)
 # Usermin Configuration — read-only status + config snapshot of usermin.service
 api_router.include_router(usermin_router)
+# FrothIQ traceroute attacker analysis — enriches hops with PTR / hosting / suspicious classification
+api_router.include_router(traceroute_router)
+# ProFTPD Global Configuration — service state, selected directives, controlled restart
+api_router.include_router(proftpd_router)
+# Per-Domain Bandwidth Reports — Apache access log aggregation per virtualmin domain
+api_router.include_router(domain_bandwidth_router)
 
 # Public edge registration (no JWT — separate prefix /api/v1/edge/)
 # This is mounted directly on the FastAPI app in main.py
